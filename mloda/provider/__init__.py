@@ -72,10 +72,27 @@ from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser
     INPUT_SEPARATOR,
 )
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import FeatureChainParserMixin
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import (
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import (
+    COLUMNWISE_HOOKS,
+    COLUMN_DISCOVERY_HOOKS,
+    missing_columnwise_hooks,
+    declared_columnwise_hooks,
+)
+from mloda.core.abstract_plugins.components.feature_chainer.parsed_feature_name import ParsedFeatureName
+
+# Property specs
+from mloda.core.abstract_plugins.components.property_spec import (
     NO_DEFAULT,
     PropertySpec,
+    is_no_default,
+    is_positive_int,
     property_spec,
+)
+
+# Match rejection recording
+from mloda.core.abstract_plugins.components.match_rejection import (
+    INPUT_DATA_STAGE,
+    record_match_rejection,
 )
 
 # Subtype declaration
@@ -95,6 +112,14 @@ from mloda.core.abstract_plugins.plugin_registry.plugin_registry import (
 from mloda.core.filter.filter_engine import BaseFilterEngine
 from mloda.core.abstract_plugins.components.mask.base_mask_engine import BaseMaskEngine
 from mloda.core.abstract_plugins.components.merge.base_merge_engine import BaseMergeEngine
+
+# Feature resolution debugging
+from mloda.core.api.plugin_docs import resolve_feature
+from mloda.core.prepare.identify_feature_group import FeatureResolutionError
+from mloda.core.prepare.resolution_types import (
+    ResolutionDiagnosis,
+    ResolutionRecord,
+)
 
 __version__ = get_mloda_version()
 
@@ -141,9 +166,20 @@ __all__ = [
     "COLUMN_SEPARATOR",
     "INPUT_SEPARATOR",
     "FeatureChainParserMixin",
+    "COLUMNWISE_HOOKS",
+    "COLUMN_DISCOVERY_HOOKS",
+    "missing_columnwise_hooks",
+    "declared_columnwise_hooks",
+    "ParsedFeatureName",
+    # Property specs
     "PropertySpec",
+    "is_no_default",
+    "is_positive_int",
     "property_spec",
     "NO_DEFAULT",
+    # Match rejection recording
+    "INPUT_DATA_STAGE",
+    "record_match_rejection",
     # Subtype declaration
     "SubtypeDeclaration",
     # Transformers
@@ -156,4 +192,9 @@ __all__ = [
     "BaseFilterEngine",
     "BaseMaskEngine",
     "BaseMergeEngine",
+    # Feature resolution debugging
+    "resolve_feature",
+    "FeatureResolutionError",
+    "ResolutionRecord",
+    "ResolutionDiagnosis",
 ]

@@ -330,3 +330,94 @@ class TestGlobalFilterCategoricalInclusion:
         self.global_filter.add_filter("region", FilterType.CATEGORICAL_INCLUSION, {"values": ["NA"]})
 
         assert len(self.global_filter.filters) == 2
+
+
+class TestGlobalFilterUnhashableParameter:
+    """An unhashable parameter value is rejected by add_filter with a ValueError (issue #925)."""
+
+    def setup_method(self) -> None:
+        self.global_filter = GlobalFilter()
+
+    def test_add_filter_rejects_dict_parameter_value(self) -> None:
+        """Test a dict value raises ValueError rather than the set insertion's TypeError."""
+        parameter: dict[str, Any] = {"value": {"a": 1}}
+
+        with pytest.raises(ValueError, match=r"'value'"):
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, parameter)
+
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_rejects_dict_nested_in_list_parameter_value(self) -> None:
+        """Test a dict nested in a list value is rejected and nothing is stored."""
+        parameter: dict[str, Any] = {"values": [{"a": 1}]}
+
+        with pytest.raises(ValueError, match="values"):
+            self.global_filter.add_filter(Feature("col"), FilterType.CATEGORICAL_INCLUSION, parameter)
+
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_rejects_list_nested_in_list_parameter_value(self) -> None:
+        """Test a list nested in a list value is rejected and nothing is stored."""
+        parameter: dict[str, Any] = {"values": [[1, 2]]}
+
+        with pytest.raises(ValueError, match="values"):
+            self.global_filter.add_filter("col", FilterType.CATEGORICAL_INCLUSION, parameter)
+
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_rejection_names_the_offending_key(self) -> None:
+        """Test the message names the key holding the unhashable value."""
+        parameter: dict[str, Any] = {"min": 25, "payload": {"a": 1}}
+
+        with pytest.raises(ValueError, match="payload"):
+            self.global_filter.add_filter(Feature("age"), FilterType.RANGE, parameter)
+
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_rejection_keeps_previously_added_filters(self) -> None:
+        """Test a rejected filter leaves the already collected filters intact."""
+        self.global_filter.add_filter(Feature("age"), FilterType.RANGE, {"min": 25, "max": 50})
+        parameter: dict[str, Any] = {"value": {"a": 1}}
+
+        with pytest.raises(ValueError, match=r"'value'"):
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, parameter)
+
+        assert len(self.global_filter.filters) == 1
+
+
+class TestGlobalFilterNonStringParameterKey:
+    """A non-string parameter key is rejected by add_filter with a ValueError (issue #959)."""
+
+    def setup_method(self) -> None:
+        self.global_filter = GlobalFilter()
+
+    def test_add_filter_rejects_non_string_parameter_key(self) -> None:
+        """Test a mixed-type key dict raises ValueError rather than the sort's TypeError."""
+        parameter: dict[Any, Any] = {1: "a", "value": 2}
+
+        with pytest.raises(ValueError, match=r"key 1 is not a string"):
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, parameter)
+
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_rejection_names_the_non_string_key(self) -> None:
+        """Test the message names the offending key."""
+        parameter: dict[Any, Any] = {("tuple", "key"): "a", "value": 2}
+
+        with pytest.raises(ValueError) as excinfo:
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, parameter)
+
+        assert "tuple" in str(excinfo.value), str(excinfo.value)
+        assert len(self.global_filter.filters) == 0
+
+    def test_add_filter_still_rejects_non_dict_parameter(self) -> None:
+        """Test the existing non-dict rejection keeps working."""
+        with pytest.raises(ValueError):
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, "not_a_dict")  # type: ignore[arg-type]
+
+    def test_add_filter_still_rejects_empty_parameter(self) -> None:
+        """Test the existing empty-parameter rejection keeps working."""
+        parameter: dict[str, Any] = {}
+
+        with pytest.raises(ValueError):
+            self.global_filter.add_filter(Feature("col"), FilterType.EQUAL, parameter)

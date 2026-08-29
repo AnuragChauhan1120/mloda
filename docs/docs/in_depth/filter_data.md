@@ -8,13 +8,14 @@ That however means that a data project typically contains multiple filters. For 
 
 -    filter_feature: It can be a Feature or a feature name as string.
 -    parameter: A dictionary of parameters to filter. Example: {"min": 2, "max": 3}
+    Parameter values must be hashable (scalars, or lists, sets or tuples of hashables); anything else raises `ValueError`.
 -    filter_type: It can be a str or a FilterType.
 
 #### FilterType
 
 This class is supposed to create similarity in the framework and by framework users.
 
-``` python
+```py
 class FilterType(Enum):
     MIN = "min"
     MAX = "max"
@@ -33,6 +34,8 @@ The GlobalFilter provides methods to add filters to the collection. The preferre
 -   filter_feature
 -   filter_type
 -   parameter
+
+A `Feature` passed as `filter_feature` is snapshotted, so later changes to your own object do not affect the stored filter.
 
 **add_time_and_time_travel_filters**: Adds time and time travel filtering to the GlobalFiltering. This is a convenience method. Due to the complexity of time in data/ml/ai projects, this function should be used.
 
@@ -73,7 +76,7 @@ global_filter.filters
 
 Result
 
-``` python
+```text
 {<SingleFilter(feature_name=example_order_id, type=equal, parameters=FilterParameterImpl(_raw=(('value', 1),)))>}
 ```
 
@@ -96,7 +99,7 @@ global_filter.filters
 
 Result
 
-``` python
+```text
 {<SingleFilter(feature_name=time_travel, type=range, parameters=FilterParameterImpl(_raw=(('max', datetime.datetime(2022, 12, 31, 0, 0, tzinfo=datetime.timezone.utc)), ('max_exclusive', True), ('min', datetime.datetime(2022, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)))))>,
  <SingleFilter(feature_name=reference_time, type=range, parameters=FilterParameterImpl(_raw=(('max', datetime.datetime(2023, 12, 31, 0, 0, tzinfo=datetime.timezone.utc)), ('max_exclusive', True), ('min', datetime.datetime(2023, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)))))>}
 ```
@@ -109,7 +112,7 @@ The implementation of the concrete filters is dependent on the feature group. Th
 
 Further, the feature is a data creator, so we create the data here itself. 
 
-``` python
+```python
 from mloda.user import mloda
 from mloda.provider import FeatureGroup, FeatureSet, ComputeFramework, BaseInputData, DataCreator
 from typing import Any, Union, Set, Type, Optional
@@ -127,6 +130,9 @@ class ExampleOrderFilter(FeatureGroup):
                          }
         # The following algorithm is naive and rather should show an example than a normal use case.
         # The filter implementation highly depends on the feature group!
+        # features.filters is None or an empty set if no filter matched this feature set.
+        if not features.filters:
+            return _data_creator
         # Extract the filter value and filter_name information from the filters.
         for filter in features.filters:
             filter_value = filter.parameter.value
@@ -141,6 +147,10 @@ class ExampleOrderFilter(FeatureGroup):
             if key != filter_name
         }
         return filtered_data
+    @classmethod
+    def final_filters(cls) -> bool | None:
+        # This group applies the filter itself and drops the filter column, so framework row elimination must not run.
+        return False
     @classmethod
     def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
         return {PyArrowTable}
@@ -172,12 +182,38 @@ The previous sections show how **users** create filters. This section explains h
 
 ### How filters reach your FeatureGroup
 
-When a user passes a `GlobalFilter`, the framework matches each `SingleFilter` to the
-FeatureGroups that declare the filter's column as an input. Each matched filter is
-**deep-copied** before delivery. If two FeatureGroups both match the same original
-filter, they each receive independent copies. This means a single `GlobalFilter` can
-be processed differently by different FeatureGroups in the same pipeline: one may use
-the mask engine for inline masking while another uses filters for row elimination.
+When a user passes a `GlobalFilter`, the framework tests every `SingleFilter` against the
+FeatureGroup that each feature already resolved to, using that feature's options, domain
+and compute framework. Each filter is **deep-copied** first, so everything below happens
+on the copy and never on the filter the user built. The copy is delivered only if it
+clears these gates, in the order they run:
+
+| Gate | Shared with feature resolution | Filter policy |
+|------|--------------------------------|---------------|
+| criteria | [one shared probe](feature-group-matching.md#modern-unified-matching) | asked about the filter feature's name and its enriched options, plus the run's `DataAccessCollection` |
+| domain | `Domain` equality only: resolution compares the FeatureGroup's domain to the feature's, and passes any candidate for a domainless feature | the filter feature's domain must equal the resolved feature's, or the FeatureGroup's when the feature declares none; a domainless filter copy adopts that domain, though never a default group domain |
+| scope | `matches_feature_group_scope`: the named class and its subclasses, class-object and string forms alike | none, beyond reading the filter feature's own `feature_group=` |
+| capability (`compute framework`) | the `supports_compute_framework` hook and its narrowing | asked over the frameworks the filter would ride (its own pin, else the resolved feature's), skipped when neither carries one; nothing accepted detaches the filter, and an unpinned copy rides the accepted subset, or the feature's frameworks when the hook was never consulted |
+| compute framework pin | only the pin-cardinality validator, which raises `ComputeFrameworkPinError` at `add_filter`, not at this gate | the resolved feature's framework must be the filter feature's pin; resolution instead tests the feature's pin against the candidate's supported frameworks |
+
+Links are deliberately not re-checked: feature resolution already covered them. Declaring
+the filter's column as an input is **not** the test either.
+
+`match_feature_group_criteria()` sees the filter feature's own options enriched from the
+resolved feature's effective (post-default) ones (see
+[Applying declared defaults](property-mapping.md#applying-declared-defaults)), where
+feature resolution passes declared options alone. The option divergence warning fires only
+for a filter that actually attaches, once per distinct message per setup. If two
+FeatureGroups both match the same original filter, they each receive independent copies.
+This means a single `GlobalFilter` can be processed differently by different FeatureGroups
+in the same pipeline: one may use the mask engine for inline masking while another uses
+filters for row elimination.
+
+The return is read for truthiness, so any falsy value is a non-match, exactly like `False`: a hook
+that falls off the end of a branch and returns `None` attaches no filter. A falsy value that is not
+`False` is reported so the detached filter is visible; return `True` explicitly to keep it. The
+report names the returned type, and each distinct report is a WARNING once per setup (see
+[Why a filter did not attach](#why-a-filter-did-not-attach)).
 
 Matched filters are attached to the `FeatureSet` before `calculate_feature()` is
 called. Inside your calculation you can access them via `features.filters`:
@@ -185,15 +221,79 @@ called. Inside your calculation you can access them via `features.filters`:
 ```
 @classmethod
 def calculate_feature(cls, data, features: FeatureSet):
-    if features.filters is not None:
+    if features.filters:
         for single_filter in features.filters:
             column = single_filter.name             # e.g. "status"
             value  = single_filter.parameter.value  # e.g. "active"
             # ... use however you need
 ```
 
-`features.filters` is available whenever a `GlobalFilter` with matching filters is
-provided. It is `None` when no filters match or no `GlobalFilter` is passed.
+`single_filter.name` is the resolved column name, i.e. after the FeatureGroup's `set_feature_name`
+rename, and is read-only.
+
+Guard on truthiness, not on `is not None`. `features.filters` has three states:
+
+| State | When |
+|-------|------|
+| non-empty set | filters matched this `FeatureSet` |
+| empty set | no filter matched this `FeatureSet`, but the `GlobalFilter` matched somewhere |
+| `None` | no `GlobalFilter` was passed, or that `GlobalFilter` never matched anything |
+
+"Somewhere" reaches further than your calculation: it covers another FeatureGroup, another
+`FeatureSet` of your own FeatureGroup (your FeatureGroup is planned as one `FeatureSet` per
+compute framework, option set, data type and dependency level), and any earlier run, because
+a reused `GlobalFilter` keeps the matches it has recorded. Which of the two empty states you
+get is therefore decided outside your FeatureGroup. `if features.filters:` covers both;
+`if features.filters is not None:` passes with nothing to iterate.
+
+### Why a filter did not attach
+
+If a FeatureGroup's `match_feature_group_criteria` raises while a filter is matched, or returns a
+value whose truthiness test raises, that filter is a non-match for that probe, like a `False`
+return, and the drop is recorded in `GlobalFilter.dropped_filters`. A typed decline the matcher
+records lands in the same ledger, at DEBUG. A framework-owned raise still aborts.
+
+`GlobalFilter.dropped_filters` maps (FeatureGroup, filter feature name, filter uuid) to the gate that
+dropped the filter and that gate's reason, for the current engine setup only. A plain `False` is an
+ordinary non-match and records nothing. A matcher defect takes the key from a stored near-miss;
+otherwise the deepest gate the filter reached keeps it, and two facts at one depth leave the first one
+in place.
+
+Both the defect drop and the falsy-return report are WARNINGs, deduplicated per setup on the rendered
+line: a report reading exactly like an earlier one drops to DEBUG, and one that reads differently, a
+new reason under the same column for instance, warns on its own. That dedupe decides the log level
+only; `dropped_filters` records per declaration either way.
+
+The uuid is `SingleFilter.uuid` of the declaration in `GlobalFilter.filters`, which is what joins a
+recorded fact back to the filter that lost. The key previously carried no uuid, so code unpacking it
+as `for (feature_group, name), elimination in ...` must now unpack three parts.
+
+A filter that matches no FeatureGroup at all is reported once after setup, with its nearest miss
+appended when one was recorded: across FeatureGroups the deepest gate wins, and a matcher defect
+ranks last.
+
+```text
+Filter feature 'price' matched no feature group. Nearest miss: SalesTotal (scope): outside the requested feature group scope
+```
+
+The parenthesized label, `(scope)` here, names the gate in the vocabulary of the "No feature groups
+found" error's
+[near-miss bullets](troubleshooting/feature-group-resolution-errors.md#the-eliminated-candidates-block).
+
+Two filters declared on one column name each record their own fact and get their own nearest miss.
+
+### Filter scope is the `FeatureSet`
+
+Matching is probed per feature, but matched filters attach to the `FeatureSet`. A feature that
+declined a filter is still filtered by it once a sibling of its set matched it, a contained raise
+included; that is logged as a WARNING. Siblings matching different non-empty filter sets get the
+union attached. Matches of one filter that differ only in the enriched options count as that one
+filter, attached once and not reported, only while they resolve to the same column: a per-sibling
+rename makes them distinct predicates and both attach. A filter feature declared with
+`feature_group=` attaches only within that feature group family. To scope a filter, make the deciding
+option a **group** option: differing group options split the features into separate `FeatureSet`s.
+
+`GlobalFilter.probes` records what every probe matched, empty results included, for debugging.
 
 ### Two independent concerns
 
@@ -313,7 +413,7 @@ return pa.table({
 
 | Your FeatureGroup... | `final_filters()` | Uses [mask engine](mask_engine.md)? | Must preserve filter column? |
 |---------------------|:-----------------:|:------------------------:|:---------------------------:|
-| Ignores filters | `None` (default) | No | Yes (it is in `input_data`) |
+| Ignores filters | `None` (default) | No | Yes (elimination reads it from your output) |
 | Handles everything inline | `False` | Yes | No (elimination skipped) |
 | Uses inline logic + elimination | `True` | Yes | **Yes** |
 | Just forces elimination | `True` | No | Yes |

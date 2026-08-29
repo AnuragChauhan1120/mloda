@@ -67,7 +67,7 @@ The new `Options` class separates parameters into two categories:
 - **Group Parameters**: Affect Feature Group resolution and splitting (stored in `options.group`)
 - **Context Parameters**: Metadata that doesn't affect splitting (stored in `options.context`)
 
-``` python
+```python
 from mloda.user import Options
 from typing import Optional
 
@@ -87,7 +87,7 @@ options = Options(
 
 Modern feature creation uses the Options architecture:
 
-``` python
+```python
 from mloda.user import Feature, Options
 
 # Traditional string-based approach:
@@ -111,7 +111,7 @@ The `FeatureChainParserMixin` provides default implementations for common featur
 
 ### Basic Usage
 
-``` python
+```py
 from mloda.provider import FeatureGroup, FeatureChainParserMixin
 from mloda.provider import DefaultOptionKeys, PropertySpec
 
@@ -144,6 +144,101 @@ class MyFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 | `MIN_IN_FEATURES` | `int` | `1` | Minimum required in_features |
 | `MAX_IN_FEATURES` | `int \| None` | `None` | Maximum allowed in_features (None = unlimited) |
 | `IN_FEATURE_SEPARATOR` | `str` | `"&"` | Separator for multiple in_features |
+| `RECOGNITION_ONLY_PATTERN` | `bool` | `False` | Declares a captureless pattern as recognition-only (binds no key from the name) |
+| `REQUIRED_COLUMNWISE_HOOKS` | `frozenset[str]` | `frozenset()` | Column-wise data hooks the family requires |
+
+### Column-Wise Data Hooks
+
+Beyond parsing, the mixin declares three column-wise data hooks: `_get_available_columns`,
+`_check_source_features_exist` and `_add_result_to_data`. The concrete compute-framework subclass
+(pandas, PyArrow, Polars, python dict, ...) implements them; the inherited defaults raise
+`NotImplementedError` naming the class and the hook, so a missing implementation fails loudly
+instead of silently. A group that resolves column names against the data implements the discovery
+hook too; the others only need the check/add pair.
+
+Whether `_check_source_features_exist` tolerates partial presence (some source names missing) or
+rejects it is a per-feature-group policy, not a framework rule.
+
+`REQUIRED_COLUMNWISE_HOOKS` declares which of the three a family needs. A family base sets it to the
+constant matching the hooks its own `calculate_feature` calls, and its compute-framework subclasses
+implement them. Both constants come from `mloda.provider`.
+
+| Constant | Declares |
+|----------|----------|
+| `COLUMNWISE_HOOKS` | `_check_source_features_exist` and `_add_result_to_data` |
+| `COLUMN_DISCOVERY_HOOKS` | those two plus `_get_available_columns` |
+
+```python
+from mloda.provider import COLUMN_DISCOVERY_HOOKS, FeatureChainParserMixin, FeatureGroup
+from mloda.user.pandas import PandasDataFrame
+
+class RollingBase(FeatureChainParserMixin, FeatureGroup):
+    REQUIRED_COLUMNWISE_HOOKS = COLUMN_DISCOVERY_HOOKS
+
+class PandasRolling(RollingBase):
+    @classmethod
+    def compute_framework_rule(cls):
+        return {PandasDataFrame}
+
+    @classmethod
+    def _get_available_columns(cls, data):
+        return set(data.columns)
+
+    @classmethod
+    def _check_source_features_exist(cls, data, feature_names):
+        if set(feature_names) - set(data.columns):
+            raise ValueError(f"Missing source features, available: {list(data.columns)}")
+
+    @classmethod
+    def _add_result_to_data(cls, data, feature_name, result):
+        data[feature_name] = result
+        return data
+```
+
+`missing_columnwise_hooks(cls)`, also from `mloda.provider`, returns the declared hooks a class does
+not implement. Assert it empty in your own test suite to catch a skipped hook there rather than
+mid-run:
+
+```python
+from mloda.provider import missing_columnwise_hooks
+
+def test_pandas_rolling_implements_its_hooks():
+    assert missing_columnwise_hooks(PandasRolling) == []
+```
+
+`missing_columnwise_hooks(cls) == []` also passes vacuously for a class that never sets
+`REQUIRED_COLUMNWISE_HOOKS`. Use `declared_columnwise_hooks(cls)`, also from `mloda.provider`, to
+assert the declaration itself is what's expected:
+
+```python
+from mloda.provider import declared_columnwise_hooks, COLUMN_DISCOVERY_HOOKS
+
+def test_pandas_rolling_declares_all_hooks():
+    assert declared_columnwise_hooks(PandasRolling) == COLUMN_DISCOVERY_HOOKS
+```
+
+A hook that is not a `@classmethod` or `@staticmethod` counts as missing: the `cls._hook(...)` call
+cannot reach it. A family base reports all of its declared hooks, since it declares the contract its
+subclasses implement, so assert this on the framework-bound class rather than on the base.
+
+### Captureless Patterns and Name Binding
+
+A captureless `PREFIX_PATTERN` (one with no capture group, e.g. `r".*__cleaned_text$"`) binds no
+`PROPERTY_MAPPING` key from the feature name. The name identifies the feature group, but every value
+comes from options. The old behavior of fabricating an operation token from the suffix text has been
+retired.
+
+- To bind a key **from the name**, use a named capture: `r".*__(?P<operation>pca|tsne)_reduce$"`.
+- For a **recognition-only** pattern (the name identifies the group but all values come from
+  options), set `RECOGNITION_ONLY_PATTERN = True`:
+
+```py
+RECOGNITION_ONLY_PATTERN = True
+```
+
+Deprecation note: a captureless pattern that also carries a non-empty `PROPERTY_MAPPING` keeps
+working, but logs a definition-time warning until it either adds a named capture or sets
+`RECOGNITION_ONLY_PATTERN = True`.
 
 ### Customization Hooks
 
@@ -151,7 +246,7 @@ class MyFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
 Override this hook when you need custom validation for string-based feature names:
 
-``` python
+```py
 class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     @classmethod
     def _validate_string_match(cls, feature_name: str, operation_config: str, in_feature: str) -> bool:
@@ -168,8 +263,8 @@ class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
 Override when you need to add additional input features (e.g., time filter):
 
-``` python
-class TimeWindowFeatureGroup(FeatureChainParserMixin, FeatureGroup):
+```py
+class TimeWindowFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, FeatureGroup):
     def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
         # Try string-based parsing first
         _, in_feature = FeatureChainParser.parse_feature_name(str(feature_name), [self.PREFIX_PATTERN])
@@ -189,7 +284,7 @@ Override for the rules a `PROPERTY_MAPPING` spec cannot express, then delegate. 
 requirements belong in `required_when` instead: it is enforced by a guard installed at class
 definition, so it still runs on an override.
 
-``` python
+```py
 class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     @classmethod
     def match_feature_group_criteria(cls, feature_name, options, data_access_collection=None) -> bool:
@@ -204,7 +299,7 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
 Use this helper to extract the operation type from either the feature name pattern or a config key, without calling `FeatureChainParser` directly:
 
-``` python
+```py
 class AggregatedFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     AGGREGATION_TYPE = "aggregation_type"
 
@@ -224,7 +319,7 @@ Give a spec a `match_guard` callable to validate the shape of the raw option val
 
 Reach for `match_guard` when the constraint is about the value as a whole (a list of strings, a dict, an ordering). Reach for `element_validator` with `strict_validation=True` when the constraint is about each element on its own.
 
-``` python
+```py
 def _is_list_of_strings(value):
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
@@ -247,7 +342,7 @@ The full model, which invariant fires at which moment, the precedence between th
 
 The modern approach uses `PROPERTY_MAPPING` to define parameter validation and classification:
 
-``` python
+```py
 from mloda.provider import FeatureGroup
 from mloda.user import FeatureName
 from mloda.provider import DefaultOptionKeys, PropertySpec
@@ -279,19 +374,19 @@ class MyFeatureGroup(FeatureGroup):
 
 `FeatureChainParserMixin` already implements this; override it only to add your own checks, and reach the parser through `cls.match_parser_criteria`:
 
-``` python
+```py
 @classmethod
 def match_feature_group_criteria(cls, feature_name, options, data_access_collection=None):
     return cls.match_parser_criteria(feature_name, options)
 ```
 
-`match_parser_criteria` calls the parser with the class's `PROPERTY_MAPPING` and patterns and turns a rejected option value into a non-match. Calling `FeatureChainParser` directly from a match hook lets that rejection escape as an exception and abort feature identification for every candidate.
+`match_parser_criteria` calls the parser with the class's `PROPERTY_MAPPING` and patterns and turns a rejected option value into a non-match. Calling `FeatureChainParser` directly from a match hook lets that rejection escape as an exception; the engine contains it as a `match hook` near-miss for that candidate, but the rejection reason is the more useful one. Containment covers plugin raises only: a framework-owned raise, such as a forwarded option value contradicting the feature name, still aborts the whole resolution.
 
 ### 3. Modernize input_features Method
 
 Handle both string-based and configuration-based features:
 
-``` python
+```py
 def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
     """Extract source feature from either configuration-based options or string parsing."""
 
@@ -315,7 +410,7 @@ def input_features(self, options: Options, feature_name: FeatureName) -> Optiona
 
 Support dual approach in feature processing:
 
-``` python
+```py
 def calculate_feature(self, features, options):
     for feature in features.features:
         # Try configuration-based approach first
@@ -343,7 +438,7 @@ def calculate_feature(self, features, options):
 
 For per-element rules that a fixed value list cannot express:
 
-``` python
+```py
 PROPERTY_MAPPING = {
     "dimension": PropertySpec(
         "Number of dimensions for reduction",
@@ -357,7 +452,7 @@ PROPERTY_MAPPING = {
 
 Specify default values for optional parameters:
 
-``` python
+```py
 PROPERTY_MAPPING = {
     "window_size": PropertySpec(
         "Rolling window length in days",
@@ -377,7 +472,7 @@ checked when the `PropertySpec` is constructed. Omitting `default` makes the key
 
 There is no `group` field: a group parameter is `context=False`.
 
-``` python
+```py
 PROPERTY_MAPPING = {
     # Group parameter - affects Feature Group resolution
     "data_source": PropertySpec(
@@ -409,7 +504,7 @@ the consumer's group options (except `in_features`) onto that child. Configurati
 on a requested feature travels down self-resolving chains (for example
 `price__mean_imputed__sum_aggr`) to the end of the chain without any ceremony:
 
-``` python
+```python
 from typing import Optional
 
 from mloda.provider import FeatureGroup
@@ -445,7 +540,7 @@ directive on the child `Feature` you return from `input_features()`:
 | `forward_group={"kg_backend"}` | Allowlist: only the listed keys flow. |
 | `forward_group_exclude={"query_text"}` | Everything flows except the listed keys. |
 
-``` python
+```python
 from mloda.user import Feature
 
 # Only kg_backend flows; query_text and top_k stay on the consumer.
@@ -471,7 +566,7 @@ Context options never flow implicitly, and `forward_group` does not touch them. 
 child needs a consumer **context** value, list it in `inherit_context_keys`; the engine
 copies the listed keys from the consumer's context into the child's context:
 
-``` python
+```python
 from mloda.user import Feature
 
 child = Feature("knowledge_graph", inherit_context_keys={"tenant"})
@@ -491,11 +586,11 @@ does not).
 Because forwarding is the default, the consumer's query-specific group keys (for
 example `query_text`, `top_k`) land on the child unless you opt out. If the child's
 matcher (its `match_feature_group_criteria` / `PROPERTY_MAPPING`) does not accept those
-extra keys, resolution fails with `No feature groups found ...`. When a feature group
-would match the bare name but rejects it because of extra group options, the error
-names the offending keys, notes that group options flow onto input features by
-default, and suggests keeping them off the child with `forward_group_exclude`, an
-allowlist, or `forward_group=False`.
+extra keys, resolution fails with `No feature groups found ...`. A key whose *value* was
+rejected is named in the error's value-rejection lines; a key rejected merely for being
+present is not called out, because identifying it would need a second, speculative match
+pass. If a feature resolves without its forwarded group options but not with them, keep
+them off the child with `forward_group_exclude`, an allowlist, or `forward_group=False`.
 
 ### Upstream feature deduplication
 
@@ -515,7 +610,7 @@ Some feature groups produce multiple result columns from a single input feature.
 
 Use `apply_naming_convention()` to create properly named columns:
 
-``` python
+```py
 from mloda.provider import FeatureGroup, FeatureSet
 
 class MultiColumnProducer(FeatureGroup):
@@ -536,7 +631,7 @@ class MultiColumnProducer(FeatureGroup):
 
 Use `resolve_multi_column_feature()` to automatically discover columns:
 
-``` python
+```py
 class MultiColumnConsumer(FeatureGroup):
     def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
         # Request base feature without ~N suffix
@@ -562,7 +657,7 @@ class MultiColumnConsumer(FeatureGroup):
 
 For backwards compatibility, you can still access specific columns:
 
-``` python
+```python
 # Manual specification of specific columns
 base_feature = "category__onehot_encoded"  # Creates all columns
 specific_column = "category__onehot_encoded~0"  # Access first column

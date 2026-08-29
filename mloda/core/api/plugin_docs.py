@@ -21,29 +21,28 @@ from mloda.core.abstract_plugins.components.base_feature_group_version import SO
 from mloda.core.abstract_plugins.components.subtype_declaration import SubtypeDeclaration
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.abstract_plugins.components.plugin_option.plugin_collector import PluginCollector
-from mloda.core.abstract_plugins.components.utils import get_all_subclasses, safe_field, safe_field_with_error
+from mloda.core.abstract_plugins.components.utils import as_str, get_all_subclasses, safe_field, safe_field_with_error
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.function_extender import Extender
 from mloda.core.abstract_plugins.plugin_registry.plugin_registry import PluginRegistry
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
-from mloda.core.abstract_plugins.components.domain import Domain
 from mloda.core.abstract_plugins.components.feature import Feature, normalize_feature_group_scope
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.link import Link
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.api.plugin_info import ComputeFrameworkInfo, ExtenderInfo, FeatureGroupInfo, ResolvedFeature
 from mloda.core.prepare.accessible_plugins import (
+    EnvironmentPreconditionError,
     FeatureGroupEnvironmentMapping,
+    FrameworkDeclarationError,
     PreFilterPlugins,
     RedefinitionConflictError,
     dedup_feature_group_subclasses,
     registry_for,
 )
-from mloda.core.prepare.identify_feature_group import (
-    IdentifyFeatureGroupClass,
-    matches_feature_group_scope,
-    scope_callout,
-)
+from mloda.core.prepare.identify_feature_group import evaluate_and_render
+from mloda.core.prepare.resolution_failure_renderer import scope_callout
+from mloda.core.prepare.resolution_types import CandidateFrameworks
 
 
 def list_registered(plugin_type: type[Any]) -> list[type[Any]]:
@@ -51,16 +50,9 @@ def list_registered(plugin_type: type[Any]) -> list[type[Any]]:
     return PluginRegistry.default().list_registered(plugin_type)
 
 
-def _as_str(value: Any) -> str:
-    """Return `value` unchanged, raising TypeError if a plugin returned a non-str, so the guarded read degrades."""
-    if not isinstance(value, str):
-        raise TypeError(f"expected str, got {type(value).__name__}")
-    return value
-
-
 def _safe_version(fg_class: type[FeatureGroup]) -> str:
     """Return the feature group version or "unavailable" if source introspection fails or version() is not a str."""
-    return safe_field(lambda: _as_str(fg_class.version()), "unavailable", catching=SOURCE_INTROSPECTION_ERRORS)
+    return safe_field(lambda: as_str(fg_class.version()), "unavailable", catching=SOURCE_INTROSPECTION_ERRORS)
 
 
 def _subtype_support_or_error(fg_class: type[FeatureGroup]) -> tuple[dict[str, list[str]], Optional[str]]:
@@ -94,31 +86,6 @@ def _dedup_degrading_on_conflict(
         return dedup_feature_group_subclasses(feature_groups, allow_redefinition=allow_redefinition)
     except RedefinitionConflictError:
         return dedup_feature_group_subclasses(feature_groups, allow_redefinition=True)
-
-
-def _matches_criteria_guarded(
-    fg_class: type[FeatureGroup],
-    feature_name: FeatureName,
-    options: Options,
-    data_access_collection: Optional[DataAccessCollection] = None,
-) -> bool:
-    """Match a feature group for the redefinition-conflict branch, treating any raise as 'not a match'.
-
-    resolve_feature is a non-throwing debug API: a conflicting candidate whose match hook raises must
-    not take the whole call down.
-    """
-    try:
-        return fg_class.match_feature_group_criteria(feature_name, options, data_access_collection)
-    except Exception:  # noqa: BLE001  (never-raising debug API)
-        return False
-
-
-def _matches_domain_guarded(fg_class: type[FeatureGroup], feature_domain: Optional[Domain]) -> bool:
-    """Domain gate for the conflict branch, mirroring the engine; a raising get_domain() is 'not a match'."""
-    try:
-        return feature_domain is None or fg_class.get_domain() == feature_domain
-    except Exception:  # noqa: BLE001  (never-raising debug API)
-        return False
 
 
 def get_feature_group_docs(
@@ -168,9 +135,9 @@ def get_feature_group_docs(
             continue
 
         cls_name = fg_class.__name__
-        fg_name = safe_field(lambda: _as_str(fg_class.get_class_name()), cls_name, field=f"{cls_name}.get_class_name")
+        fg_name = safe_field(lambda: as_str(fg_class.get_class_name()), cls_name, field=f"{cls_name}.get_class_name")
         doc_fallback = (fg_class.__doc__ or "").strip() or cls_name
-        description = safe_field(lambda: _as_str(fg_class.description()), doc_fallback, field=f"{cls_name}.description")
+        description = safe_field(lambda: as_str(fg_class.description()), doc_fallback, field=f"{cls_name}.description")
         version = _safe_version(fg_class)
         module = fg_class.__module__
         compute_frameworks: list[str] = safe_field(
@@ -375,10 +342,11 @@ def resolve_feature(
     Never raises for matching errors: those are reported in the returned ResolvedFeature.error.
     Signature misuse (options/feature_group alongside a Feature) is a programmer error and raises TypeError.
 
-    Design note: resolve_feature DELEGATES matching to the #754 evaluation seam
-    IdentifyFeatureGroupClass.evaluate. It only builds the accessible-plugins environment locally
-    (applicability filter, dedup/redefinition-conflict handling) and degrades to never raise; the seam
-    owns name/domain/scope/abstract/subclass filtering, the winner, candidates, and the failure texts.
+    Design note: resolve_feature is a thin adapter. It only normalizes the standalone request, builds the
+    canonical accessible-plugins environment once, delegates one evaluation to evaluate_and_render, and
+    projects the result. ANY environment-build failure (including redefinition conflicts) is projected
+    fail-closed from the failure itself into ``error`` with no candidates and no re-matching; the seam owns
+    name/domain/scope/abstract/subclass filtering, the winner, candidates, and the failure texts.
 
     Engine inputs now covered: name, options, domain and compute-framework pin (carried on the Feature),
     scope (via the Feature's feature_group_scope or the feature_group argument for the string form), and
@@ -412,7 +380,6 @@ def resolve_feature(
         feature_name = str(feature.name)
         scope = feature.feature_group_scope
         resolved_options = feature.options
-        feature_domain: Optional[Domain] = feature.domain
     else:
         feature_obj = None
         feature_name = feature
@@ -426,8 +393,6 @@ def resolve_feature(
                 error=str(exc),
             )
         resolved_options = options if options is not None else Options()
-        raw_domain = resolved_options.get("domain")
-        feature_domain = Domain(raw_domain) if raw_domain else None
 
     callout = scope_callout(scope)
     scope_suffix = f" {callout}" if callout else ""
@@ -438,22 +403,17 @@ def resolve_feature(
     )
     try:
         accessible_plugins: FeatureGroupEnvironmentMapping = PreFilterPlugins(
-            restricted_frameworks, plugin_collector, degrade_on_error=True
+            restricted_frameworks, plugin_collector
         ).get_accessible_plugins()
-    except RedefinitionConflictError as exc:
-        matching_conflicts = [
-            fg
-            for fg in exc.conflicts
-            if (scope is None or matches_feature_group_scope(fg, scope))
-            and _matches_criteria_guarded(fg, feature_name_obj, resolved_options, data_access_collection)
-            and _matches_domain_guarded(fg, feature_domain)
-        ]
-        return ResolvedFeature(feature_name, None, matching_conflicts, error=f"{exc}{scope_suffix}")
-    except ValueError as exc:
+    except (RedefinitionConflictError, EnvironmentPreconditionError, FrameworkDeclarationError) as exc:
+        # mloda's own environment failure: already a complete sentence. Project it bare, no candidates.
         return ResolvedFeature(feature_name, None, [], error=f"{exc}{scope_suffix}")
-    except Exception:  # noqa: BLE001  (never-raising debug API; broken plugin while building the environment)
+    except Exception as exc:  # noqa: BLE001  (never-raising debug API; projects a broken plugin's build failure)
         return ResolvedFeature(
-            feature_name, None, [], error=f"No feature groups found for feature name: '{feature_name}'.{scope_suffix}"
+            feature_name,
+            None,
+            [],
+            error=f"Failed to build the plugin environment: {type(exc).__name__}: {exc}{scope_suffix}",
         )
 
     if feature_obj is None:
@@ -464,25 +424,26 @@ def resolve_feature(
         if feature_obj is None:
             return ResolvedFeature(feature_name, None, [], error=f"{feature_error}{scope_suffix}")
 
-    # The seam does the name/domain/scope/abstract/subclass filtering. Matching or a capability hook can raise;
-    # resolve_feature must not, so degrade any raise into an error result (never-raising contract).
-    evaluation = safe_field_with_error(
-        lambda: IdentifyFeatureGroupClass.evaluate(
+    # The seam does the name/domain/scope/abstract/subclass filtering. Matching, a capability hook or the
+    # renderer can raise; resolve_feature must not, so degrade any raise into an error result.
+    evaluation, eval_error = safe_field_with_error(
+        lambda: evaluate_and_render(
             feature_obj, accessible_plugins, links=links, data_access_collection=data_access_collection
         ),
         None,
     )
-    result, eval_error = evaluation
-    if result is None:
+    if evaluation is None:
         return ResolvedFeature(feature_name, None, [], error=f"{eval_error}{scope_suffix}")
+    result, message = evaluation
 
     candidates = sorted(result.criteria_matched, key=lambda c: c.get_class_name())
 
-    if result.failure_kind is None:
-        winner, supported_frameworks = next(iter(result.identified.items()))
-        available = accessible_plugins.get(winner, set())
-        supported_names = sorted(c.get_class_name() for c in supported_frameworks)
-        unsupported_names = sorted(c.get_class_name() for c in (available - supported_frameworks))
+    # The message is None exactly when the feature resolved, so it carries the success/failure split.
+    if message is None:
+        winner = next(iter(result.identified))
+        split = result.candidate_frameworks.get(winner, CandidateFrameworks())
+        supported_names = sorted(c.get_class_name() for c in split.supported)
+        unsupported_names = sorted(c.get_class_name() for c in split.rejected)
         subtype, subtype_family = _resolved_subtype_fields(winner, feature_name_obj, resolved_options)
         return ResolvedFeature(
             feature_name,
@@ -495,33 +456,6 @@ def resolve_feature(
             subtype_family=subtype_family,
         )
 
-    error = _engine_failure_message(
-        feature_obj, accessible_plugins, feature_name, scope_suffix, links, data_access_collection
-    )
-    return ResolvedFeature(feature_name, None, candidates, error=error)
-
-
-def _engine_failure_message(
-    feature: Feature,
-    accessible_plugins: FeatureGroupEnvironmentMapping,
-    feature_name: str,
-    scope_suffix: str,
-    links: Optional[set[Link]],
-    data_access_collection: Optional[DataAccessCollection],
-) -> str:
-    """Return the engine's failure message for these inputs.
-
-    The engine builders raise a ValueError carrying the failure text (already including any scope
-    callout); a broken plugin declaration touched while building that text degrades to a generic
-    message so resolve_feature never raises.
-    """
-    generic = f"No feature groups found for feature name: '{feature_name}'.{scope_suffix}"
-    try:
-        IdentifyFeatureGroupClass(
-            feature, accessible_plugins, links=links, data_access_collection=data_access_collection
-        )
-    except ValueError as exc:
-        return str(exc)
-    except Exception:  # noqa: BLE001  (broken plugin declaration inside the builder; degrade)
-        return generic
-    return generic
+    # A projection of the evaluation already in hand: the same message the engine raises with, and the
+    # renderer emits the scope callout itself, so scope_suffix must not be appended a second time.
+    return ResolvedFeature(feature_name, None, candidates, error=message)

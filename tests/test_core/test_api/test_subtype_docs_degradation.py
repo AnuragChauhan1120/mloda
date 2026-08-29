@@ -19,14 +19,19 @@ from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.provider import FeatureGroup, SubtypeDeclaration, property_spec
 from mloda.steward import FeatureGroupInfo, get_feature_group_docs, resolve_feature
+from mloda.user import PluginCollector
 from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
     PythonDictFramework,
 )
+
+# Docs enumeration source-hashes every FeatureGroup subclass; a cold cache under xdist load can exceed the default timeout.
+pytestmark = pytest.mark.timeout(30)
 
 
 SBFIX_HOOK_FEATURE = "sbfix_raising_hook_feature"
 SBFIX_DOC_KEY = "sbfixdoc_kind"
 SBFIX_BOGUS_FRAMEWORK = "SbfixNoSuchDocFramework"
+SBFIX852_EMPTY_HOOK_FEATURE = "sbfix852_empty_message_hook_feature"
 
 
 class SbfixRaisingHookFG(FeatureGroup):
@@ -58,6 +63,35 @@ class SbfixRaisingHookFG(FeatureGroup):
         return None
 
 
+class Sbfix852EmptyHookFG(FeatureGroup):
+    """supports_compute_framework hook that raises with an EMPTY message (issue #852)."""
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
+        return {PythonDictFramework}
+
+    @classmethod
+    def match_feature_group_criteria(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        data_access_collection: Optional[DataAccessCollection] = None,
+    ) -> bool:
+        return str(feature_name) == SBFIX852_EMPTY_HOOK_FEATURE
+
+    @classmethod
+    def supports_compute_framework(
+        cls,
+        feature_name: FeatureName | str,
+        options: Options,
+        compute_framework: type[ComputeFramework],
+    ) -> bool:
+        raise RuntimeError()
+
+    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+        return None
+
+
 class SbfixDocBogusSupportedFG(FeatureGroup):
     """Declaration whose 'supported' names a framework outside compute_framework_rule()."""
 
@@ -81,10 +115,11 @@ class SbfixDocBogusSupportedFG(FeatureGroup):
         return None
 
 
-def _sbfix_doc_for(name: str) -> FeatureGroupInfo:
-    exact = [doc for doc in get_feature_group_docs(name=name) if doc.name == name]
-    assert len(exact) == 1, f"expected exactly one doc for {name}, got {[doc.name for doc in exact]}"
-    return exact[0]
+def _sbfix_doc_for(fg_class: type[FeatureGroup]) -> FeatureGroupInfo:
+    """Fetch the FeatureGroupInfo of one class object, independent of what else is registered."""
+    docs = get_feature_group_docs(plugin_collector=PluginCollector.enabled_feature_groups(fg_class))
+    assert len(docs) == 1, f"expected exactly one doc for {fg_class!r}, got {[doc.name for doc in docs]}"
+    return docs[0]
 
 
 class TestSbfixRaisingHookFailsClosed:
@@ -106,11 +141,23 @@ class TestSbfixRaisingHookFailsClosed:
         assert "sbfix hook exploded" in result.error
 
 
+class TestSbfix852EmptyMessageHookErrorIsNonEmpty:
+    """A raising hook with an empty message must still carry a non-empty, typed error (issue #852)."""
+
+    def test_empty_message_hook_error_is_truthy_and_typed(self) -> None:
+        # str(RuntimeError()) is "", so a naive error must not collapse to a falsy value that reads as success.
+        result = resolve_feature(SBFIX852_EMPTY_HOOK_FEATURE)
+        assert result.feature_group is None
+        assert bool(result.error) is True
+        assert result.error is not None
+        assert "RuntimeError" in result.error
+
+
 class TestSbfixBogusSupportedSurfacedInDocs:
     """Docs surface the undeclared 'supported' framework as subtype_error."""
 
     def test_docs_report_subtype_error_with_empty_support(self) -> None:
-        doc = _sbfix_doc_for("SbfixDocBogusSupportedFG")
+        doc = _sbfix_doc_for(SbfixDocBogusSupportedFG)
         assert doc.subtype_key == SBFIX_DOC_KEY
         assert doc.subtype_support == {}
         assert doc.subtype_error is not None

@@ -5,6 +5,7 @@
 - **Orchestration Only**: Coordinate Test-Driven Development cycles between specialized agents
 - **No Code Implementation**: NEVER write implementation code or tests directly
 - **Agent Delegation**: Use Red Agent for test writing, Green Agent for implementation
+- **Session root**: `.claude/agents/red-agent.md` and `.claude/agents/green-agent.md` are only auto-loaded when Claude Code's session is rooted at this repository. If working from a parent or workspace directory, start a session inside the clone (`cd code/mloda && claude`) so the agents are available natively.
 
 ## TDD Workflow
 
@@ -31,7 +32,11 @@
 
 ## Phase Completion Protocol
 
-When working with `memory-bank/todo.md` that contains phases:
+Phased work uses a `todo.md` checklist at the repository root. This file is **transient**: it
+is created for the duration of a phased task and removed when the work lands, so it is
+normally absent from the repository.
+
+When such a `todo.md` exists and contains phases:
 
 1. **After completing each phase**: Run `tox` to validate all tests pass
 2. **If tox passes**:
@@ -47,7 +52,7 @@ Each phase should be a clean, validated checkpoint with all tests passing and ch
 **CRITICAL**: If agent behavior is unexpected or incorrect:
 
 1. **Update Agent Configuration**: Modify `.claude/agents/red-agent.md` or `.claude/agents/green-agent.md` to refine instructions, constraints, or workflow
-2. **Update This File**: Modify `CLAUDE.md` and `AGENTS.md` (keep them in sync) to clarify orchestration rules or add missing guidance
+2. **Update This File**: Modify `CLAUDE.md` and `AGENTS.md` (`tests/test_agent_docs_sync.py` pins them identical) to clarify orchestration rules or add missing guidance
 3. **Document Changes**: Briefly explain what was learned and why the change improves behavior
 
 This enables continuous learning and improvement of the TDD workflow based on actual usage patterns.
@@ -75,11 +80,17 @@ source .venv/bin/activate
 - **Python**: supported range is `>=3.10,<3.15`; CI matrixes 3.10, 3.11, 3.12, 3.13, 3.14.
 - **Type hints**: use modern forms (`list[str]`, `dict[str, int]`, `X | None`). Ruff enforces this via `UP006` and `UP007`.
 - **Formatting**: ruff format with line length 120.
-- **Tests**: every new feature or bug fix must come with tests; follow the patterns in the existing `tests/` tree. Tests must be parallel-safe (pytest-xdist) and finish under the 10-second timeout. The default tox env asserts `EXPECTED_SKIP_COUNT=147`; if a test you add is skipped, update the count or unskip it.
+- **Tests**: every new feature or bug fix must come with tests; follow the patterns in the existing `tests/` tree. Tests must be parallel-safe (pytest-xdist) and finish under the 10-second timeout. The default tox env asserts `EXPECTED_SKIP_COUNT=170`; if a test you add is skipped, update the count or unskip it.
 - **Supply chain**: `[tool.uv] exclude-newer = "7 days"` in `pyproject.toml` defers new dependency releases by 7 days. Do not edit this without a reason.
 - **Licenses**: dependencies must satisfy the allowlist in `tox.ini` (Apache-2.0, BSD, MIT, MPL-2.0, PSF, ISC, LGPLv2+). Adding a dependency with a non-listed license fails tox.
 - **`attribution/ATTRIBUTION.md`**: `tox` regenerates this file from the installed dependency versions on every run, so a dependency change shows up as a diff here. This is intended: commit the update as part of the same change so the tracked file stays current. The release workflow does not regenerate it; it ships the committed copy, so keeping it up to date in PRs is what keeps releases accurate.
 - **Commits**: use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`, `minor:`). semantic-release computes the next version. This project deviates from the standard: the minor version (middle number) bumps only on `minor:` commits; `feat:` is treated as a patch bump.
+
+### mypy iteration notes
+
+- `mypy --strict --ignore-missing-imports .` (what tox runs) checks `tests/` as well as `mloda/` and `mloda_plugins/`. Running `mypy mloda/` locally will miss test-tree type errors that block the tox gate. `tox` (or `tox -e python310`) is the only trustworthy mypy invocation.
+- A stray local build (`python -m build` or `pip wheel .`) creates a `build/` directory. mypy picks it up and reports spurious errors. Clean it with `rm -rf build/` before running tox. The `[tool.mypy]` exclude list in `pyproject.toml` includes `build/` to prevent this at the gate.
+- Running `mypy --strict .` in the dev venv (outside tox) may surface pyspark-related errors that tox's isolated env does not see; trust the tox run as the source of truth.
 
 ## Issue Creation
 
@@ -92,19 +103,10 @@ When filing a GitHub issue (via `gh issue create` or otherwise), follow the stru
 
 Issues that meet this bar are eligible for the `good first issue` label without further sharpening.
 
-## Memory Bank
+## Project Context
 
-The `memory-bank/` directory contains project context documentation. Read relevant files at the start of tasks to understand the project.
-
-### Core Files
-| File | Purpose |
-|------|---------|
-| `projectbrief.md` | Foundation document - core requirements and goals |
-| `productContext.md` | Why the project exists, problems solved, user experience goals |
-| `activeContext.md` | Current work focus, recent changes, next steps |
-| `systemPatterns.md` | System architecture, design patterns, component relationships |
-| `techContext.md` | Technologies, development setup, constraints, dependencies |
-| `progress.md` | What works, what's left, current status, known issues |
-
-### Hierarchy
-Files build upon each other: `projectbrief.md` → `productContext.md`/`systemPatterns.md`/`techContext.md` → `activeContext.md` → `progress.md`
+`docs/docs/` is the published documentation tree. Start a task by reading `docs/docs/index.md` and
+`mloda/core/README.md` for the architecture, then the `in_depth/` page for the subsystem you are
+touching (`in_depth/property-mapping.md` is the PropertySpec lifecycle). In-tree READMEs
+(`mloda/core/`, `mloda_plugins/`, `tests/`) and `CONTRIBUTING.md` cover the rest. Current work state
+comes from git history and the issue tracker, not from a checked-in status file.

@@ -15,18 +15,19 @@ Follows the construction conventions in test_identify_feature_group_error_messag
 
 import inspect
 from abc import abstractmethod
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 import pytest
 
-from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass, matches_feature_group_scope
+from mloda.core.prepare.identify_feature_group import matches_feature_group_scope
+from tests.helpers.plugin_stubs import StubFeatureGroup, make_fg
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda.provider import BaseInputData, DataCreator, FeatureSet
 from mloda.user import PluginCollector, mloda
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
@@ -42,86 +43,33 @@ class SecondMockComputeFramework(ComputeFramework):
     """A second mock compute framework, for rival subclasses of different frameworks."""
 
 
-class ScopeSourceA(FeatureGroup):
+class ScopeSourceA(StubFeatureGroup):
     """Source A: matches the shared "subject_token" plus its own "scoping_value_a"."""
 
-    @classmethod
-    def feature_names_supported(cls) -> set[str]:
-        return {"subject_token", "scoping_value_a"}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        name = str(feature_name)
-        return name in {"subject_token", "scoping_value_a"}
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"subject_token", "scoping_value_a"})
+    SUPPORTED_NAMES: ClassVar[frozenset[str]] = MATCHED_NAMES
 
 
-class ScopeSourceB(FeatureGroup):
+class ScopeSourceB(StubFeatureGroup):
     """Source B: matches the shared "subject_token" plus its own "scoping_value_b"."""
 
-    @classmethod
-    def feature_names_supported(cls) -> set[str]:
-        return {"subject_token", "scoping_value_b"}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        name = str(feature_name)
-        return name in {"subject_token", "scoping_value_b"}
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"subject_token", "scoping_value_b"})
+    SUPPORTED_NAMES: ClassVar[frozenset[str]] = MATCHED_NAMES
 
 
-class InaccessibleScopeSource(FeatureGroup):
-    """A FeatureGroup that matches "subject_token" but is never added to accessible_plugins."""
+InaccessibleScopeSource = make_fg(
+    "InaccessibleScopeSource",
+    matches="subject_token",
+    supported_names="subject_token",
+    doc="A FeatureGroup that is never added to accessible_plugins.",
+)
 
-    @classmethod
-    def feature_names_supported(cls) -> set[str]:
-        return {"subject_token"}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == "subject_token"
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
-
-
-class _DupNameBase(FeatureGroup):
-    """Base for two feature groups that will share the identical class name."""
-
-    @classmethod
-    def feature_names_supported(cls) -> set[str]:
-        return {"subject_token"}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == "subject_token"
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
+_DupNameBase = make_fg(
+    "_DupNameBase",
+    matches="subject_token",
+    supported_names="subject_token",
+    doc="Base for two feature groups that will share the identical class name.",
+)
 
 
 def _both_sources() -> FeatureGroupEnvironmentMapping:
@@ -136,7 +84,7 @@ def test_unscoped_shared_name_is_ambiguous() -> None:
     feature = Feature("subject_token")
 
     with pytest.raises(ValueError, match="Multiple feature groups found"):
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=_both_sources(),
             links=None,
@@ -148,13 +96,13 @@ def test_scope_class_resolves_uniquely_by_identity() -> None:
     """A class-object scope resolves uniquely to that class (matched by identity)."""
     feature = Feature("subject_token", feature_group=ScopeSourceA)
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=_both_sources(),
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceA
 
 
@@ -162,13 +110,13 @@ def test_scope_string_resolves_uniquely_by_class_name() -> None:
     """A class-name string scope resolves uniquely to the matching class."""
     feature = Feature("subject_token", feature_group=ScopeSourceA.get_class_name())
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=_both_sources(),
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceA
 
 
@@ -177,7 +125,7 @@ def test_unknown_scope_raises_no_feature_groups_found() -> None:
     feature = Feature("subject_token", feature_group="CompletelyUnknownScope")
 
     with pytest.raises(ValueError, match="No feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=_both_sources(),
             links=None,
@@ -196,7 +144,7 @@ def test_class_scope_pointing_at_inaccessible_group_raises_no_feature_groups_fou
     feature = Feature("subject_token", feature_group=InaccessibleScopeSource)
 
     with pytest.raises(ValueError, match="No feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=_both_sources(),
             links=None,
@@ -225,7 +173,7 @@ def test_string_scope_name_collision_reports_scope_in_multiple_found() -> None:
     feature = Feature("subject_token", feature_group="DupNameSource")
 
     with pytest.raises(ValueError, match="Multiple feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
@@ -258,13 +206,13 @@ def test_base_class_scope_resolves_to_accessible_subclass() -> None:
         ScopeSourceB: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceASub
 
 
@@ -281,13 +229,13 @@ def test_base_class_scope_prefers_subclass_when_both_accessible() -> None:
         ScopeSourceASub: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceASub
 
 
@@ -300,21 +248,11 @@ class ScopedCapabilityFw(ComputeFramework):
     """Compute framework rejected by RejectAllScopedSource at match time."""
 
 
-class RejectAllScopedSource(FeatureGroup):
+class RejectAllScopedSource(StubFeatureGroup):
     """Matches "subject_token" but declares every compute framework unsupported."""
 
-    @classmethod
-    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {ScopedCapabilityFw}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == "subject_token"
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"subject_token"})
+    FRAMEWORK_RULE: ClassVar[set[type[ComputeFramework]]] = {ScopedCapabilityFw}
 
     @classmethod
     def supports_compute_framework(
@@ -325,17 +263,14 @@ class RejectAllScopedSource(FeatureGroup):
     ) -> bool:
         return False
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
-
 
 def test_capability_rejection_error_names_the_scope() -> None:
     """When every framework of the scoped group is capability-rejected, the error names the scope.
 
     The scoped group matches the feature name, but supports_compute_framework
-    rejects all of its frameworks, so the no-match error takes the capability
-    branch. That message must still call out the requested scope, otherwise the
-    scoped request looks like a plain capability failure.
+    rejects all of its frameworks, so the no-match error carries a capability
+    near-miss line. That message must still call out the requested scope, otherwise
+    the scoped request looks like a plain capability failure.
     """
     feature = Feature("subject_token", feature_group=RejectAllScopedSource)
     accessible_plugins: FeatureGroupEnvironmentMapping = {
@@ -343,15 +278,16 @@ def test_capability_rejection_error_names_the_scope() -> None:
     }
 
     with pytest.raises(ValueError) as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
             data_access_collection=None,
         )
     message = str(exc_info.value)
-    # Prove the capability branch was taken (guards against a fixture bug).
-    assert "Unsupported compute framework" in message
+    # Prove the capability near-miss was recorded (guards against a fixture bug).
+    assert "Feature group(s) eliminated while matching 'subject_token':" in message
+    assert "supports_compute_framework rejected ['ScopedCapabilityFw']" in message
     assert "Scoped to feature group: 'RejectAllScopedSource'" in message
 
 
@@ -377,7 +313,7 @@ def test_scoped_ambiguity_callout_precedes_troubleshooting_url() -> None:
     feature = Feature("subject_token", feature_group="DupNameSource")
 
     with pytest.raises(ValueError, match="Multiple feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
@@ -417,13 +353,13 @@ def test_base_class_name_string_scope_resolves_to_accessible_subclass() -> None:
         ScopeSourceASub: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceASub
 
 
@@ -440,13 +376,13 @@ def test_base_class_name_string_scope_prefers_subclass_when_both_accessible() ->
         ScopeSourceASub: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceASub
 
 
@@ -463,39 +399,26 @@ def test_string_scope_does_not_widen_to_unrelated_groups() -> None:
         ScopeSourceB: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeSourceASub
 
 
-class ScopeAbstractFamilyBase(FeatureGroup):
+class ScopeAbstractFamilyBase(StubFeatureGroup):
     """Abstract family base: matches "subject_token" but cannot be instantiated."""
 
-    @classmethod
-    def feature_names_supported(cls) -> set[str]:
-        return {"subject_token"}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == "subject_token"
+    MATCHED_NAMES: ClassVar[frozenset[str]] = frozenset({"subject_token"})
+    SUPPORTED_NAMES: ClassVar[frozenset[str]] = frozenset({"subject_token"})
 
     @classmethod
     @abstractmethod
     def _family_hook(cls) -> str:
         """Abstract hook that makes this base abstract."""
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
 
 
 class ScopeConcreteFamilyMember(ScopeAbstractFamilyBase):
@@ -523,13 +446,13 @@ def test_abstract_base_name_string_scope_resolves_to_concrete_subclass() -> None
         ScopeSourceB: {MockComputeFramework},
     }
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeConcreteFamilyMember
 
 
@@ -553,7 +476,7 @@ def test_string_scope_matching_two_same_named_bases_stays_ambiguous() -> None:
     feature = Feature("subject_token", feature_group="DupNameAncestorBase")
 
     with pytest.raises(ValueError, match="Multiple feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
@@ -579,7 +502,7 @@ def test_base_name_string_scope_with_two_sibling_subclasses_stays_ambiguous() ->
     feature = Feature("subject_token", feature_group=_DupNameBase.get_class_name())
 
     with pytest.raises(ValueError, match="Multiple feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
@@ -607,7 +530,7 @@ def test_base_name_string_scope_with_differing_framework_siblings_stays_ambiguou
     feature = Feature("subject_token", feature_group=_DupNameBase.get_class_name())
 
     with pytest.raises(ValueError, match="Multiple feature groups found") as exc_info:
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
@@ -657,13 +580,13 @@ def test_abstract_base_name_string_scope_resolves_when_base_is_not_accessible() 
     }
     assert ScopeAbstractFamilyBase not in accessible_plugins, "the scoped base must be absent from the mapping"
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=accessible_plugins,
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, _compute_frameworks = identifier.get()
+    resolved_feature_group, _compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeConcreteFamilyMember
 
 
@@ -716,7 +639,7 @@ def test_framework_pin_narrows_base_name_scope_to_primary_member() -> None:
     """
     unpinned = Feature("subject_token", feature_group=ScopeAbstractFamilyBase.get_class_name())
     with pytest.raises(ValueError, match="Multiple feature groups found"):
-        IdentifyFeatureGroupClass(
+        evaluate_or_raise(
             feature=unpinned,
             accessible_plugins=_framework_split_family(),
             links=None,
@@ -729,13 +652,13 @@ def test_framework_pin_narrows_base_name_scope_to_primary_member() -> None:
         compute_framework=ScopePinnedPrimaryFramework.get_class_name(),
     )
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=_framework_split_family(),
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, compute_frameworks = identifier.get()
+    resolved_feature_group, compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeConcreteFamilyMember
     assert compute_frameworks == {ScopePinnedPrimaryFramework}
 
@@ -752,13 +675,13 @@ def test_framework_pin_narrows_base_name_scope_to_secondary_member() -> None:
         compute_framework=ScopePinnedSecondaryFramework.get_class_name(),
     )
 
-    identifier = IdentifyFeatureGroupClass(
+    identifier = evaluate_or_raise(
         feature=feature,
         accessible_plugins=_framework_split_family(),
         links=None,
         data_access_collection=None,
     )
-    resolved_feature_group, compute_frameworks = identifier.get()
+    resolved_feature_group, compute_frameworks = next(iter(identifier.identified.items()))
     assert resolved_feature_group is ScopeConcreteFamilyMemberSecondary
     assert compute_frameworks == {ScopePinnedSecondaryFramework}
 

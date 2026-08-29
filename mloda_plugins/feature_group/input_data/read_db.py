@@ -1,6 +1,7 @@
-from typing import Any
+from typing import Any, ClassVar
 from mloda.user import DataAccessCollection
-from mloda.provider import FeatureSet, BaseInputData
+from mloda.provider import FeatureSet, BaseInputData, PropertySpec, record_match_rejection
+from mloda.core.abstract_plugins.components.match_rejection import INPUT_DATA_STAGE
 from mloda.user import Options
 
 
@@ -22,6 +23,16 @@ class ReadDB(BaseInputData):
     """
 
     _auto_load_group: str = "feature_group/input_data/read_dbs"
+
+    READER_OPTIONS: ClassVar[dict[str, PropertySpec]] = {
+        "data_access_handle": PropertySpec(
+            "Hint naming which DataAccessCollection credentials handle to prefer while matching.",
+            default=None,
+            element_validator=lambda value: isinstance(value, str),
+            strict_validation=True,
+            scalar_only=True,
+        ),
+    }
 
     @classmethod
     def prepare_credentials(cls, data_access: Any, features: FeatureSet) -> Any:
@@ -74,6 +85,10 @@ class ReadDB(BaseInputData):
         Matcher exception contract: match_read_db_data_access treats only NotImplementedError
         as a soft no-match; any other exception propagates and aborts matching for every
         reader sharing the DataAccessCollection.
+
+        match_subclass_data_access also enforces this via the _credentials_predicate wrapper,
+        and may invoke it once per registered credentials entry while matching, not only the
+        entry ultimately bound to this reader.
         """
         raise NotImplementedError
 
@@ -87,14 +102,26 @@ class ReadDB(BaseInputData):
         raise NotImplementedError
 
     @classmethod
+    def _credentials_predicate(cls, credentials: Any) -> bool:
+        """Wraps is_valid_credentials as a predicate, treating NotImplementedError as no match."""
+        try:
+            return cls.is_valid_credentials(credentials)
+        except NotImplementedError:
+            return False
+
+    @classmethod
     def match_subclass_data_access(cls, data_access: Any, feature_names: list[str], options: Options) -> Any:
         data_accesses: list[Any] = []
 
         if isinstance(data_access, DataAccessCollection):
             hint = options.get("data_access_handle") if options is not None else None
-            if hint is not None and data_access.handles().get(hint) not in (None, "credentials"):
-                hint = None
-            creds = data_access.resolve("credentials", hint=hint)
+            if hint is not None:
+                handle_kind = data_access.handles().get(hint)
+                if handle_kind not in (None, "credentials"):
+                    hint = None
+                elif handle_kind == "credentials" and not cls._credentials_predicate(data_access.credentials[hint]):
+                    return None
+            creds = data_access.resolve("credentials", predicate=cls._credentials_predicate, hint=hint)
             if creds:
                 data_accesses.append(creds)
         elif isinstance(data_access, dict):
@@ -110,6 +137,7 @@ class ReadDB(BaseInputData):
 
     @classmethod
     def match_read_db_data_access(cls, data_accesses: list[Any], feature_names: list[str]) -> Any:
+        """Valid credentials with a declined feature record an attributable decline before moving on."""
         if len(feature_names) > 1:
             raise ValueError(
                 f"ReadDB.match_read_db_data_access expects exactly one feature name, "
@@ -123,6 +151,13 @@ class ReadDB(BaseInputData):
                     try:
                         if cls.check_feature_in_data_access(feature_names[0], data_access):
                             return data_access
+                        # Attributable decline: ownership established, content failed; plain non-matches stay silent.
+                        record_match_rejection(
+                            cls.get_class_name(),
+                            f"{cls.get_class_name()} accepted the credentials but declined "
+                            f"the feature '{feature_names[0]}'",
+                            stage=INPUT_DATA_STAGE,
+                        )
                         continue
                     except NotImplementedError:
                         pass

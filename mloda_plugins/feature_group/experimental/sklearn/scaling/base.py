@@ -15,6 +15,7 @@ from mloda.provider import FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMNWISE_HOOKS
 from mloda.provider import BaseArtifact
 from mloda.provider import DefaultOptionKeys
 from mloda.provider import PropertySpec
@@ -87,6 +88,9 @@ class ScalingFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = 1
 
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
+
     # Property mapping for new configuration-based approach
     PROPERTY_MAPPING = {
         SCALER_TYPE: PropertySpec(
@@ -100,6 +104,7 @@ class ScalingFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             context=True,
             strict_validation=False,
         ),
+        SklearnArtifact.ARTIFACT_STORAGE_PATH: SklearnArtifact.ARTIFACT_STORAGE_PATH_SPEC,
     }
 
     @staticmethod
@@ -351,36 +356,5 @@ class ScalingFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
         Returns:
             Scaled data
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of feature names to check
-
-        Raises:
-            ValueError: If any of the features do not exist in the data.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
         """
         ...

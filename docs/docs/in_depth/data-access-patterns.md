@@ -28,7 +28,7 @@ BaseInputData is an **abstract base class** that defines how feature groups **lo
 For detailed examples of these use cases, see the [data access documentation](access-feature-data.md).
 
 ### Example Implementation
-``` python
+```py
 from mloda.provider import BaseInputData, FeatureGroup, FeatureSet
 
 class ReadFileFeature(FeatureGroup):
@@ -72,9 +72,9 @@ Readers are classified structurally; no reader code is executed for classificati
 
 ### Selecting among sibling readers
 
-A feature selects a specific reader with an Option whose key equals the reader's class name (`BaseInputData.data_access_name()`, i.e. `cls.__name__`, unique per class, so sibling readers cannot collide):
+A feature selects a specific reader with an Option whose key equals the reader's `BaseInputData.data_access_name()`, which defaults to `cls.__name__` (unique per class, so sibling readers cannot collide) and which a reader that overrides it keeps unique within its family itself:
 
-``` python
+```py
 Feature("value", options={UbaAirReader.__name__: url})
 ```
 
@@ -83,6 +83,73 @@ The reader class itself is also accepted as the key, e.g. `Feature("value", opti
 The matched `(ReaderClass, data_access)` pair is stored under the reserved `"BaseInputData"` options key and consumed by `init_reader` at load time.
 
 For non-file sources such as HTTP endpoints, subclassing `ReadFile` and overriding `match_subclass_data_access` plus `load_data` is a supported pattern; on that path `suffix()` is never consulted (it is inert). `ApiInputData` injects in-memory data passed through the API request and is not an HTTP client.
+
+### Reader selection vs feature-group resolution
+
+Reader selection answers "which plugin handles this input" the way [feature-group resolution](feature-group-matching.md) answers "which feature group owns this name". It is not a second resolver: it runs nested inside the criteria gate of feature-group resolution, where `match_feature_group_criteria` calls the reader family's `matches()`. The two deliberately share no request, environment, or outcome abstractions; they share only the low-level rejection channel described below.
+
+| Aspect | Feature-group resolution | Reader selection |
+|--------|--------------------------|------------------|
+| **Candidate discovery** | Registered accessible plugins | Structural walk over the family's final readers (`is_final_reader()`); no reader code executed |
+| **Auto-loading** | Up-front plugin loading | Lazy per-family `_auto_load_group`, triggered only when no final readers are found |
+| **Accessibility policy** | Strict mode, collector policy, enabled compute frameworks | None: every final reader of the family is a candidate |
+| **Matching** | Criteria, domain, scope, capability, framework-pin, and links gates | Per-reader file, suffix, column-validation, and pinning rules |
+| **Ambiguity** | Multiple winners resolved by subclass preference, then reported | First match wins; a second conflicting reader for the same feature raises |
+| **Outcome and diagnostics** | Structured evaluation result rendered into failure messages | A matched `(ReaderClass, data_access)` pair written into options; declines surface through the shared rejection channel |
+
+### Declining with an attributable reason
+
+A reader that owns an input but cannot serve the requested feature can record why it declined; the reason then appears in the near-miss block of the "No feature groups found" error message, labeled `(input data)`. `record_match_rejection` is exported via `mloda.provider`. A custom reader owns its own suffix and overrides `load_data` wholesale; its own decline points sit beyond the automatic column validation, for example a required schema marker in the header:
+
+```python
+from typing import Any
+
+from mloda.provider import INPUT_DATA_STAGE, FeatureSet, record_match_rejection
+from mloda_plugins.feature_group.input_data.read_file import ReadFile
+
+class SensorCsvReader(ReadFile):
+    @classmethod
+    def suffix(cls) -> tuple[str, ...]:
+        return (".sensorcsv",)
+
+    @classmethod
+    def load_data(cls, data_access: Any, features: FeatureSet) -> Any: ...
+
+    @classmethod
+    def validate_columns(cls, file_name: str, feature_names: list[str]) -> bool:
+        if super().validate_columns(file_name, feature_names) is False:
+            return False
+        with open(file_name, encoding="utf-8") as handle:
+            header = handle.readline()
+        if "#sensor-schema" not in header:
+            record_match_rejection(
+                cls.get_class_name(),
+                f"{cls.get_class_name()} matched the suffix of {file_name} "
+                f"but its header lacks the #sensor-schema marker",
+                stage=INPUT_DATA_STAGE,
+            )
+            return False
+        return True
+```
+
+The recorded decline renders as a near-miss line of the resolution failure:
+
+```
+  - SensorFeatureGroup (input data): SensorCsvReader matched the suffix of /data/run1.sensorcsv but its header lacks the #sensor-schema marker
+```
+
+Rules for reader authors:
+
+- Record only when ownership is established but the content fails: right suffix but a missing column, valid credentials but a declined feature.
+- Plain non-matches (wrong suffix, invalid credentials) stay silent. `NotImplementedError` from `is_valid_credentials` is a silent non-match; from `check_feature_in_data_access` it is an accept (the reader matches on credentials alone).
+- Never raise to decline: anything but `NotImplementedError` in the DB match hooks aborts matching for every reader sharing the `DataAccessCollection`. Record, then return a falsy value.
+- Recording outside an engine-opened window is a no-op, so readers stay usable standalone.
+- Recorded reasons are discarded at the enclosing candidate level: when the reader ultimately matches, when a sibling reader matches, or, for unowned recordings, when the feature group matches by another rule. An owned veto instead gates the name-based rules (see the paragraph below). Only a decline surfaces them.
+- Name the reader and the concrete input in the reason, as the example does. Any label works as the owner name, an overridden `data_access_name()` included, but it must be distinct among the reader's own decline points: the first recording per owner wins, so a later reason under a name already used in the same window is dropped and never reaches the owned stage.
+
+`ReadFile` column validation and the `ReadDB` feature check (`check_feature_in_data_access`) already record automatically; a custom reader only needs this for its own decline points.
+
+A veto recorded while the user explicitly addressed the reader family (an option key equal to the reader's `data_access_name()`) gates the candidate's name-based match rules: the feature group fails at resolution with that reason instead of resolving by name and crashing at load time in `init_reader`. A content decline on that path gates the same way: if the addressed reader records a decline and its probe still matches nothing, the recording counts as owned. A decline followed by a match on another input of the same probe stays discarded as usual. An unowned decline on the global probe stays near-miss material only, and the MatchData rule is not gated.
 
 ## MatchData Pattern
 
@@ -108,7 +175,7 @@ MatchData is **only** used in these specific scenarios:
 - Enabling flexible connection configuration for stateful frameworks
 
 ### Example Implementation
-``` python
+```py
 from mloda.provider import MatchData, FeatureGroup
 
 class DuckDBFeatureGroup(FeatureGroup, MatchData):
@@ -158,7 +225,7 @@ BaseInputData and MatchData serve **different purposes** and are used in **diffe
 3. **Only applies** to specific compute frameworks like DuckDB that require persistent connections
 
 ### Combined Usage Example
-``` python
+```py
 class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
     @classmethod
     def input_data(cls) -> Optional[BaseInputData]:
@@ -182,7 +249,7 @@ class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
 **Use Case**: Reading CSV files with Pandas
 **Pattern**: Only BaseInputData is needed
 
-``` python
+```py
 class CsvProcessingFeature(FeatureGroup):
     @classmethod
     def input_data(cls) -> Optional[BaseInputData]:
@@ -194,7 +261,7 @@ class CsvProcessingFeature(FeatureGroup):
 **Use Case**: Analytics with DuckDB requiring connection objects
 **Pattern**: Both BaseInputData and MatchData are needed
 
-``` python
+```py
 class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
     @classmethod
     def input_data(cls) -> Optional[BaseInputData]:
@@ -213,7 +280,7 @@ For database connection patterns, see [Framework Connection Object](framework-co
 **Use Case**: Creating synthetic data with Pandas
 **Pattern**: Only BaseInputData is needed
 
-``` python
+```py
 class SyntheticDataFeature(FeatureGroup):
     @classmethod
     def input_data(cls) -> Optional[BaseInputData]:

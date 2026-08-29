@@ -4,19 +4,24 @@ Feature chain parser for handling feature name chaining across feature groups.
 
 from __future__ import annotations
 
-import contextvars
-import functools
 import logging
 import re
-from collections.abc import Callable
 from typing import Any, Optional
 
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
+from mloda.core.abstract_plugins.components.match_rejection import record_match_rejection
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import PropertySpec, is_no_default
-from mloda.core.abstract_plugins.components.utils import safe_field
+from mloda.core.abstract_plugins.components.feature_chainer.parsed_feature_name import ParsedFeatureName
+from mloda.core.abstract_plugins.components.property_spec import PropertySpec, is_no_default
+from mloda.core.abstract_plugins.components.declaration_surface import DeclarationSurface, validate_property_spec
+from mloda.core.abstract_plugins.components.utils import (
+    contained_raise_log_level,
+    contained_raise_reason,
+    escalate_match_abort,
+    safe_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,23 +30,13 @@ CHAIN_SEPARATOR = "__"  # Separates chained transformations (source→suffix)
 COLUMN_SEPARATOR = "~"  # Separates multi-column output index
 INPUT_SEPARATOR = "&"  # Separates multiple input features
 
-# Marks a matcher that already carries the required_when guard, so it is never wrapped twice.
-REQUIRED_WHEN_GUARD_FLAG = "_mloda_required_when_guard"
 
-# How many guards the current match call is nested in. A guarded matcher that delegates via super()
-# reaches the guard of its parent, and only the outermost one may evaluate the predicates.
-# A ContextVar (not a plain global) keeps the count per thread and per async task.
-REQUIRED_WHEN_GUARD_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "mloda_required_when_guard_depth", default=0
-)
-
-# Exception classes a user callable raises when it merely cannot judge a value.
-_EXPECTED_JUDGMENT_ERRORS: tuple[type[Exception], ...] = (TypeError, ValueError, AttributeError)
-
-
-def _contained_raise_log_level(exc: BaseException) -> int:
-    """DEBUG for expected judgment failures, WARNING for classes that suggest a broken callable."""
-    return logging.DEBUG if isinstance(exc, _EXPECTED_JUDGMENT_ERRORS) else logging.WARNING
+def option_key_is_present(spec: PropertySpec, key: str, options: Options) -> bool:
+    """The single presence decision (#768 matrix): an opted-in explicit None counts as present, a flagless
+    present-as-None does not."""
+    if spec.allow_explicit_none:
+        return key in options
+    return options.get(key) is not None
 
 
 class PropertyValueRejection(ValueError):
@@ -85,15 +80,17 @@ class FeatureChainParser:
         return CHAIN_SEPARATOR in feature_name
 
     @classmethod
-    def parse_feature_name(
+    def parse_name(
         cls,
         feature_name: FeatureName | str,
         prefix_patterns: list[Any],
         pattern: str = CHAIN_SEPARATOR,
-    ) -> tuple[str | None, str | None]:
-        """Internal method for parsing feature names - used by match_configuration_feature_chain_parser.
+    ) -> ParsedFeatureName:
+        """Parse a feature name into structured facts, keeping today's matching semantics.
 
         A prefix pattern is anything ``re.match`` accepts: a ``str`` or a compiled ``re.Pattern``.
+        A matched pattern with nothing before the separator raises the historical ValueError;
+        ``match_parser_criteria`` and the mixin's standalone rejection diagnostic depend on that raise.
         """
         _feature_name: str = feature_name
 
@@ -102,36 +99,48 @@ class FeatureChainParser:
         operation_part = parts[1] if len(parts) > 1 else parts[0]
 
         for suffix_pattern in prefix_patterns:
-            if re.match(suffix_pattern, _feature_name) is None:
+            match = re.match(suffix_pattern, _feature_name)
+            if match is None:
                 continue
 
             if len(parts) == 1 or not source_feature:
+                # Contained: a matched pattern with no source feature is this parser's own name verdict.
                 raise ValueError(f"Matches the pattern {pattern}, but has no source feature: {_feature_name}")
 
-            match = re.match(suffix_pattern, _feature_name)
-            if match and match.groups():
-                operation_config = match.group(1)
-            else:
-                operation_config = operation_part.split("_")[0]
+            return ParsedFeatureName(
+                matched=True,
+                source_feature=source_feature,
+                operation_part=operation_part,
+                named_captures=match.groupdict(),
+                positional_captures=match.groups(),
+            )
 
-            return operation_config, source_feature
-
-        return None, None
+        return ParsedFeatureName.no_match()
 
     @classmethod
-    def _match_pattern_based_feature(
+    def _legacy_operation_config(cls, parsed: ParsedFeatureName) -> str | None:
+        """The value the legacy positional reverse-lookup binding consumes: the first positional
+        capture, or None. A captureless match fabricates nothing (#772)."""
+        if parsed.positional_captures:
+            return parsed.positional_captures[0]
+        return None
+
+    @classmethod
+    def parse_feature_name(
         cls,
-        feature_name: str | FeatureName,
+        feature_name: FeatureName | str,
         prefix_patterns: list[Any],
         pattern: str = CHAIN_SEPARATOR,
-    ) -> bool:
-        """Internal method for matching pattern-based features - used by match_configuration_feature_chain_parser."""
-        _feature_name: FeatureName = FeatureName(feature_name) if isinstance(feature_name, str) else feature_name
+    ) -> tuple[str | None, str | None]:
+        """Legacy adapter over ``parse_name``: returns ``(operation_config, source_feature)``.
 
-        has_prefix_configuration, source_feature = cls.parse_feature_name(_feature_name, prefix_patterns, pattern)
-        if has_prefix_configuration is None or source_feature is None:
-            return False
-        return True
+        Public API (mloda_plugins call sites and documented examples), so the tuple stays
+        byte-for-byte identical to today, including the captureless fabrication and the ValueError.
+        """
+        parsed = cls.parse_name(feature_name, prefix_patterns, pattern)
+        if not parsed.matched:
+            return None, None
+        return cls._legacy_operation_config(parsed), parsed.source_feature
 
     @classmethod
     def _can_skip_required_check(cls, spec: PropertySpec) -> bool:
@@ -146,21 +155,6 @@ class FeatureChainParser:
         return not is_no_default(spec.default) or spec.required_when is not None
 
     @classmethod
-    def _is_context_parameter(cls, spec: PropertySpec) -> bool:
-        """Check if the spec marks the property as a context parameter."""
-        return spec.context
-
-    @classmethod
-    def _is_strict_validation(cls, spec: PropertySpec) -> bool:
-        """Check if the spec requires strict validation (values must be in the value space)."""
-        return spec.strict_validation
-
-    @classmethod
-    def _get_element_validator(cls, spec: PropertySpec) -> Callable[[Any], Any] | None:
-        """Get the spec's per-element validator if present."""
-        return spec.element_validator
-
-    @classmethod
     def _validate_property_value(
         cls, found_property_val: Any, property_value: Any, property_name: str, original_property_config: PropertySpec
     ) -> None:
@@ -169,44 +163,48 @@ class FeatureChainParser:
 
         Raises PropertyValueRejection if validation fails, otherwise returns None.
         """
-        if not cls._is_strict_validation(original_property_config):
+        if not original_property_config.strict_validation:
             return  # No validation needed
 
-        element_validator = cls._get_element_validator(original_property_config)
+        element_validator = original_property_config.element_validator
 
         if element_validator is not None:
-            # A validator that raises cannot judge the value, so the value is rejected, not the run.
             raised: Exception | None = None
             try:
                 verdict = element_validator(found_property_val)
-            except Exception as exc:
-                level = _contained_raise_log_level(exc)
+            except Exception as exc:  # Swallows: a validator that raises cannot judge the value, so it is rejected.
+                # Text, not exc: a retained record must not pin the traceback, its frames and the plugin class.
+                level = contained_raise_log_level(exc)
                 if level == logging.DEBUG:
                     logger.debug(
-                        "element_validator for '%s' raised %s for value %r; treating value as rejected.",
+                        "element_validator for '%s' %s for value %r; treating value as rejected.",
                         property_name,
-                        exc,
+                        contained_raise_reason(exc),
                         found_property_val,
                     )
                 else:
                     # The raw value stays out of WARNING logs; rerun with debug logging to see it.
                     logger.warning(
-                        "element_validator for '%s' raised %s; treating value as rejected.", property_name, exc
+                        "element_validator for '%s' %s; treating value as rejected.",
+                        property_name,
+                        contained_raise_reason(exc),
                     )
                 raised = exc
                 verdict = False
             if not verdict:
+                # Contained: a rejected option value is this candidate's own verdict, recorded as its reason.
                 raise PropertyValueRejection(
                     f"Property value '{found_property_val}' failed validation for '{property_name}'"
                 ) from raised
         else:
-            # Fallback to membership check. An unhashable element (e.g. a dict) can never be
-            # a member of the accepted set, so it is a clean rejection, not a TypeError.
+            # Fallback to membership check.
             try:
                 is_member = found_property_val in property_value
+            # Swallows: an unhashable element can never be a member, so the TypeError is a clean rejection.
             except TypeError:
                 is_member = False
             if not is_member:
+                # Contained: a rejected option value is this candidate's own verdict, recorded as its reason.
                 raise PropertyValueRejection(
                     f"Property value '{found_property_val}' not found in mapping for '{property_name}'"
                 )
@@ -234,16 +232,19 @@ class FeatureChainParser:
         """
 
         if property_name in options.group and property_name in options.context:
-            raise ValueError(
-                f"Parameter '{property_name}' exists in both group and context. "
-                "This is not allowed. Please choose one category."
+            # Marked: Options construction already rejects a key in both categories, so this is a broken invariant.
+            raise escalate_match_abort(
+                ValueError(
+                    f"Parameter '{property_name}' exists in both group and context. "
+                    "This is not allowed. Please choose one category."
+                )
             )
 
         if property_name in options.group:
             return DefaultOptionKeys.group
         elif property_name in options.context:
             return DefaultOptionKeys.context
-        elif cls._is_context_parameter(property_value):
+        elif property_value.context:
             return DefaultOptionKeys.context
         else:
             return DefaultOptionKeys.group
@@ -256,34 +257,15 @@ class FeatureChainParser:
         return spec.allowed_values
 
     @classmethod
-    def _extract_property_values(cls, spec: PropertySpec) -> Any:
-        """Alias kept for existing callers."""
-        return cls.extract_property_values(spec)
-
-    @classmethod
     def _require_spec(cls, owner_name: str, key: str, spec: Any) -> PropertySpec:
-        """Reject anything that is not a ``PropertySpec``.
-
-        The parser entry point is public and takes a mapping straight from a caller, so the type
-        rule cannot live at class-definition time alone: an unmigrated dict would otherwise die
-        with an AttributeError deep in the match path instead of this ValueError.
-        """
-        if isinstance(spec, PropertySpec):
-            return spec
-
-        raise ValueError(
-            f"{owner_name}.PROPERTY_MAPPING['{key}'] is a {type(spec).__name__}, not a PropertySpec. "
-            f"Raw dict specs are no longer accepted; construct PropertySpec(...) or use the "
-            f"property_spec(...) helper."
-        )
+        """Thin seam onto the shared FEATURE_GROUP surface rules; the parser entry point is public
+        and takes caller mappings."""
+        return validate_property_spec(owner_name, key, spec, DeclarationSurface.FEATURE_GROUP)
 
     @classmethod
     def validate_property_mapping_defaults(cls, owner_name: str, property_mapping: dict[str, Any] | None) -> None:
-        """Validate a PROPERTY_MAPPING at class-definition time.
-
-        Every spec must BE a ``PropertySpec``; a spec validates itself at construction, so the
-        only rule left here is the type itself.
-        """
+        """Validate a PROPERTY_MAPPING at class-definition time; the rules live in ``_require_spec``,
+        shared with the match-time entry points."""
         if property_mapping is None:
             return
 
@@ -346,10 +328,10 @@ class FeatureChainParser:
         property_config = property_mapping[property_name]
         found_property_value = options.get(property_name)
         # An opted-in spec treats a present-as-None value as PRESENT, so it flows through validation (#768).
-        if found_property_value is None and not (property_config.allow_explicit_none and property_name in options):
+        if not option_key_is_present(property_config, property_name, options):
             return None
         return cls._process_found_property_value(
-            found_property_value, cls._extract_property_values(property_config), property_name, property_config
+            found_property_value, cls.extract_property_values(property_config), property_name, property_config
         )
 
     @classmethod
@@ -385,6 +367,80 @@ class FeatureChainParser:
         return cls._validate_final_properties(property_tracker, property_mapping)
 
     @classmethod
+    def _name_path_missing_required_keys(
+        cls, effective_options: Options, property_mapping: dict[str, PropertySpec]
+    ) -> list[str]:
+        """The missing required keys on the name path (#769).
+
+        The source key is name-provided (its count is enforced by MIN/MAX_IN_FEATURES), so
+        ``in_features`` is excluded. A declared-default or ``required_when`` key is skippable
+        (``_can_skip_required_check``); ``deferred_binding`` is the #769 opt-out. A key is absent
+        exactly as ``_collect_option_value`` / ``feature_chain_author_guards.check_required_when`` read absence.
+        """
+        missing: list[str] = []
+        for key, spec in property_mapping.items():
+            if not isinstance(spec, PropertySpec):
+                continue
+            if key == DefaultOptionKeys.in_features:
+                continue
+            if cls._can_skip_required_check(spec):
+                continue
+            if spec.deferred_binding:
+                continue
+            absent = not option_key_is_present(spec, key, effective_options)
+            if absent:
+                missing.append(key)
+        return missing
+
+    @staticmethod
+    def _presence_rejection_reason(missing: list[str]) -> str:
+        """The one formatting of the missing-required-keys reason, shared by the matcher and the diagnostic."""
+        return f"required option(s) {', '.join(sorted(missing))} are absent after declared defaults and name bindings"
+
+    @classmethod
+    def _check_name_path_required_presence(
+        cls,
+        owner_name: str | None,
+        feature_name: str | FeatureName,
+        effective_options: Options,
+        property_mapping: dict[str, PropertySpec],
+    ) -> bool:
+        """Enforce the name-path required-presence rule (#769). False means non-match."""
+        missing = cls._name_path_missing_required_keys(effective_options, property_mapping)
+        if not missing:
+            return True
+
+        if owner_name is not None:
+            record_match_rejection(owner_name, cls._presence_rejection_reason(missing))
+
+        owner = owner_name or "A feature group"
+        keys = ", ".join(sorted(missing))
+        logger.warning(
+            "%s did not match feature '%s': required option(s) %s are absent after declared defaults and "
+            "name bindings. Provide the option(s), add a named capture (?P<key>...), or set "
+            "deferred_binding=True on each key bound outside the name.",
+            owner,
+            feature_name,
+            keys,
+        )
+        return False
+
+    @classmethod
+    def name_path_presence_rejection_reason(
+        cls, effective_options: Options, property_mapping: dict[str, PropertySpec]
+    ) -> str | None:
+        """The reason a name-path candidate was rejected for missing presence (#769); None when nothing is missing.
+
+        Supported diagnostic seam, paired with ``_strict_validation_rejection_reason``:
+        mirrors _check_name_path_required_presence so the resolution-failure report explains the
+        same non-match the matcher produced.
+        """
+        missing = cls._name_path_missing_required_keys(effective_options, property_mapping)
+        if not missing:
+            return None
+        return cls._presence_rejection_reason(missing)
+
+    @classmethod
     def match_configuration_feature_chain_parser(
         cls,
         feature_name: str | FeatureName,
@@ -392,13 +448,15 @@ class FeatureChainParser:
         property_mapping: Optional[dict[str, PropertySpec]] = None,
         prefix_patterns: Optional[list[Any]] = None,
         pattern: str = CHAIN_SEPARATOR,
+        owner_name: str | None = None,
     ) -> bool:
         """
         Unified method for matching features using either configuration-based or pattern-based parsing.
 
-        Both paths validate the values of the present options; only required presence is enforced on the
-        configuration-based path alone. This raises on a rejected value, so an overridden
-        ``match_feature_group_criteria`` must reach it through ``FeatureChainParserMixin.match_parser_criteria``.
+        Both paths validate the values of the present options and enforce required presence; the
+        string-named path resolves declared defaults and name bindings first (#769). This raises on a
+        rejected value, so an overridden ``match_feature_group_criteria`` must reach it through
+        ``FeatureChainParserMixin.match_parser_criteria``.
 
         Args:
             feature_name: The feature name to match
@@ -411,11 +469,21 @@ class FeatureChainParser:
             True if the feature matches either pattern-based or configuration-based parsing, False otherwise
         """
 
-        # string based matching
+        # string based matching. parse_name raises the no-source ValueError exactly as before, contained by
+        # match_parser_criteria. Effective options are built from the parse facts here, keeping the matcher's
+        # own parse containment; a raise out of build_effective_options in the author guards'
+        # check_required_when now surfaces as a framework defect (see TestBuildEffectiveOptionsRaiseSurfaces).
         if prefix_patterns is not None:
-            if cls._match_pattern_based_feature(feature_name, prefix_patterns, pattern):
+            parsed = cls.parse_name(feature_name, prefix_patterns, pattern)
+            if cls._name_identifies_group(parsed, property_mapping):
                 if property_mapping is not None:
-                    cls._validate_present_option_values(options, property_mapping)
+                    bindings = cls.bind_name_captures(parsed, property_mapping)
+                    effective_options = cls._merge_bindings(options, bindings, property_mapping)
+                    cls._validate_present_option_values(effective_options, property_mapping)
+                    if not cls._check_name_path_required_presence(
+                        owner_name, feature_name, effective_options, property_mapping
+                    ):
+                        return False
                 return True
 
         # configuration-based
@@ -449,6 +517,103 @@ class FeatureChainParser:
         return patterns
 
     @classmethod
+    def bind_name_captures(cls, parsed: ParsedFeatureName, property_mapping: dict[str, Any]) -> dict[str, str]:
+        """Turn parse facts into PROPERTY_MAPPING bindings by name; documented and deterministic.
+
+        Named captures bind EXCLUSIVELY by name: a capture whose name is a mapping key binds to that
+        key, an unmapped name binds nothing, a non-participating (None) capture binds nothing. Only
+        when the matched pattern declares no named capture at all does the legacy positional fallback
+        bind ``_legacy_operation_config`` to the single key whose ``allowed_values`` already contain
+        it (transitional compatibility for unmigrated positional patterns; retired by #772 /
+        mloda-registry#327). The fallback binds only a value already accepted, so it never fails strict
+        validation.
+        """
+        if not parsed.matched:
+            return {}
+
+        if parsed.named_captures:
+            bindings: dict[str, str] = {}
+            for name, value in parsed.named_captures.items():
+                if value is None or name not in property_mapping:
+                    continue
+                bindings[name] = value
+            return bindings
+
+        legacy_value = cls._legacy_operation_config(parsed)
+        if legacy_value is None:
+            return {}
+        for key, spec in property_mapping.items():
+            if not isinstance(spec, PropertySpec):
+                continue
+            if legacy_value in cls.extract_property_values(spec):
+                return {key: legacy_value}
+        return {}
+
+    @classmethod
+    def _name_identifies_group(cls, parsed: ParsedFeatureName, property_mapping: dict[str, Any] | None) -> bool:
+        """True when a matched name string-identifies this group for matching.
+
+        A legacy positional pattern whose only capture is an absent optional first group does NOT
+        identify the group: reproduce the pre-#770 gate so required presence still guards it on the
+        config path (#769 owns changing that). A named capture that binds a mapping key identifies the
+        group even when the legacy operation value is absent, so a named-optional-first pattern gets
+        full binding, guard, and forwarded-mismatch visibility. A captureless match is a recognition
+        predicate (#772): it identifies the group and binds nothing.
+        """
+        if not parsed.matched:
+            return False
+        if property_mapping and cls.bind_name_captures(parsed, property_mapping):
+            return True
+        if not parsed.positional_captures:
+            # Captureless pattern: zero declared groups. It identifies the group as a recognition
+            # predicate and binds nothing. #772 stopped fabricating a token here.
+            return True
+        # A positional group that did not participate (optional-first) still does not identify;
+        # #769 owns changing that.
+        return cls._legacy_operation_config(parsed) is not None
+
+    @classmethod
+    def _merge_bindings(
+        cls, options: Options, bindings: dict[str, str], property_mapping: dict[str, Any] | None
+    ) -> Options:
+        """Merge name-derived bindings into options; a present option wins, nothing to merge is identity.
+
+        Provenance (inherited_group_keys / inherited_context_keys) and propagate_context_keys survive
+        the rebuild, so forwarded-mismatch protection still reads it off the effective options.
+        """
+        if property_mapping is None or not bindings:
+            return options
+
+        merged_group = dict(options.group)
+        merged_context = dict(options.context)
+        changed = False
+        for key, value in bindings.items():
+            spec = property_mapping.get(key)
+            if not isinstance(spec, PropertySpec):
+                continue
+            # An explicit option (including an opted-in explicit None, #768) is never overwritten.
+            if option_key_is_present(spec, key, options):
+                continue
+            if cls._determine_parameter_category(key, spec, options) == DefaultOptionKeys.context:
+                merged_context[key] = value
+            else:
+                merged_group[key] = value
+            changed = True
+
+        if not changed:
+            return options
+
+        effective = Options(
+            group=merged_group,
+            context=merged_context,
+            propagate_context_keys=options.propagate_context_keys,
+        )
+        effective.inherited_group_keys = options.inherited_group_keys
+        effective.inherited_context_keys = options.inherited_context_keys
+        effective.last_forwarded_group_keys = options.last_forwarded_group_keys
+        return effective
+
+    @classmethod
     def build_effective_options(
         cls,
         feature_name: str | FeatureName,
@@ -456,207 +621,22 @@ class FeatureChainParser:
         property_mapping: dict[str, Any],
         options: Options,
     ) -> Options:
-        """Build effective options by merging string-parsed values with explicit options.
+        """Merge every name-derived binding into options so predicates and validation see them.
 
-        When a feature is matched by string pattern, the operation_config value extracted
-        from the feature name is mapped to the corresponding PROPERTY_MAPPING key. This
-        ensures that required_when predicates see values from both sources.
-
-        If the feature is not string-based or no mapping key matches, returns the
-        original options unchanged.
+        Binding is by name (``bind_name_captures``): all captures merge at once, not just the first key.
+        A matcher may parse the name with its own separator, so CHAIN_SEPARATOR can leave it unparseable;
+        that is no name-parsed value to merge, never an exception out of a matcher. If nothing matches or
+        nothing binds, the original options come back by identity.
         """
-        # A matcher may parse the name with its own separator, so CHAIN_SEPARATOR can leave it
-        # unparseable. That is no name-parsed value to merge, never an exception out of a matcher.
-        nothing_parsed: tuple[str | None, str | None] = (None, None)
-        operation_config, _source_feature = safe_field(
-            lambda: cls.parse_feature_name(feature_name, prefix_patterns, CHAIN_SEPARATOR),
-            nothing_parsed,
+        parsed = safe_field(
+            lambda: cls.parse_name(feature_name, prefix_patterns, CHAIN_SEPARATOR),
+            ParsedFeatureName.no_match(),
             catching=(ValueError,),
         )
-        if operation_config is None:
+        if not parsed.matched:
             return options
-
-        # Find which property mapping key the operation_config value belongs to
-        for prop_key, prop_value in property_mapping.items():
-            if not isinstance(prop_value, PropertySpec):
-                continue
-            # Already present in options: no merge needed
-            if options.get(prop_key) is not None:
-                continue
-            # Check if operation_config is a valid value for this property
-            if operation_config not in cls._extract_property_values(prop_value):
-                continue
-            category = cls._determine_parameter_category(prop_key, prop_value, options)
-            merged_group = dict(options.group)
-            merged_context = dict(options.context)
-            if category == DefaultOptionKeys.context:
-                merged_context[prop_key] = operation_config
-            else:
-                merged_group[prop_key] = operation_config
-            return Options(
-                group=merged_group,
-                context=merged_context,
-                propagate_context_keys=options.propagate_context_keys,
-            )
-
-        return options
-
-    @classmethod
-    def check_required_when(
-        cls,
-        owner_name: str,
-        feature_name: str | FeatureName,
-        prefix_patterns: list[Any],
-        property_mapping: dict[str, Any] | None,
-        options: Options,
-    ) -> bool:
-        """Evaluate every required_when predicate of a mapping. False means the feature is not a match."""
-        if property_mapping is None or not cls.has_required_when_predicates(property_mapping):
-            return True
-
-        # Building effective options may itself raise, so a raise here is contained as a non-match too.
-        try:
-            effective_options = cls.build_effective_options(feature_name, prefix_patterns, property_mapping, options)
-        except Exception as exc:
-            logger.log(
-                _contained_raise_log_level(exc),
-                "building effective options for required_when on %s raised %s; treating feature group as a non-match.",
-                owner_name,
-                exc,
-            )
-            return False
-        for key, spec in property_mapping.items():
-            if not isinstance(spec, PropertySpec):
-                continue
-            # Callability is enforced at PropertySpec construction, so a present predicate is callable.
-            predicate = spec.required_when
-            if predicate is None:
-                continue
-            # A predicate that raises cannot judge the value, so the feature group is a non-match, not the run.
-            try:
-                is_required = bool(predicate(effective_options))
-            except Exception as exc:
-                logger.log(
-                    _contained_raise_log_level(exc),
-                    "required_when predicate %s for '%s' raised %s; treating feature group %s as a non-match.",
-                    getattr(predicate, "__name__", repr(predicate)),
-                    key,
-                    exc,
-                    owner_name,
-                )
-                return False
-            # An opted-in key present as an explicit None counts as present, so the requirement is met (#768).
-            if (
-                is_required
-                and effective_options.get(key) is None
-                and not (spec.allow_explicit_none and key in effective_options)
-            ):
-                logger.debug(
-                    "Feature group %s requires option '%s' (predicate %s is satisfied) but it was not provided.",
-                    owner_name,
-                    key,
-                    getattr(predicate, "__name__", repr(predicate)),
-                )
-                return False
-        return True
-
-    @staticmethod
-    def _resolve_match_arguments(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str | FeatureName, Any]:
-        """Recover (feature_name, options) from a matcher call without assuming an override's parameter names."""
-        values = list(args) + list(kwargs.values())
-
-        feature_name = kwargs.get("feature_name", args[0] if args else None)
-        if not isinstance(feature_name, str):
-            feature_name = next((value for value in values if isinstance(value, str)), "")
-
-        options = kwargs.get("options")
-        if not isinstance(options, Options):
-            options = next((value for value in values if isinstance(value, Options)), None)
-
-        return feature_name, options
-
-    @classmethod
-    def _reject_staticmethod_matcher(cls, owner: type[Any]) -> None:
-        """Reject a staticmethod matcher on a class that declares required_when.
-
-        The guard is reinstalled as a classmethod, so the class would be passed as the first
-        positional argument: a staticmethod matcher would read ``cls`` as its ``feature_name`` and the
-        feature name as its ``options``, and answer a silently wrong verdict. Fail at class definition.
-        """
-        for klass in owner.__mro__:
-            descriptor = klass.__dict__.get("match_feature_group_criteria")
-            if descriptor is None:
-                continue
-            if isinstance(descriptor, staticmethod):
-                raise ValueError(
-                    f"{owner.__name__} declares required_when in its PROPERTY_MAPPING, but its "
-                    f"match_feature_group_criteria is a staticmethod. It must be a classmethod: the "
-                    f"required_when guard is installed as a classmethod and passes the class as the first "
-                    f"argument, which a staticmethod would misread as the feature name."
-                )
-            return
-
-    @classmethod
-    def install_required_when_guard(cls, owner: type[Any]) -> None:
-        """Wrap a class's RESOLVED matcher so its required_when predicates run whatever matcher it kept.
-
-        Called at class-definition time from ``FeatureGroup.__init_subclass__`` and
-        ``FeatureChainParserMixin.__init_subclass__``. The predicates cannot live inside one
-        matcher: overriding ``match_feature_group_criteria`` is supported, and an override that
-        never delegates would silently drop the declared contract. The wrapper stays a
-        classmethod, so it reads the PROPERTY_MAPPING and patterns of the class it is called on.
-
-        A class that declares no required_when is left untouched, and an already guarded matcher
-        is never wrapped again. Guards do nest (an override may delegate into a guarded parent), so
-        only the outermost one evaluates the predicates: exactly once per match call.
-
-        Class definition is the install site, so a PROPERTY_MAPPING mutated, or a matcher replaced,
-        AFTER the class body is not seen by the guard.
-        """
-        property_mapping = getattr(owner, "PROPERTY_MAPPING", None)
-        if not isinstance(property_mapping, dict) or not cls.has_required_when_predicates(property_mapping):
-            return
-
-        cls._reject_staticmethod_matcher(owner)
-
-        matcher = getattr(owner, "match_feature_group_criteria", None)
-        if matcher is None:
-            return
-
-        inner: Any = getattr(matcher, "__func__", matcher)
-        if getattr(inner, REQUIRED_WHEN_GUARD_FLAG, False):
-            return
-
-        @functools.wraps(inner)
-        def guarded(guarded_cls: type[Any], *args: Any, **kwargs: Any) -> bool:
-            # The outermost guard is the one whose class the matcher was called on, so it is the one
-            # whose PROPERTY_MAPPING decides. An inner guard, reached through a delegating super()
-            # call, only answers with its matcher's verdict.
-            outermost = REQUIRED_WHEN_GUARD_DEPTH.get() == 0
-            token = REQUIRED_WHEN_GUARD_DEPTH.set(REQUIRED_WHEN_GUARD_DEPTH.get() + 1)
-            try:
-                if not inner(guarded_cls, *args, **kwargs):
-                    return False
-
-                if not outermost:
-                    return True
-
-                feature_name, options = FeatureChainParser._resolve_match_arguments(args, kwargs)
-                if options is None:
-                    return True
-
-                return FeatureChainParser.check_required_when(
-                    guarded_cls.__name__,
-                    feature_name,
-                    FeatureChainParser.prefix_patterns_of(guarded_cls),
-                    getattr(guarded_cls, "PROPERTY_MAPPING", None),
-                    options,
-                )
-            finally:
-                REQUIRED_WHEN_GUARD_DEPTH.reset(token)
-
-        setattr(guarded, REQUIRED_WHEN_GUARD_FLAG, True)
-        setattr(owner, "match_feature_group_criteria", classmethod(guarded))
+        bindings = cls.bind_name_captures(parsed, property_mapping)
+        return cls._merge_bindings(options, bindings, property_mapping)
 
     @classmethod
     def extract_in_feature(cls, feature_name: str, suffix_pattern: str) -> str:

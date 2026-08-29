@@ -14,6 +14,9 @@ from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.domain import Domain
 from mloda.core.abstract_plugins.components.options import Options
 
+# Docs enumeration source-hashes every FeatureGroup subclass; a cold cache under xdist load can exceed the default timeout.
+pytestmark = pytest.mark.timeout(30)
+
 
 class _EqTestFeatureGroup(FeatureGroup):
     """Concrete FeatureGroup subclass for __eq__ testing.
@@ -80,6 +83,23 @@ class TestDomainEqTypeMismatch:
         assert (d == other) is False
 
 
+class TestDomainRejectsNonStrName:
+    """Domain.__init__ should raise TypeError when name is not a str."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param(42, id="int"),
+            pytest.param(Domain("nested"), id="Domain-double-wrap"),
+            pytest.param(None, id="None"),
+            pytest.param(["not_a_str"], id="list"),
+        ],
+    )
+    def test_domain_non_str_name_raises_type_error(self, name: Any) -> None:
+        with pytest.raises(TypeError):
+            Domain(name)
+
+
 class TestNormalEqualityStillWorks:
     """Ensure normal same-type equality comparisons continue to work correctly."""
 
@@ -97,3 +117,6 @@ class TestNormalEqualityStillWorks:
 
     def test_domain_not_equal_different_name(self) -> None:
         assert Domain("x") != Domain("y")
+
+    def test_domain_accepts_str_name(self) -> None:
+        assert Domain("valid_name").name == "valid_name"

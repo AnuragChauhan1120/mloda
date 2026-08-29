@@ -9,9 +9,22 @@ from mloda.core.abstract_plugins.components.plugin_option.plugin_collector impor
 # Explicit alias re-exports Engine under no_implicit_reexport so tests can patch mloda.core.api.request.Engine.
 from mloda.core.core.engine import Engine as Engine
 from mloda.core.api.plan_info import PlanStep, build_plan_steps
+from mloda.core.prepare.identify_feature_group import (
+    ComputeFrameworkPinError,
+    FeatureResolutionError,
+)
+from mloda.core.prepare.resolution_types import (
+    ResolutionDiagnosis,
+    ResolutionRecord,
+)
 from mloda.core.api.run_result import ResultStream, RunResult
 from mloda.core.api.prepare.setup_compute_framework import SetupComputeFramework
-from mloda.core.prepare.accessible_plugins import filter_extenders_by_strict_mode
+from mloda.core.prepare.accessible_plugins import (
+    EnvironmentPreconditionError,
+    FrameworkDeclarationError,
+    RedefinitionConflictError,
+    filter_extenders_by_strict_mode,
+)
 from mloda.core.filter.global_filter import GlobalFilter
 from mloda.core.runtime.run import ExecutionOrchestrator
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
@@ -22,6 +35,10 @@ from mloda.core.abstract_plugins.components.feature_collection import Features
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.link import Link
 from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+
+
+class SetupConfigurationError(ValueError):
+    """Invalid mlodaAPI setup argument, raised before any feature resolution runs."""
 
 
 class mlodaAPI:
@@ -49,33 +66,39 @@ class mlodaAPI:
         column_ordering: Optional[str] = None,
         parallelization_modes: Optional[set[ParallelizationMode]] = None,
     ) -> None:
-        if column_ordering is not None and column_ordering not in ("alphabetical", "request_order"):
-            raise ValueError(
-                f"column_ordering must be None, 'alphabetical', or 'request_order', got '{column_ordering}'"
-            )
-        self.column_ordering = column_ordering
-        # The features object is potentially changed during the run, so we need to deepcopy it by default, so that follow up runs with the same object are not affected.
-        # Set copy_features=False to disable deep copying for use cases where features contain non-copyable objects.
-        _requested_features = deepcopy(requested_features) if copy_features else requested_features
+        # Setup boundary: any invalid request argument surfaces as the typed error before planning.
+        try:
+            if column_ordering is not None and column_ordering not in ("alphabetical", "request_order"):
+                raise SetupConfigurationError(
+                    f"column_ordering must be None, 'alphabetical', or 'request_order', got '{column_ordering}'"
+                )
+            self.column_ordering = column_ordering
+            # The features object is potentially changed during the run, so we need to deepcopy it by default, so that follow up runs with the same object are not affected.
+            # Set copy_features=False to disable deep copying for use cases where features contain non-copyable objects.
+            _requested_features = deepcopy(requested_features) if copy_features else requested_features
 
-        # Handle api_data: create ApiInputDataCollection if api_data provided
-        api_input_data_collection: Optional[ApiInputDataCollection] = None
-        if api_data is not None and len(api_data) > 0:
-            api_input_data_collection = ApiInputDataCollection()
-            for key_name, key_data in api_data.items():
-                api_input_data_collection.setup_key_class(key_name, list(key_data.keys()))
+            # Handle api_data: create ApiInputDataCollection if api_data provided
+            api_input_data_collection: Optional[ApiInputDataCollection] = None
+            if api_data is not None and len(api_data) > 0:
+                api_input_data_collection = ApiInputDataCollection()
+                for key_name, key_data in api_data.items():
+                    api_input_data_collection.setup_key_class(key_name, list(key_data.keys()))
 
-        self.strict_type_enforcement = strict_type_enforcement
-        self.features = self._process_features(_requested_features, api_input_data_collection)
-        self.compute_framework = SetupComputeFramework(
-            compute_frameworks, self.features, parallelization_modes=parallelization_modes
-        ).compute_frameworks
-        self.links = links
-        self.data_access_collection = data_access_collection
-        self.global_filter = global_filter
-        self.api_input_data_collection = api_input_data_collection
-        self.api_data = api_data
-        self.plugin_collector = plugin_collector
+            self.strict_type_enforcement = strict_type_enforcement
+            self.features = self._process_features(_requested_features, api_input_data_collection)
+            self.compute_framework = SetupComputeFramework(
+                compute_frameworks, self.features, parallelization_modes=parallelization_modes
+            ).compute_frameworks
+            self.links = links
+            self.data_access_collection = data_access_collection
+            self.global_filter = global_filter
+            self.api_input_data_collection = api_input_data_collection
+            self.api_data = api_data
+            self.plugin_collector = plugin_collector
+        except SetupConfigurationError:
+            raise
+        except ValueError as error:
+            raise SetupConfigurationError(str(error)) from error
 
         self.runner: None | ExecutionOrchestrator = None
         self.engine: None | Engine = None
@@ -299,6 +322,67 @@ class mlodaAPI:
         )
         return session.resolved_plan()
 
+    @classmethod
+    def diagnose(
+        cls,
+        features: Features | list[Feature | str],
+        *,
+        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
+        links: Optional[set[Link]] = None,
+        data_access_collection: Optional[DataAccessCollection] = None,
+        global_filter: Optional[GlobalFilter] = None,
+        api_data: Optional[dict[str, dict[str, Any]]] = None,
+        plugin_collector: Optional[PluginCollector] = None,
+        copy_features: bool = True,
+        strict_type_enforcement: bool = False,
+        column_ordering: Optional[str] = None,
+        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+    ) -> ResolutionDiagnosis:
+        """Non-raising whole-request resolution preflight.
+
+        Runs the same eager planning as prepare() but projects the outcome instead of raising: on success
+        records equals resolution_report() with complete True; on a resolution failure records holds the
+        features resolved before the failing one (from the error payload, capped at PARTIAL_RECORDS_CAP on
+        huge requests) plus that feature's EvaluationResult and rendered message. A SetupConfigurationError
+        (any invalid request argument caught during session setup, before planning, for example an invalid
+        column_ordering or an unknown compute framework name) yields only the message. Environment-build
+        failures (EnvironmentPreconditionError, RedefinitionConflictError, FrameworkDeclarationError) and
+        compute-framework pin misuse (ComputeFrameworkPinError) are likewise projected into the diagnosis
+        instead of raising; any other error propagates. Every parameter after features is keyword-only.
+        """
+        try:
+            session = cls(
+                features,
+                compute_frameworks,
+                links,
+                data_access_collection,
+                global_filter,
+                api_data=api_data,
+                plugin_collector=plugin_collector,
+                copy_features=copy_features,
+                strict_type_enforcement=strict_type_enforcement,
+                column_ordering=column_ordering,
+                parallelization_modes=parallelization_modes,
+            )
+        except FeatureResolutionError as error:
+            return ResolutionDiagnosis(
+                records=list(error.partial_records),
+                complete=False,
+                feature_name=error.feature_name,
+                failed_result=deepcopy(error.result),
+                message=str(error),
+            )
+        except (
+            ComputeFrameworkPinError,
+            EnvironmentPreconditionError,
+            RedefinitionConflictError,
+            FrameworkDeclarationError,
+        ) as error:
+            return ResolutionDiagnosis(records=[], complete=False, message=str(error))
+        except SetupConfigurationError as error:
+            return ResolutionDiagnosis(records=[], complete=False, message=str(error))
+        return ResolutionDiagnosis(records=session.resolution_report(), complete=True)
+
     def resolved_plan(self) -> list[PlanStep]:
         """Return the resolved execution plan of this session as ``PlanStep`` records.
 
@@ -306,7 +390,16 @@ class mlodaAPI:
         """
         if self.engine is None:
             raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
-        return build_plan_steps(self.engine.execution_planner)
+        return build_plan_steps(self.engine.execution_planner, self.engine.execution_planner.resolved_join_plan)
+
+    def resolution_report(self) -> list[ResolutionRecord]:
+        """Return this session's per-feature resolution records, captured during planning.
+
+        Available after ``prepare()`` and unchanged by ``run()``. Mirrors ``resolved_plan()``.
+        """
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        return deepcopy(self.engine.resolution_records)
 
     def run(
         self,
@@ -439,11 +532,13 @@ class mlodaAPI:
         return runner
 
     def get_result(self) -> list[Any]:
+        """Return the computed run results; raises if no run function has executed yet."""
         if self.runner is None:
             raise ValueError("You need to run any run function beforehand.")
         return self.runner.get_result()
 
     def get_artifacts(self) -> dict[str, Any]:
+        """Return the artifacts produced by the run; raises if no run function has executed yet."""
         if self.runner is None:
             raise ValueError("You need to run any run function beforehand.")
         return self.runner.get_artifacts()

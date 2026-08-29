@@ -28,12 +28,19 @@ from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.api.plugin_docs import get_feature_group_docs, resolve_feature
 from mloda.core.api.plugin_info import FeatureGroupInfo, ResolvedFeature
+from mloda.core.api.request import mlodaAPI
 from mloda.core.abstract_plugins.components.base_feature_group_version import BaseFeatureGroupVersion
 from mloda.core.prepare.accessible_plugins import (
     PreFilterPlugins,
+    RedefinitionConflictError,
     dedup_feature_group_subclasses,
     _safe_class_source_hash,
 )
+from mloda.core.prepare.resolution_types import ResolutionDiagnosis
+from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
+
+# Docs enumeration source-hashes every FeatureGroup subclass; a cold cache under xdist load can exceed the default timeout.
+pytestmark = pytest.mark.timeout(30)
 
 
 # Module-level reference store. This simulates IPython's ``_oh``/``Out[N]`` history,
@@ -482,9 +489,9 @@ def test_resolve_feature_after_jupyter_redefinition_succeeds() -> None:
 # Case 9: resolve_feature must not raise on redefinition conflict
 # ---------------------------------------------------------------------------
 def test_resolve_feature_returns_error_for_redef_conflict_does_not_raise() -> None:
-    """``resolve_feature`` is a non-throwing debug API: when ``dedup_feature_group_subclasses``
-    detects a different-content redefinition conflict, the error must surface in
-    ``ResolvedFeature.error`` rather than as an unhandled ``ValueError``.
+    """``resolve_feature`` is a non-throwing debug API: a different-content redefinition
+    conflict surfaces in ``ResolvedFeature.error`` and is projected fail-closed with no
+    candidates (#792), never as an unhandled exception.
     """
     qualname = "MyFG_Test9"
     feature_name = "case9_feature_unique_xyz"
@@ -510,9 +517,53 @@ def test_resolve_feature_returns_error_for_redef_conflict_does_not_raise() -> No
         f"error must mention the qualname, 'redefined', or 'set_allow_redefinition'; got: {result.error!r}"
     )
 
-    # candidates must surface the conflicting classes so callers can inspect them programmatically.
-    assert v1 in result.candidates, f"v1 must be in candidates on conflict, got: {result.candidates}"
-    assert v2 in result.candidates, f"v2 must be in candidates on conflict, got: {result.candidates}"
+    # Fail-closed projection (#792): conflicting classes are never re-matched into candidates.
+    assert result.candidates == [], f"candidates must be empty on conflict, got: {result.candidates}"
+
+
+# ---------------------------------------------------------------------------
+# Case 9b (#850): mlodaAPI.diagnose projects a RedefinitionConflictError instead
+# of raising, and the projected message equals what prepare() throws.
+# ---------------------------------------------------------------------------
+def test_diagnose_projects_redefinition_conflict_and_matches_prepare() -> None:
+    """diagnose() catches the dedup RedefinitionConflictError and projects it fail-closed (#850).
+
+    A different-source Jupyter-style redefinition raises RedefinitionConflictError during the
+    environment build (dedup, allow_redefinition defaults False). diagnose() must not raise: it
+    returns a ResolutionDiagnosis with no records and no failed feature (the build aborts before any
+    feature is resolved), carrying the SAME text the raising prepare() path throws for the same request.
+    The generated FG declares no compute_framework_rule, so PandasDataFrame is a valid framework to pass;
+    the conflict fires in dedup before any framework matching, so the choice does not affect the outcome.
+    """
+    qualname = "MyFG_Diagnose850"
+    feature_name = "case_diagnose850_feature_unique_xyz"
+    src_v1 = _make_fg_source(qualname, feature_name)
+    src_v2 = _make_fg_source(
+        qualname,
+        feature_name,
+        extra_body="    def extra_method(self):\n        return 850\n",
+    )
+
+    v1 = _exec_fg_in_main(qualname, src_v1, "cell-diagnose850-v1")
+    v2 = _exec_fg_in_main(qualname, src_v2, "cell-diagnose850-v2")
+    _REF_STORE.extend([v1, v2])
+
+    diagnosis = mlodaAPI.diagnose([feature_name], compute_frameworks={PandasDataFrame})
+
+    assert isinstance(diagnosis, ResolutionDiagnosis)
+    assert diagnosis.complete is False
+    assert diagnosis.records == []
+    assert diagnosis.feature_name is None
+    assert diagnosis.failed_result is None
+    assert diagnosis.message is not None
+    assert any(token in diagnosis.message for token in (qualname, "redefined", "set_allow_redefinition")), (
+        f"message must report the redefinition conflict; got: {diagnosis.message!r}"
+    )
+
+    # Parity with the raising path: prepare() throws the exact text diagnose() projected.
+    with pytest.raises(RedefinitionConflictError) as exc_info:
+        mlodaAPI.prepare([feature_name], compute_frameworks={PandasDataFrame})
+    assert diagnosis.message == str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,11 +1293,13 @@ case25 flush-left line at column zero
 
 # ---------------------------------------------------------------------------
 # Case 26 (issue 693): scoped resolve_feature during a redefinition conflict.
-# The dedup-conflict branch must filter the returned candidates by the
-# feature_group scope AND append the scope callout to the conflict error.
+# The conflict is projected fail-closed with no candidates (#792); the scope
+# callout must still be appended to the conflict error.
 # ---------------------------------------------------------------------------
 def test_resolve_feature_excluding_scope_empties_conflict_candidates_and_error_keeps_callout() -> None:
-    """A scope excluding the conflicting classes empties candidates while the error keeps conflict and callout."""
+    """A scope excluding the conflicting classes yields no candidates (fail-closed, #792);
+    the error keeps conflict and callout.
+    """
     qualname = "MyFG_Test26_Scope"
     feature_name = "case26_feature_unique_xyz"
     src_v1 = _make_fg_source(qualname, feature_name)
@@ -1265,7 +1318,7 @@ def test_resolve_feature_excluding_scope_empties_conflict_candidates_and_error_k
 
     assert result.feature_group is None
     assert result.candidates == [], (
-        f"conflicting classes outside the scope must be filtered from candidates, got: {result.candidates}"
+        f"conflict is projected fail-closed, so candidates must be empty, got: {result.candidates}"
     )
     assert result.error is not None
     assert any(token in result.error for token in (qualname, "redefined", "set_allow_redefinition")), (
@@ -1274,8 +1327,10 @@ def test_resolve_feature_excluding_scope_empties_conflict_candidates_and_error_k
     assert "Scoped to feature group: 'DocsCatalogAnchorFG'." in result.error
 
 
-def test_resolve_feature_matching_scope_keeps_conflict_candidates_and_error_keeps_callout() -> None:
-    """A scope naming the conflicting class keeps both versions in candidates and appends the callout."""
+def test_resolve_feature_matching_scope_projects_no_candidates_and_error_keeps_callout() -> None:
+    """Even a scope naming the conflicting class is projected fail-closed with no candidates (#792);
+    the error keeps the conflict and the scope callout.
+    """
     qualname = "MyFG_Test26_ScopeKeep"
     feature_name = "case26_keep_feature_unique_xyz"
     src_v1 = _make_fg_source(qualname, feature_name)
@@ -1292,10 +1347,8 @@ def test_resolve_feature_matching_scope_keeps_conflict_candidates_and_error_keep
     result = resolve_feature(feature_name, feature_group=qualname)
 
     assert result.feature_group is None
-    assert v1 in result.candidates, f"v1 matches scope and feature name, so it must stay; got: {result.candidates}"
-    assert v2 in result.candidates, f"v2 matches scope and feature name, so it must stay; got: {result.candidates}"
-    assert all(c.__name__ == qualname for c in result.candidates), (
-        f"only in-scope classes may appear in candidates, got: {result.candidates}"
+    assert result.candidates == [], (
+        f"conflict is projected fail-closed, so candidates must be empty even in scope, got: {result.candidates}"
     )
     assert result.error is not None
     assert "set_allow_redefinition" in result.error, f"error must report the conflict; got: {result.error!r}"

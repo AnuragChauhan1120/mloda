@@ -32,6 +32,13 @@ from mloda.core.abstract_plugins.plugin_registry.plugin_policy import (
     PluginPolicyViolationError,
 )
 
+# Feature resolution
+from mloda.core.prepare.identify_feature_group import FeatureResolutionError
+from mloda.core.prepare.resolution_types import (
+    ResolutionDiagnosis,
+    ResolutionRecord,
+)
+
 __version__ = get_mloda_version()
 
 __all__ = [
@@ -59,4 +66,8 @@ __all__ = [
     "ApprovalStatus",
     "PluginPolicy",
     "PluginPolicyViolationError",
+    # Feature resolution
+    "FeatureResolutionError",
+    "ResolutionRecord",
+    "ResolutionDiagnosis",
 ]

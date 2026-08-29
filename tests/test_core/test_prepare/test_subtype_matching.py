@@ -1,7 +1,7 @@
 """Pinning tests for match-time enforcement of SubtypeDeclaration (issue #639)."""
 
 import re
-from typing import Optional
+from typing import ClassVar, Optional
 
 import pytest
 
@@ -11,8 +11,11 @@ from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass, split_frameworks_by_capability
+from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from mloda.core.prepare.resolution_types import CandidateFrameworks
 from mloda.provider import FeatureChainParserMixin, FeatureGroup, SubtypeDeclaration, property_spec
+from tests.helpers.plugin_stubs import StubFeatureGroup, make_fg
+from tests.test_core.test_prepare.identify_seam import identify_winner
 
 
 MATCH_KEY = "subdeclm_window_function"
@@ -50,6 +53,7 @@ class SubDeclMatchWindowFG(FeatureChainParserMixin, FeatureGroup):
             "Window function subtype.",
             strict=True,
             allowed_values={"median": "Median", "sum": "Sum", "lag": "Lag"},
+            deferred_binding=True,  # parametric subtypes (ntile_2) are resolved by SUBTYPES, not name capture
         ),
     }
 
@@ -102,24 +106,12 @@ class SubDeclMatchCompiledSuffixFG(FeatureChainParserMixin, FeatureGroup):
         return {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
 
 
-class SubDeclMatchPlainFG(FeatureGroup):
-    """Family without any subtype dimension."""
-
-    @classmethod
-    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == MATCH_PLAIN_FEATURE
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
+SubDeclMatchPlainFG = make_fg(
+    "SubDeclMatchPlainFG",
+    matches=MATCH_PLAIN_FEATURE,
+    frameworks={SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
+    doc="Family without any subtype dimension.",
+)
 
 
 class SubDeclMatchRankLikeFG(FeatureChainParserMixin, FeatureGroup):
@@ -136,6 +128,7 @@ class SubDeclMatchRankLikeFG(FeatureChainParserMixin, FeatureGroup):
             "Ranking method.",
             strict=True,
             allowed_values={"dense": "Dense rank", "ordinal": "Ordinal rank"},
+            deferred_binding=True,  # parametric subtypes (ntile_2) are resolved by SUBTYPES, not name capture
         ),
     }
 
@@ -151,7 +144,7 @@ def _subdeclm_frame_resolver(feature_name: str, options: Options) -> Optional[st
     return match.group(1)
 
 
-class SubDeclMatchFrameSpecFG(FeatureGroup):
+class SubDeclMatchFrameSpecFG(StubFeatureGroup):
     """Registry-like shape B family: flattened frame spec with a name resolver."""
 
     SUBTYPES = SubtypeDeclaration(
@@ -160,10 +153,7 @@ class SubDeclMatchFrameSpecFG(FeatureGroup):
         parametric_families={"rows": "Row-count frames"},
         supported={SubDeclMatchFwBeta.get_class_name(): {"rows_1"}},
     )
-
-    @classmethod
-    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
+    FRAMEWORK_RULE: ClassVar[set[type[ComputeFramework]]] = {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
 
     @classmethod
     def match_feature_group_criteria(
@@ -174,33 +164,64 @@ class SubDeclMatchFrameSpecFG(FeatureGroup):
     ) -> bool:
         return str(feature_name).startswith("subdeclm_") and str(feature_name).endswith("_frame")
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
+
+def _identify(
+    feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping
+) -> tuple[type[FeatureGroup], set[type[ComputeFramework]]]:
+    return identify_winner(feature, accessible_plugins)
 
 
-def _identify(feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping) -> IdentifyFeatureGroupClass:
-    return IdentifyFeatureGroupClass(
-        feature=feature,
-        accessible_plugins=accessible_plugins,
-        links=None,
-        data_access_collection=None,
-    )
+_ROUTING_CASES = [
+    pytest.param(
+        "value__median_subdeclmw",
+        SubDeclMatchWindowFG,
+        "'median' is unsupported on SubDeclMatchFwBeta and must be routed around",
+        id="keyed_literal_subtype",
+    ),
+    pytest.param(
+        "value__ntile_2_subdeclmw",
+        SubDeclMatchWindowFG,
+        "Family 'ntile' is unsupported on SubDeclMatchFwBeta, so 'ntile_2' must be routed around",
+        id="keyed_parametric_instance",
+    ),
+    pytest.param(
+        "value__ntile_2_subdeclmrank",
+        SubDeclMatchRankLikeFG,
+        "'ntile' is only supported on SubDeclMatchFwAlpha",
+        id="rank_like_parametric_instance",
+    ),
+    pytest.param(
+        "subdeclm_price__rows_7_frame",
+        SubDeclMatchFrameSpecFG,
+        "'rows_7' is unsupported on SubDeclMatchFwBeta",
+        id="frame_spec_resolved_literal",
+    ),
+    pytest.param(
+        "value__median_subdeclmcompiled",
+        SubDeclMatchCompiledWindowFG,
+        "'median' is unsupported on SubDeclMatchFwBeta and must be routed around even when PREFIX_PATTERN "
+        "is compiled; the dropped pattern fails open",
+        id="compiled_prefix_pattern",
+    ),
+]
+
+
+@pytest.mark.parametrize(("feature_name", "expected_feature_group", "reason"), _ROUTING_CASES)
+def test_unsupported_subtype_routes_around_incapable_framework(
+    feature_name: str, expected_feature_group: type[FeatureGroup], reason: str
+) -> None:
+    feature = Feature(feature_name)
+    accessible_plugins: FeatureGroupEnvironmentMapping = {
+        expected_feature_group: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
+    }
+
+    feature_group_class, compute_frameworks = _identify(feature, accessible_plugins)
+    assert feature_group_class is expected_feature_group
+    assert compute_frameworks == {SubDeclMatchFwAlpha}, f"{reason}; got {compute_frameworks}"
 
 
 class TestMatchTimeIntegration:
     """The declaration is enforced through IdentifyFeatureGroupClass."""
-
-    def test_unsupported_subtype_is_routed_to_capable_framework(self) -> None:
-        feature = Feature("value__median_subdeclmw")
-        accessible_plugins: FeatureGroupEnvironmentMapping = {
-            SubDeclMatchWindowFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
-        }
-
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
-        assert feature_group_class is SubDeclMatchWindowFG
-        assert compute_frameworks == {SubDeclMatchFwAlpha}, (
-            f"'median' is unsupported on SubDeclMatchFwBeta and must be routed around; got {compute_frameworks}"
-        )
 
     def test_pin_to_incapable_framework_raises_capability_error(self) -> None:
         feature = Feature("value__median_subdeclmw")
@@ -213,26 +234,15 @@ class TestMatchTimeIntegration:
             _identify(feature, accessible_plugins)
 
         message = str(exc_info.value)
-        lowered = message.lower()
-        assert "unsupported" in lowered or "not supported" in lowered, (
+        assert "compute framework pin" in message, (
+            f"Error must signal a rejected compute-framework pin, but got: {message}"
+        )
+        assert "is not among its supported" in message, (
             f"Error must signal an unsupported framework, but got: {message}"
         )
         assert SubDeclMatchFwBeta.get_class_name() in message
         assert SubDeclMatchFwAlpha.get_class_name() in message
         assert "Did you mean" not in message
-
-    def test_parametric_instance_is_routed_around(self) -> None:
-        feature = Feature("value__ntile_2_subdeclmw")
-        accessible_plugins: FeatureGroupEnvironmentMapping = {
-            SubDeclMatchWindowFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
-        }
-
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
-        assert feature_group_class is SubDeclMatchWindowFG
-        assert compute_frameworks == {SubDeclMatchFwAlpha}, (
-            f"Family 'ntile' is unsupported on SubDeclMatchFwBeta, so 'ntile_2' must be routed around; "
-            f"got {compute_frameworks}"
-        )
 
     def test_unknown_subtype_keeps_every_framework(self) -> None:
         assert SubDeclMatchWindowFG.canonical_subtype("zzz") == "zzz"
@@ -242,7 +252,7 @@ class TestMatchTimeIntegration:
             SubDeclMatchWindowFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        _, compute_frameworks = _identify(feature, accessible_plugins).get()
+        _, compute_frameworks = _identify(feature, accessible_plugins)
         assert compute_frameworks == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}, (
             f"An undeclared subtype must stay open on every framework; got {compute_frameworks}"
         )
@@ -256,7 +266,7 @@ class TestMatchTimeIntegration:
             SubDeclMatchPlainFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        _, compute_frameworks = _identify(feature, accessible_plugins).get()
+        _, compute_frameworks = _identify(feature, accessible_plugins)
         assert compute_frameworks == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
 
     def test_matching_stays_orthogonal_to_subtype_support(self) -> None:
@@ -266,7 +276,7 @@ class TestMatchTimeIntegration:
 
 
 class TestRankLikeFamily:
-    """Definition of done: a keyed parametric registry-like family routes by declaration alone."""
+    """Universe, parametric canonicalization, and both-framework support for a keyed registry-like family."""
 
     def test_universe_enumerates_family_without_probing(self) -> None:
         assert SubDeclMatchRankLikeFG.subtype_universe() == RANK_UNIVERSE
@@ -274,30 +284,18 @@ class TestRankLikeFamily:
     def test_parametric_instance_canonicalizes_to_family(self) -> None:
         assert SubDeclMatchRankLikeFG.canonical_subtype("ntile_2") == "ntile"
 
-    def test_parametric_instance_routes_only_to_capable_framework(self) -> None:
-        feature = Feature("value__ntile_2_subdeclmrank")
-        accessible_plugins: FeatureGroupEnvironmentMapping = {
-            SubDeclMatchRankLikeFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
-        }
-
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
-        assert feature_group_class is SubDeclMatchRankLikeFG
-        assert compute_frameworks == {SubDeclMatchFwAlpha}, (
-            f"'ntile' is only supported on SubDeclMatchFwAlpha; got {compute_frameworks}"
-        )
-
     def test_supported_subtype_runs_on_both_frameworks(self) -> None:
         feature = Feature("value__dense_subdeclmrank")
         accessible_plugins: FeatureGroupEnvironmentMapping = {
             SubDeclMatchRankLikeFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        _, compute_frameworks = _identify(feature, accessible_plugins).get()
+        _, compute_frameworks = _identify(feature, accessible_plugins)
         assert compute_frameworks == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
 
 
 class TestFrameSpecLikeFamily:
-    """Definition of done: a shape B registry-like family resolves from names and routes by narrowing."""
+    """Universe, name resolution, literal-vs-family canonicalization, and both-framework support for shape B."""
 
     def test_universe_unions_literals_and_family(self) -> None:
         assert SubDeclMatchFrameSpecFG.subtype_universe() == FRAME_UNIVERSE
@@ -310,25 +308,13 @@ class TestFrameSpecLikeFamily:
         assert SubDeclMatchFrameSpecFG.canonical_subtype("rows_7") == "rows_7"
         assert SubDeclMatchFrameSpecFG.canonical_subtype("rows_9") == "rows"
 
-    def test_routing_honors_supported_narrowing(self) -> None:
-        feature = Feature("subdeclm_price__rows_7_frame")
-        accessible_plugins: FeatureGroupEnvironmentMapping = {
-            SubDeclMatchFrameSpecFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
-        }
-
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
-        assert feature_group_class is SubDeclMatchFrameSpecFG
-        assert compute_frameworks == {SubDeclMatchFwAlpha}, (
-            f"'rows_7' is unsupported on SubDeclMatchFwBeta; got {compute_frameworks}"
-        )
-
     def test_supported_literal_runs_on_both_frameworks(self) -> None:
         feature = Feature("subdeclm_price__rows_1_frame")
         accessible_plugins: FeatureGroupEnvironmentMapping = {
             SubDeclMatchFrameSpecFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        _, compute_frameworks = _identify(feature, accessible_plugins).get()
+        _, compute_frameworks = _identify(feature, accessible_plugins)
         assert compute_frameworks == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
 
 
@@ -357,13 +343,18 @@ class TestSubDeclMatchPlanningNeverRaises:
     """A raising resolver must not crash the planning path; the family degrades open."""
 
     def test_raising_resolver_degrades_open_in_split(self) -> None:
-        supported, rejected = split_frameworks_by_capability(
-            [SubDeclMatchRaisingResolverFG],
-            FeatureName("subdeclm_raising_feature"),
-            Options(),
+        """Both frameworks stay supported: the split the evaluation seam records keeps neither rejected."""
+        feature = Feature(SubDeclMatchRaisingResolverFG.get_class_name())
+        accessible_plugins: FeatureGroupEnvironmentMapping = {
+            SubDeclMatchRaisingResolverFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
+        }
+
+        result = IdentifyFeatureGroupClass.evaluate(feature=feature, accessible_plugins=accessible_plugins, links=None)
+
+        assert result.candidate_frameworks[SubDeclMatchRaisingResolverFG] == CandidateFrameworks(
+            supported=frozenset({SubDeclMatchFwAlpha, SubDeclMatchFwBeta}),
+            rejected=frozenset(),
         )
-        assert supported == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}
-        assert rejected == set()
 
 
 class TestCompiledPrefixPatternParity:
@@ -380,26 +371,13 @@ class TestCompiledPrefixPatternParity:
             f"the guard drops the re.Pattern and returns {compiled_subtype}."
         )
 
-    def test_unsupported_subtype_routes_around_incapable_framework(self) -> None:
-        feature = Feature("value__median_subdeclmcompiled")
-        accessible_plugins: FeatureGroupEnvironmentMapping = {
-            SubDeclMatchCompiledWindowFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
-        }
-
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
-        assert feature_group_class is SubDeclMatchCompiledWindowFG
-        assert compute_frameworks == {SubDeclMatchFwAlpha}, (
-            f"'median' is unsupported on SubDeclMatchFwBeta and must be routed around even when PREFIX_PATTERN "
-            f"is compiled; the dropped pattern fails open and keeps {compute_frameworks}"
-        )
-
     def test_supported_subtype_runs_on_both_frameworks(self) -> None:
         feature = Feature("value__sum_subdeclmcompiled")
         accessible_plugins: FeatureGroupEnvironmentMapping = {
             SubDeclMatchCompiledWindowFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        _, compute_frameworks = _identify(feature, accessible_plugins).get()
+        _, compute_frameworks = _identify(feature, accessible_plugins)
         # Pin resolution directly: pre-fix the dropped compiled pattern returns None, so routing merely fails open.
         assert SubDeclMatchCompiledWindowFG.resolve_subtype("value__sum_subdeclmcompiled", Options()) == "sum"
         assert compute_frameworks == {SubDeclMatchFwAlpha, SubDeclMatchFwBeta}, (
@@ -415,7 +393,7 @@ class TestCompiledPrefixPatternParity:
             SubDeclMatchCompiledSuffixFG: {SubDeclMatchFwAlpha, SubDeclMatchFwBeta},
         }
 
-        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins).get()
+        feature_group_class, compute_frameworks = _identify(feature, accessible_plugins)
         assert feature_group_class is SubDeclMatchCompiledSuffixFG
         assert compute_frameworks == {SubDeclMatchFwAlpha}, (
             f"'median' is unsupported on SubDeclMatchFwBeta and must be routed around even when the compiled "

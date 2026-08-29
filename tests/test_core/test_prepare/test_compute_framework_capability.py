@@ -29,7 +29,7 @@ from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise, identify_winner
 
 
 CAPABILITY_FEATURE = "capability_test_feature"
@@ -125,38 +125,18 @@ class RejectAllCapabilityFeatureGroup(FeatureGroup):
         return None
 
 
-class PandasLikeFG(FeatureGroup):
-    """Declares only CapabilityFwA and supports the op on it (default hook).
+class DualDeclaringFG_782(FeatureGroup):
+    """Declares BOTH frameworks, supports the op on CapabilityFwA only, and rejects CapabilityFwB.
 
-    Mirrors an installed/declared backend whose framework may or may not be
-    enabled for a particular run.
+    One candidate declaring both is what makes "declared but not enabled" observable per candidate.
+    An earlier fixture split the two frameworks across two feature groups and relied on the message
+    pooling supported/rejected across candidates; #791 removed that union, so each line now names only
+    its OWN candidate's frameworks.
     """
 
     @classmethod
     def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {CapabilityFwA}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        if isinstance(feature_name, FeatureName):
-            feature_name = str(feature_name)
-        return feature_name == CAPABILITY_FEATURE
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
-
-
-class SqliteLikeFG(FeatureGroup):
-    """Declares only CapabilityFwB and rejects the op on it."""
-
-    @classmethod
-    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {CapabilityFwB}
+        return {CapabilityFwA, CapabilityFwB}
 
     @classmethod
     def match_feature_group_criteria(
@@ -193,14 +173,12 @@ class TestComputeFrameworkCapabilityHook:
             PlainCapabilityFeatureGroup: {CapabilityFwA, CapabilityFwB},
         }
 
-        identified = IdentifyFeatureGroupClass(
+        feature_group_class, compute_frameworks = identify_winner(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
             data_access_collection=None,
         )
-
-        feature_group_class, compute_frameworks = identified.get()
         assert feature_group_class is PlainCapabilityFeatureGroup
         assert compute_frameworks == {CapabilityFwA, CapabilityFwB}, (
             f"Default behaviour must keep all declared frameworks; got {compute_frameworks}"
@@ -218,21 +196,19 @@ class TestComputeFrameworkCapabilityHook:
             RejectBCapabilityFeatureGroup: {CapabilityFwA, CapabilityFwB},
         }
 
-        identified = IdentifyFeatureGroupClass(
+        feature_group_class, compute_frameworks = identify_winner(
             feature=feature,
             accessible_plugins=accessible_plugins,
             links=None,
             data_access_collection=None,
         )
-
-        feature_group_class, compute_frameworks = identified.get()
         assert feature_group_class is RejectBCapabilityFeatureGroup
         assert compute_frameworks == {CapabilityFwA}, (
             f"Unsupported CapabilityFwB must be narrowed out, leaving only CapabilityFwA; got {compute_frameworks}"
         )
 
     def test_distinguishable_error_when_pinned_to_unsupported_framework(self) -> None:
-        """Pinning to the unsupported framework yields a dedicated, distinguishable error."""
+        """Pinning to the unsupported framework names the pin as a compute-framework-pin near-miss."""
         feature = Feature(CAPABILITY_FEATURE)
         feature.compute_frameworks = {CapabilityFwB}
 
@@ -241,7 +217,7 @@ class TestComputeFrameworkCapabilityHook:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -249,19 +225,24 @@ class TestComputeFrameworkCapabilityHook:
             )
 
         error_message = str(exc_info.value)
-        lowered = error_message.lower()
 
-        assert "unsupported" in lowered or "not supported" in lowered, (
-            f"Capability error must signal an unsupported framework, but got: {error_message}"
+        assert "Feature group(s) eliminated while matching" in error_message, (
+            f"Capability pin rejection must render as a near-miss line, but got: {error_message}"
+        )
+        assert "compute framework pin" in error_message, (
+            f"A pin rejection must be labelled a compute framework pin, but got: {error_message}"
         )
         assert CapabilityFwB.get_class_name() in error_message, (
-            f"Error must name the unsupported framework '{CapabilityFwB.get_class_name()}', but got: {error_message}"
+            f"Error must name the pinned unsupported framework '{CapabilityFwB.get_class_name()}', "
+            f"but got: {error_message}"
         )
         assert CapabilityFwA.get_class_name() in error_message, (
             f"Error must name the supported framework '{CapabilityFwA.get_class_name()}', but got: {error_message}"
         )
-        assert "Did you mean" not in error_message, (
-            f"Capability error must skip the fuzzy suggestion path, but got: {error_message}"
+        # The near-miss block already names the eliminated candidate; a fuzzy suggestion must not echo it.
+        suggestion_line = next((line for line in error_message.split("\n") if line.startswith("Did you mean")), "")
+        assert RejectBCapabilityFeatureGroup.get_class_name() not in suggestion_line, (
+            f"the 'Did you mean' suggestion must not echo the already-named eliminated candidate, got: {error_message}"
         )
 
     def test_all_frameworks_reject_operation(self) -> None:
@@ -273,7 +254,7 @@ class TestComputeFrameworkCapabilityHook:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -281,11 +262,13 @@ class TestComputeFrameworkCapabilityHook:
             )
 
         error_message = str(exc_info.value)
-        lowered = error_message.lower()
 
         assert CAPABILITY_FEATURE in error_message, f"Error must mention the feature name, but got: {error_message}"
-        assert "unsupported" in lowered or "not supported" in lowered, (
-            f"Error must signal that the framework(s) are unsupported, but got: {error_message}"
+        assert "Feature group(s) eliminated while matching" in error_message, (
+            f"An all-rejected candidate must render as a capability near-miss, but got: {error_message}"
+        )
+        assert "supports_compute_framework rejected" in error_message, (
+            f"Error must signal that supports_compute_framework rejected the frameworks, but got: {error_message}"
         )
         assert CapabilityFwA.get_class_name() in error_message, (
             f"Error must name rejected framework '{CapabilityFwA.get_class_name()}', but got: {error_message}"
@@ -303,7 +286,7 @@ class TestComputeFrameworkCapabilityHook:
         }
 
         with pytest.raises(ValueError) as unknown_exc:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=unknown_feature,
                 accessible_plugins=unknown_accessible,
                 links=None,
@@ -322,42 +305,41 @@ class TestComputeFrameworkCapabilityHook:
         }
 
         with pytest.raises(ValueError) as capability_exc:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=pinned_feature,
                 accessible_plugins=capability_accessible,
                 links=None,
                 data_access_collection=None,
             )
         capability_message = str(capability_exc.value)
-        lowered = capability_message.lower()
 
-        assert "unsupported" in lowered or "not supported" in lowered, (
-            f"Capability error must signal an unsupported framework, but got: {capability_message}"
+        # Both share the base "No feature groups found" line now; the capability rejection is
+        # distinguished by its near-miss block, which the unknown-feature error never carries.
+        assert "Feature group(s) eliminated while matching" in capability_message, (
+            f"Capability error must name the eliminated near-miss candidate, but got: {capability_message}"
         )
-        assert "No feature groups found for feature name" not in capability_message, (
-            f"Capability error must be distinguishable from the unknown-feature error, but got: {capability_message}"
+        assert "Feature group(s) eliminated while matching" not in unknown_message, (
+            f"Unknown-feature error must carry no near-miss block, but got: {unknown_message}"
         )
 
-    def test_supported_list_includes_declared_but_not_enabled_framework(self) -> None:
-        """A declared+available+supporting framework appears in 'Supported on' even if not enabled this run.
+    def test_capability_reason_names_only_run_enabled_rejected_framework(self) -> None:
+        """Run-only capability reason: only the run-enabled framework the candidate rejected is named.
 
-        Change B: the 'Supported on' list must be derived from each criteria-matched
-        feature group's ``compute_framework_definition()`` intersected with availability
-        and ``supports_compute_framework``, NOT from the run-enabled set. Here CapabilityFwA
-        is declared by ``PandasLikeFG`` and available, but is NOT enabled for this run
-        (its accessible_plugins value is an empty set). It must still show up as supported.
+        os-011 (Q2 = run-only) dropped the wider declared-available universe. ``DualDeclaringFG_782``
+        declares {CapabilityFwA, CapabilityFwB} and supports the op on CapabilityFwA, but only CapabilityFwB
+        is enabled for this run and CapabilityFwB is exactly what it rejects. The capability reason names only
+        the run-enabled, rejected CapabilityFwB; the declared-but-not-enabled CapabilityFwA no longer appears.
         """
         feature = Feature(CAPABILITY_FEATURE)
         feature.compute_frameworks = {CapabilityFwB}
 
-        # FwA declared by PandasLikeFG but NOT enabled (empty set); FwB enabled for SqliteLikeFG.
+        # Only FwB is enabled for the run, and it is exactly the framework this candidate rejects.
         accessible_plugins: FeatureGroupEnvironmentMapping = {
-            PandasLikeFG: set(),
-            SqliteLikeFG: {CapabilityFwB},
+            DualDeclaringFG_782: {CapabilityFwB},
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -365,18 +347,20 @@ class TestComputeFrameworkCapabilityHook:
             )
 
         error_message = str(exc_info.value)
-        lowered = error_message.lower()
 
-        assert "unsupported" in lowered or "not supported" in lowered, (
-            f"Capability error must signal an unsupported framework, but got: {error_message}"
+        assert "Feature group(s) eliminated while matching" in error_message, (
+            f"Capability rejection must render as a near-miss line, but got: {error_message}"
         )
-        assert CapabilityFwB.get_class_name() in error_message, (
-            f"Error must name the unsupported framework '{CapabilityFwB.get_class_name()}', but got: {error_message}"
+        assert f"supports_compute_framework rejected ['{CapabilityFwB.get_class_name()}']" in error_message, (
+            f"Reason must name the run-enabled rejected framework '{CapabilityFwB.get_class_name()}', "
+            f"but got: {error_message}"
         )
-        assert CapabilityFwA.get_class_name() in error_message, (
-            "Error 'Supported on' list must include the declared+available+supporting framework "
-            f"'{CapabilityFwA.get_class_name()}' even though it was not enabled this run, but got: {error_message}"
+        assert CapabilityFwA.get_class_name() not in error_message, (
+            "run-only capability reason must not name the declared-but-not-enabled framework "
+            f"'{CapabilityFwA.get_class_name()}', but got: {error_message}"
         )
-        assert "Did you mean" not in error_message, (
-            f"Capability error must skip the fuzzy suggestion path, but got: {error_message}"
+        # The eliminated candidate is named in the near-miss block; a fuzzy suggestion must not echo it.
+        suggestion_line = next((line for line in error_message.split("\n") if line.startswith("Did you mean")), "")
+        assert DualDeclaringFG_782.get_class_name() not in suggestion_line, (
+            f"the 'Did you mean' suggestion must not echo the already-named eliminated candidate, got: {error_message}"
         )

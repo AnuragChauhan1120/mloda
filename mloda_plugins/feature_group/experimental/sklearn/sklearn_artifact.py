@@ -9,8 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from mloda.core.abstract_plugins.components.utils import contained_raise_reason
 from mloda.provider import BaseArtifact
 from mloda.provider import FeatureSet
+from mloda.provider import property_spec
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,12 @@ class SklearnArtifact(BaseArtifact):
     This class also provides helper methods for managing multiple artifacts
     in sklearn feature groups (encoding, scaling, pipeline).
     """
+
+    ARTIFACT_STORAGE_PATH = "artifact_storage_path"
+    ARTIFACT_STORAGE_PATH_SPEC = property_spec(
+        "Filesystem directory for persisting fitted sklearn artifacts; owned by SklearnArtifact, exposed by each sklearn feature group. Defaults to the system temp dir.",
+        default=None,
+    )
 
     @classmethod
     def _serialize_artifact(cls, artifact: dict[str, Any]) -> str:
@@ -164,7 +172,7 @@ class SklearnArtifact(BaseArtifact):
 
         options = cls.get_singular_option_from_options(features)
         if options:
-            storage_path = options.get("artifact_storage_path")
+            storage_path = options.get(cls.ARTIFACT_STORAGE_PATH)
 
         if storage_path is None:
             storage_path = tempfile.gettempdir()
@@ -199,7 +207,7 @@ class SklearnArtifact(BaseArtifact):
 
         options = cls.get_singular_option_from_options(features)
         if options:
-            storage_path = options.get("artifact_storage_path")
+            storage_path = options.get(cls.ARTIFACT_STORAGE_PATH)
         if storage_path is None:
             storage_path = tempfile.gettempdir()
 
@@ -224,7 +232,9 @@ class SklearnArtifact(BaseArtifact):
                     loaded_artifacts[artifact_key] = artifact_data
 
             except Exception as e:
-                logger.warning("Failed to load artifact from %s: %s", file_path, e)
+                # The reason as text, not the exception: an object in LogRecord.args pins its traceback,
+                # so a retained record would hold the frames of the failed load.
+                logger.warning("Failed to load artifact from %s: %s", file_path, contained_raise_reason(e))
                 continue
 
         if loaded_artifacts:

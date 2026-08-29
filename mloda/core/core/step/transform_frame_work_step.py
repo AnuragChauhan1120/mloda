@@ -9,6 +9,7 @@ from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.core.cfw_manager import CfwManager
 from mloda.core.core.step.abstract_step import Step
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
+from mloda.core.optional_dependency import loaded
 from mloda.core.runtime.flight.flight_server import FlightServer
 
 
@@ -22,6 +23,7 @@ class TransformFrameworkStep(Step):
         to_feature_group: type[FeatureGroup],
         link_id: Optional[UUID] = None,
         source_framework_uuids: Optional[set[UUID]] = None,
+        source_step_uuid: Optional[UUID] = None,
     ) -> None:
         if source_framework_uuids is None:
             source_framework_uuids = set()
@@ -32,6 +34,9 @@ class TransformFrameworkStep(Step):
         self.from_feature_group = from_feature_group
         self.to_feature_group = to_feature_group
         self.link_id = link_id
+        # Hops built by add_tfs carry at most one of link_id (join hops) or source_step_uuid
+        # (plain hops), never both.
+        self.source_step_uuid = source_step_uuid
         self.transformer = ComputeFrameworkTransformer()
 
         # This variable is only set, if the TFS was requested by a joinstep.
@@ -44,15 +49,29 @@ class TransformFrameworkStep(Step):
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, TransformFrameworkStep):
             return False
+        # A join's hop and a plain hop of the same shape are different steps (the join looks
+        # its hop up by link_id), so link_id is part of the identity; source_step_uuid is included
+        # for the same reason, since execute() only ever moves one source's data per hop.
         return (
             self.from_framework == other.from_framework
             and self.to_framework == other.to_framework
             and self.from_feature_group == other.from_feature_group
             and self.to_feature_group == other.to_feature_group
+            and self.link_id == other.link_id
+            and self.source_step_uuid == other.source_step_uuid
         )
 
     def __hash__(self) -> int:
-        return hash((self.from_framework, self.to_framework, self.from_feature_group, self.to_feature_group))
+        return hash(
+            (
+                self.from_framework,
+                self.to_framework,
+                self.from_feature_group,
+                self.to_feature_group,
+                self.link_id,
+                self.source_step_uuid,
+            )
+        )
 
     def get_uuids(self) -> set[UUID]:
         return {self.uuid}
@@ -117,11 +136,21 @@ class TransformFrameworkStep(Step):
         cfw.set_data(data)
 
     def transform(self, cfw: ComputeFramework, data: Any, feature_names: set[str]) -> Any:
-        if self.equal_frameworks():
-            return data
-
         _from_fw = self.from_framework.expected_data_framework()
         _to_fw = self.to_framework.expected_data_framework()
+
+        pa = loaded("pyarrow")
+        if (
+            pa is not None
+            and isinstance(data, pa.Table)
+            and isinstance(_from_fw, type)
+            and not isinstance(data, _from_fw)
+        ):
+            # Flight transport hands back a pa.Table whatever the source framework's native type is.
+            _from_fw = pa.Table
+
+        if _from_fw == _to_fw:
+            return data
 
         # Try to find a transformation chain (direct or through PyArrow)
         transformation_chain = self.transformer.get_transformation_chain(_from_fw, _to_fw)
@@ -135,8 +164,3 @@ class TransformFrameworkStep(Step):
         return self.transformer.apply_chain(
             _from_fw, _to_fw, transformation_chain, data, cfw.framework_connection_object
         )
-
-    def equal_frameworks(self) -> bool:
-        if self.from_framework.expected_data_framework() == self.to_framework.expected_data_framework():
-            return True
-        return False

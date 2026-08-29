@@ -4,7 +4,6 @@ Base implementation for dimensionality reduction feature groups.
 
 from __future__ import annotations
 
-import numbers
 from abc import abstractmethod
 from typing import Any, Optional
 
@@ -14,19 +13,11 @@ from mloda.provider import CHAIN_SEPARATOR, FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMNWISE_HOOKS
 from mloda.provider import FeatureSet
 from mloda.user import Options
 from mloda.provider import DefaultOptionKeys
-from mloda.provider import PropertySpec
-
-
-def _is_positive_int(value: Any) -> bool:
-    """Accept any positive integer (int, numpy int, decimal string), so bool, 0, -5, 2.5, "abc" and "²" are rejected."""
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, numbers.Integral):
-        return int(value) > 0
-    return isinstance(value, str) and value.isdecimal() and int(value) > 0
+from mloda.provider import PropertySpec, is_positive_int
 
 
 class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup):
@@ -129,6 +120,9 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = None
 
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
+
     PROPERTY_MAPPING = {
         ALGORITHM: PropertySpec(
             "Dimensionality reduction algorithm to use",
@@ -140,14 +134,15 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
             "Target dimension for the reduction (positive integer)",
             context=True,
             strict_validation=True,
-            element_validator=_is_positive_int,
+            element_validator=is_positive_int,
+            deferred_binding=True,  # parsed from the name by this group, not a framework-bound capture (#769)
         ),
         DefaultOptionKeys.in_features: PropertySpec(
             "Source features to use for dimensionality reduction",
             context=True,
             strict_validation=False,
         ),
-        # The algorithm-specific numeric keys below share _is_positive_int across both hooks.
+        # The algorithm-specific numeric keys below share is_positive_int across both hooks.
         # element_validator produces the rejection message and checks the declared default at
         # construction; it runs on BOTH match paths, so it alone enforces the value space. match_guard
         # additionally judges the raw, un-unpacked value.
@@ -157,16 +152,16 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
             context=True,
             strict_validation=True,
             default=250,
-            element_validator=_is_positive_int,
-            match_guard=_is_positive_int,
+            element_validator=is_positive_int,
+            match_guard=is_positive_int,
         ),
         TSNE_N_ITER_WITHOUT_PROGRESS: PropertySpec(
             "Maximum iterations without progress before early stopping (t-SNE)",
             context=True,
             strict_validation=True,
             default=50,
-            element_validator=_is_positive_int,
-            match_guard=_is_positive_int,
+            element_validator=is_positive_int,
+            match_guard=is_positive_int,
         ),
         TSNE_METHOD: PropertySpec(
             "t-SNE computation method",
@@ -197,8 +192,8 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
             context=True,
             strict_validation=True,
             default=200,
-            element_validator=_is_positive_int,
-            match_guard=_is_positive_int,
+            element_validator=is_positive_int,
+            match_guard=is_positive_int,
         ),
         # Isomap specific parameters
         ISOMAP_N_NEIGHBORS: PropertySpec(
@@ -206,8 +201,8 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
             context=True,
             strict_validation=True,
             default=5,
-            element_validator=_is_positive_int,
-            match_guard=_is_positive_int,
+            element_validator=is_positive_int,
+            match_guard=is_positive_int,
         ),
     }
 
@@ -374,37 +369,6 @@ class DimensionalityReductionFeatureGroup(FeatureChainParserMixin, FeatureGroup)
             # Add the result to the data
             data = cls._add_result_to_data(data, feature.name, result)
         return data
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of feature names to check
-
-        Raises:
-            ValueError: If any of the features do not exist in the data.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
-        """
-        ...
 
     @classmethod
     @abstractmethod

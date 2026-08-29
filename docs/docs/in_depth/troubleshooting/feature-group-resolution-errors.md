@@ -1,38 +1,126 @@
 # Feature Group Resolution Errors
 
 Resolution runs inside a full `mloda` request, but you do not need to build one
-to reproduce a resolution error. `resolve_feature` (from `mloda.steward`) runs
+to reproduce a resolution error. `resolve_feature` (from `mloda.provider`) runs
 the **same matcher over the same candidate universe** as a run and reports what a
 run would, without raising: the failure lands in `result.error` instead of an
-exception, so the message below is the message you get back.
+exception, so for the matching failures on this page the message below is the
+message you get back.
 
-``` python
-from mloda.steward import resolve_feature
+```python
+from mloda.provider import resolve_feature
 
 result = resolve_feature("my_feature")  # or resolve_feature(Feature(...)) for a full request
 if result.error:
-    print(result.error)  # the same message a run raises
+    print(result.error)  # for a matching failure, the same message a run raises
     print([fg.__name__ for fg in result.candidates])
 ```
 
-Its environment is a standalone default (`result.environment` is
-`"standalone-default"`), not a replay of a specific run. Pass a `Feature`,
-`options`, `plugin_collector`, `links`, `data_access_collection`, or
-`compute_frameworks` (a run that restricts its frameworks needs this to mirror)
-to reproduce the run you are debugging. See
+One failure is reported rather than echoed: a plugin that raises while declaring
+its frameworks fails the environment build, which `resolve_feature` prefixes with
+`Failed to build the plugin environment:` where a run raises it bare. See
+[Broken framework declarations](../discover-plugins.md#broken-framework-declarations).
+
+Its candidate universe is a standalone default, not a replay of a specific run.
+Pass a `Feature`, `options`, `plugin_collector`, `links`,
+`data_access_collection`, or `compute_frameworks` (a run that restricts its
+frameworks needs this to mirror) to reproduce the run you are debugging. See
 [Discover Plugins](../discover-plugins.md) for the full signature.
+
+## Catching resolution failures
+
+Inside a run, a feature that does not resolve to exactly one FeatureGroup raises
+`FeatureResolutionError` during planning (the `mloda.run_all(...)` /
+`mloda.prepare(...)` call, before any compute runs). It is a `ValueError`
+subclass, so existing `except ValueError` handlers keep working, but you can now
+catch it specifically and inspect why it failed:
+
+```python
+from mloda.provider import FeatureResolutionError
+from mloda.user import mloda
+
+try:
+    mloda.run_all(["my_feature"])
+except FeatureResolutionError as err:
+    print(err.feature_name)   # the feature that failed to resolve
+    print(err)                # the human-readable message a run prints
+    for record in err.partial_records:
+        print(record.feature_name, record.requested)  # features resolved before the failure
+    # err.result carries the per-candidate elimination facts (an EvaluationResult)
+```
+
+To inspect a request without catching an exception, use the non-raising
+surfaces: `resolve_feature` for a single name (above), or `mlodaAPI.diagnose(...)`,
+which returns a `ResolutionDiagnosis` for the whole request. See
+[mlodaAPI](../mloda-api.md#diagnose-and-resolution_report) for both, plus the
+fields on `FeatureResolutionError`, `ResolutionDiagnosis`, and `ResolutionRecord`.
+
+## No Feature Groups Found Error
+
+### The Problem
+
+```
+FeatureResolutionError: No feature groups found for feature name: 'sales_revnue'. Requested domain: 'marketing'.
+Feature group(s) eliminated while matching 'sales_revnue':
+  - MarketingRevenueGroup (compute framework): none of its compute frameworks are enabled for this run
+  - SalesFeatureGroup (domain): declares domain 'sales', but the run requested 'marketing'
+Did you mean one of: ['sales_revenue']?
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+No enabled feature group both declared the requested name and survived every matching gate. It is raised as `FeatureResolutionError` during planning; see [Catching resolution failures](#catching-resolution-failures) to inspect it, or follow the message's closing pointer and rerun the request through `resolve_feature`. Pass the same `Feature` and run arguments, as the top of this page describes; the bare name alone would drop the domain and default to all frameworks, changing the outcome.
+
+### The eliminated candidates block
+
+Each line names a candidate the matcher considered and dropped: the first gate that eliminated it (the parenthesized label) and that gate's reason. A line does not prove the candidate declared the requested name; a candidate whose match hook raised or whose input-data gate declined is recorded regardless.
+
+| Label | What eliminated the candidate | Typical fix |
+| --- | --- | --- |
+| `option value` | The group declined an option value in the request. | Fix the value the reason names. |
+| `input data` | The input-data gate declined the request. | Point the request at data the group can read ([Data Access Patterns](../data-access-patterns.md)). |
+| `match hook` | The group's match hook raised; the error is contained and quoted. | Fix the plugin bug it names. |
+| `domain` | The group declares a different domain than the request. | Align the requested domain ([domain solution below](#3-use-domains-to-separate-feature-groups)). |
+| `scope` | The group is outside the requested `feature_group` scope. | Widen or correct the scope ([scope solution below](#4-scope-a-feature-to-one-source-shared-keys-across-sources)). |
+| `compute framework` | None of the group's compute frameworks are usable: its capability hook rejected every enabled framework, or none of its frameworks is enabled for the run. | Enable a framework the group supports. |
+| `compute framework pin` | The `Feature` pins `compute_frameworks` to one that is not among the group's supported set for this run. | Change or drop the pin. |
+| `links` | No index column of the group matches the run's links. | Align the run's links with the group's index. |
+
+### The Did you mean hint
+
+Suggestions are close matches drawn from the catalog of accessible groups: declared feature names, class names, and class-name prefixes. The hint drops what would only repeat or mislead: the requested name itself, names the eliminated-candidates block already covers, and names only unreachable groups declare (abstract, no enabled framework, or outside the requested domain, scope, or links). A missing hint therefore means no reachable group declares anything close. In the example above, 'sales_revenue' survives because a third, still-reachable group declares it; the two eliminated candidates could not have contributed it.
+
+### Only abstract feature group bases matched
+
+A sibling variant fires when an abstract base matched the name and no concrete group won:
+
+```
+No feature groups found for feature name: 'my_feature'. Only abstract feature group base(s) matched, which cannot be instantiated; no concrete implementation is available or enabled.
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+or, when concrete implementations exist but their compute frameworks do not:
+
+```
+No feature groups found for feature name: 'my_feature'. Its concrete implementations require compute framework(s) ['PandasDataFrame'], none of which are available or enabled for this run.
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+For the first shape, import or enable a concrete implementation. For the second, enable one of the named compute frameworks; the list comes from the base's accessible concrete implementations, so check that the one you enable actually serves the name. Eliminated candidates, if any, still render in their block, and the message closes with the same pointer lines as the ordinary form. Only the Did-you-mean suggestion is dropped, because the name already matched a base.
 
 ## Multiple Feature Groups Error
 
 ### The Problem
 
 ```
-ValueError: Multiple feature groups found for feature '<feature_name>':
+FeatureResolutionError: Multiple feature groups found for feature '<feature_name>':
   - FeatureGroupA (...) [domain: ...]
   - FeatureGroupB (...) [domain: ...]
 ```
 
-This error occurs when multiple distinct feature groups claim they can handle the same feature. Each feature must resolve to exactly one feature group to prevent conflicts.
+This error occurs when multiple distinct feature groups claim they can handle the same feature. Each feature must resolve to exactly one feature group to prevent conflicts. It is raised as `FeatureResolutionError` (a `ValueError` subclass) during planning; see [Catching resolution failures](#catching-resolution-failures) to inspect it.
 
 If you previously hit this in a notebook because of a redefined feature group (re-running a cell that defines `class MyFG(FeatureGroup): ...`), that case is now auto-deduplicated. If this error still appears, it points to a real conflict between two distinct classes (different `(module, qualname)`).
 
@@ -41,7 +129,7 @@ If you previously hit this in a notebook because of a redefined feature group (r
 #### 1. Use PluginCollector to enable or disable feature groups
 Control which feature groups are loaded to prevent conflicts:
 
-``` python
+```py
 from mloda.user import PluginCollector
 
 # Disable specific conflicting feature groups
@@ -65,15 +153,17 @@ plugin_loader.load_group("feature_group") # load plugins only from mloda_plugins
 
 #### 3. Use Domains to Separate Feature Groups
 ```python
+from mloda.user import Domain
+
 @classmethod
 def get_domain(cls):
-    return "sales"  # Makes this FG only handle 'sales' domain features
+    return Domain("sales")  # Makes this FG only handle 'sales' domain features
 ```
 
 #### 4. Scope a feature to one source (shared keys across sources)
-When two enabled sources declare the same column (for example a shared join key), requesting that column by bare name is ambiguous. Scope the request to one source. The scope is resolution-only and does not affect feature identity.
+When two enabled sources declare the same column (for example a shared join key), requesting that column by bare name is ambiguous. Scope the request to one source. The scope is read by feature resolution and by filter matching, and does not affect feature identity.
 
-``` python
+```py
 # class object, collision-proof
 Feature("subject_token", feature_group=ClaimsReader)
 
@@ -83,7 +173,7 @@ Feature("subject_token", feature_group="ClaimsReader")
 
 The same scope in a JSON config ([feature config](../feature-config.md)):
 
-``` json
+```json
 [
     {"name": "subject_token", "feature_group": "ClaimsReader"}
 ]
@@ -93,7 +183,7 @@ The config form takes the class-name string only, because JSON cannot express a 
 
 Both forms match the scoped class and its subclasses, preferring the most specific one. Naming an abstract family base therefore selects the concrete subclass, so a config can scope to the family without naming a compute-framework-specific class:
 
-``` json
+```json
 [
     {"name": "age__mean_aggr", "feature_group": "AggregatedFeatureGroup"}
 ]
@@ -105,7 +195,7 @@ Caveats:
 - The class object is collision-proof; the string form is not. Two classes with the same name in different modules both match the string, so the request stays ambiguous and raises.
 - Neither form pins one exact class: a subclass of the named class is preferred over it. To resolve to a specific implementation, name that implementation.
 - The root `FeatureGroup` base is rejected in either form: it names no family.
-- The scope is resolution-only and excluded from Feature identity, so two requests for the same column name scoped to different sources compare equal. Requesting both in one features list raises `ValueError: Duplicate feature setup: <name>` rather than silently dropping one, so you are told, not surprised. Inside a single `input_features()` returning a set literal, a second same-name feature with a different scope is silently deduplicated by the Python set itself before the engine ever sees it, so never scope the same name twice within one feature group. To read the same column from two sources side by side, give them distinct derived feature names.
+- The scope is read by feature resolution and by filter matching, and stays excluded from Feature identity, so two requests for the same column name scoped to different sources compare equal. Requesting both in one features list raises `ValueError: Duplicate feature setup: <name>` rather than silently dropping one, so you are told, not surprised. Inside a single `input_features()` returning a set literal, a second same-name feature with a different scope is silently deduplicated by the Python set itself before the engine ever sees it, so never scope the same name twice within one feature group. To read the same column from two sources side by side, give them distinct derived feature names.
 
 ## FeatureGroup Redefinition Errors
 
@@ -195,7 +285,7 @@ relevant entries, return a *schema-bearing* empty result: keep the columns and
 drop the rows. On PythonDict that is a dict with empty column lists; on the
 other frameworks it is an empty typed table or frame with the right columns.
 
-``` python
+```py
 class MyFeatureGroup(FeatureGroup):
     @classmethod
     def calculate_feature(cls, data, features):

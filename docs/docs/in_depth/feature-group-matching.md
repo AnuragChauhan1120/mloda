@@ -23,7 +23,17 @@ def match_feature_group_criteria(cls, feature_name, options, data_access_collect
     return cls.match_parser_criteria(feature_name, options)
 ```
 
-Do not call `FeatureChainParser.match_configuration_feature_chain_parser` directly from a match hook: it raises on an option value the `PROPERTY_MAPPING` rejects, and an exception out of the hook aborts feature identification for every candidate, not just yours. `match_parser_criteria` turns that rejection into a non-match, and the reason still reaches the user in the "No feature groups found" error.
+Do not call `FeatureChainParser.match_configuration_feature_chain_parser` directly from a match hook: it raises on an option value the `PROPERTY_MAPPING` rejects. An exception out of a match hook is contained as a `match hook` near-miss for that candidate instead of taking the whole resolution down, but a contained crash is a worse reason than a rejection. `match_parser_criteria` turns that rejection into a non-match, and the reason still reaches the user in the "No feature groups found" error.
+
+Containment covers plugin raises only: a framework-owned raise (a two-readers conflict, a forwarded value contradicting the feature name, a rejected effective-options build) still aborts the whole resolution, because it reports a misconfiguration you have to fix.
+
+Filter matching contains the same way: a raise is a non-match for that probe, like a `False` return, and is recorded in `GlobalFilter.dropped_filters` as a `match hook` near-miss, as is a typed decline the matcher records; a framework-owned raise still aborts. Every entry names the gate that dropped the filter and that gate's reason. [How filters reach your FeatureGroup](filter_data.md#how-filters-reach-your-featuregroup) tables the gates the two paths share and where filter policy differs.
+
+The probe runs per feature, but a matched filter attaches to the whole `FeatureSet`, so a non-match for one feature does not suppress a filter a sibling matched. See [Filter scope](filter_data.md#filter-scope-is-the-featureset).
+
+Every caller reads the return by truthiness: any falsy value is a non-match, any truthy value a match. Filter matching additionally reports a falsy value that is not `False`, and each distinct report is a WARNING once per setup.
+
+The options view depends on the caller: feature resolution passes declared (pre-default) options, while filter matching runs after intake and passes the resolved feature's effective (post-default) options merged onto the filter feature's own. Matching logic that reads option values can see different values on the two paths. See [Applying declared defaults](property-mapping.md#applying-declared-defaults).
 
 ### 2. PROPERTY_MAPPING Configuration
 
@@ -95,25 +105,29 @@ For feature groups not yet modernized, the default matching criteria still apply
 1. **Root Feature with Matching Input Data**: The feature group is a root feature (has no dependencies) and its input data matches the feature.
 
 2. **Class Name Match**: The feature name exactly matches the feature group's class name.
-   ``` python
+   ```py
    feature_name == FeatureGroup.get_class_name()
    ```
 
 3. **Prefix Match**: The feature name starts with the feature group's class name as a prefix.
-   ``` python
+   ```py
    feature_name.startswith(FeatureGroup.prefix())  # Default prefix is "ClassName_"
    ```
 
 4. **Explicitly Supported**: The feature name is in the set of explicitly supported feature names.
-   ``` python
+   ```py
    feature_name in FeatureGroup.feature_names_supported()
    ```
+
+An owned reader veto recorded during rule 1 (the user addressed the reader family by name and its declaration rejected the request, or its probe recorded a content decline and matched nothing) gates the name-based rules 2 to 4; see [Data Access Patterns](data-access-patterns.md) for the recording contract.
 
 ## Matching Examples
 
 ### Modern Feature Group (Aggregation)
 
-``` python
+```python
+from mloda.user import Feature, Options
+
 # String-based matching
 feature = Feature("sales__sum_aggr")  # Matches via pattern
 
@@ -131,7 +145,7 @@ feature = Feature(
 
 The group/context parameter separation affects matching behavior:
 
-``` python
+```python
 # These create different Feature Group instances (different group parameters)
 feature1 = Feature("placeholder", Options(
     group={"data_source": "production"},

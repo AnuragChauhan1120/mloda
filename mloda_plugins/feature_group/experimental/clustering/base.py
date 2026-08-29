@@ -13,9 +13,10 @@ from mloda.provider import CHAIN_SEPARATOR, FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMN_DISCOVERY_HOOKS
 from mloda.provider import FeatureSet
 from mloda.provider import DefaultOptionKeys
-from mloda.provider import PropertySpec
+from mloda.provider import PropertySpec, is_positive_int
 
 
 def _is_bool(value: Any) -> bool:
@@ -116,6 +117,9 @@ class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = None  # Unlimited in_features allowed
 
+    # Hooks calculate_feature calls: _get_available_columns, _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMN_DISCOVERY_HOOKS
+
     # Property mapping for configuration-based feature creation
     PROPERTY_MAPPING = {
         ALGORITHM: PropertySpec(
@@ -128,9 +132,8 @@ class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             "Number of clusters or 'auto' for automatic determination",
             context=True,
             strict_validation=True,
-            element_validator=lambda value: (
-                value == "auto" or (isinstance(value, (int, str)) and str(value).isdigit() and int(value) > 0)
-            ),
+            element_validator=lambda value: value == "auto" or is_positive_int(value),
+            deferred_binding=True,  # parsed from the name by this group, not a framework-bound capture (#769)
         ),
         DefaultOptionKeys.in_features: PropertySpec(
             "Source features to use for clustering",
@@ -314,7 +317,7 @@ class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             cls._check_source_features_exist(data, resolved_features)
 
             # Check if we should output probabilities
-            output_probabilities = cls.options_with_defaults(feature.options).get(cls.OUTPUT_PROBABILITIES)
+            output_probabilities = feature.options.get(cls.OUTPUT_PROBABILITIES)
 
             # Perform clustering
             if output_probabilities:
@@ -336,51 +339,6 @@ class ClusteringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
                 data = cls._add_result_to_data(data, feature.name, result)
 
         return data
-
-    @classmethod
-    @abstractmethod
-    def _get_available_columns(cls, data: Any) -> set[str]:
-        """
-        Get the set of available column names from the data.
-
-        Args:
-            data: The input data
-
-        Returns:
-            Set of column names available in the data
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the resolved source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of resolved feature names (may contain ~N suffixes)
-
-        Raises:
-            ValueError: If none of the features exist in the data (partial presence is accepted).
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
-        """
-        ...
 
     @classmethod
     @abstractmethod

@@ -17,6 +17,7 @@ from mloda.provider import FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMNWISE_HOOKS
 from mloda.provider import BaseArtifact
 from mloda.provider import DefaultOptionKeys
 from mloda.provider import PropertySpec
@@ -86,7 +87,7 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         "preprocessing": "Standard preprocessing pipeline with imputation and scaling",
         "scaling": "Feature scaling pipeline",
         "imputation": "Missing value imputation pipeline",
-        "feature_engineering": "Feature engineering pipeline",
+        "feature_engineering": "Degree-2 polynomial and interaction feature generation, followed by scaling",
     }
 
     # Property mapping for new configuration-based approach
@@ -119,6 +120,7 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             context=True,
             strict_validation=False,
         ),
+        SklearnArtifact.ARTIFACT_STORAGE_PATH: SklearnArtifact.ARTIFACT_STORAGE_PATH_SPEC,
     }
 
     PREFIX_PATTERN = r".*__sklearn_pipeline_([\w]+)$"
@@ -128,6 +130,9 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     IN_FEATURE_SEPARATOR = ","  # Use comma for multiple source features
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES: Optional[int] = None  # Unlimited
+
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
 
     @staticmethod
     def artifact() -> type[BaseArtifact] | None:
@@ -432,10 +437,11 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         components = {}
 
         try:
-            from sklearn.preprocessing import StandardScaler
+            from sklearn.preprocessing import PolynomialFeatures, StandardScaler
             from sklearn.pipeline import Pipeline
 
             components["StandardScaler"] = StandardScaler
+            components["PolynomialFeatures"] = PolynomialFeatures
             components["Pipeline"] = Pipeline
 
             # Try to import SimpleImputer from different locations depending on sklearn version
@@ -468,21 +474,52 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
         Returns:
             Default pipeline configuration
+
+        Raises:
+            ValueError: If the pipeline type has no dispatch branch.
+            ImportError: If a component the pipeline type needs is unavailable.
         """
         sklearn_components = cls._import_sklearn_components()
         StandardScaler = sklearn_components["StandardScaler"]
         SimpleImputer = sklearn_components.get("SimpleImputer")
+        PolynomialFeatures = sklearn_components.get("PolynomialFeatures")
 
-        # Define common pipeline configurations
-        if pipeline_name == "preprocessing" and SimpleImputer:
-            return {"steps": [("imputer", SimpleImputer(strategy="mean")), ("scaler", StandardScaler())], "params": {}}
-        elif pipeline_name == "scaling":
+        def _require(component: Any, name: str) -> Any:
+            # A declared type must fail loudly when its component is missing rather
+            # than quietly degrading to a different pipeline than the one requested.
+            if component is None:
+                raise ImportError(
+                    f"The '{pipeline_name}' pipeline requires {name}, which is not available in the "
+                    "installed scikit-learn version."
+                )
+            return component
+
+        if pipeline_name == "scaling":
             return {"steps": [("scaler", StandardScaler())], "params": {}}
-        elif pipeline_name == "imputation" and SimpleImputer:
-            return {"steps": [("imputer", SimpleImputer(strategy="mean"))], "params": {}}
-        else:
-            # Default to simple scaling
-            return {"steps": [("scaler", StandardScaler())], "params": {}}
+
+        if pipeline_name == "preprocessing":
+            imputer = _require(SimpleImputer, "SimpleImputer")
+            return {"steps": [("imputer", imputer(strategy="mean")), ("scaler", StandardScaler())], "params": {}}
+
+        if pipeline_name == "imputation":
+            imputer = _require(SimpleImputer, "SimpleImputer")
+            return {"steps": [("imputer", imputer(strategy="mean"))], "params": {}}
+
+        if pipeline_name == "feature_engineering":
+            poly = _require(PolynomialFeatures, "PolynomialFeatures")
+            return {
+                "steps": [
+                    ("poly", poly(degree=2, include_bias=False)),
+                    ("scaler", StandardScaler()),
+                ],
+                "params": {},
+            }
+
+        # Every value in PIPELINE_TYPES is dispatched above. Anything else is a
+        # declaration/dispatch mismatch and must not silently become scaling.
+        raise ValueError(
+            f"Unsupported pipeline type {pipeline_name!r}; supported types are {sorted(cls.PIPELINE_TYPES)}."
+        )
 
     @classmethod
     def _pipeline_matches_config(cls, fitted_pipeline: Any, config: dict[str, Any]) -> bool:
@@ -565,36 +602,5 @@ class SklearnPipelineFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
         Returns:
             Transformed data
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of feature names to check
-
-        Raises:
-            ValueError: If any of the features do not exist in the data.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
         """
         ...

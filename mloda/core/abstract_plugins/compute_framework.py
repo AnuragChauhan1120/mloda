@@ -1,5 +1,5 @@
 from abc import ABC
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, Optional, final
 from uuid import UUID, uuid4
 from mloda.core.abstract_plugins.components.data_types import DataType
@@ -601,6 +601,20 @@ class ComputeFramework(ABC):
     def get_class_name(cls) -> str:
         return cls.__name__
 
+    @staticmethod
+    @final
+    def select_deterministic(frameworks: Iterable[type["ComputeFramework"]]) -> type["ComputeFramework"]:
+        """Set iteration over class objects is id-based, so reduce by a total name key instead."""
+        candidates = list(frameworks)
+        if not candidates:
+            raise ValueError("Cannot select a compute framework from an empty collection.")
+
+        # Module and qualname break ties between frameworks sharing a class name; the name alone leaves those to id order.
+        def key(framework: type["ComputeFramework"]) -> tuple[str, str, str]:
+            return (framework.get_class_name(), framework.__module__, framework.__qualname__)
+
+        return min(candidates, key=key)
+
     @final
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ComputeFramework):
@@ -668,6 +682,12 @@ class ComputeFramework(ABC):
 
     @final
     def run_calculate_feature(self, feature_group: Any, features: Any) -> Any:
+        # Local import: feature_set -> feature -> compute_framework would cycle at module level.
+        from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+
+        # Tests pass non-FeatureSet stand-ins for features; only a real FeatureSet is materialized (#796).
+        if isinstance(features, FeatureSet):
+            features.materialize_option_defaults(feature_group)
         extender = self.get_function_extender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
 
         try:
@@ -800,7 +820,7 @@ Available join types:
     @final
     def get_uuid(self) -> UUID:
         if self.uuid is None:
-            raise ValueError("UUID is not set")
+            raise ValueError(f"UUID is not set on compute framework {self.__class__.__name__}")
         return self.uuid
 
     @final

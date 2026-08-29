@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import is_no_default
+from mloda.core.abstract_plugins.components.property_spec import is_no_default
 from mloda.provider import DefaultOptionKeys, FeatureChainParser, PropertySpec
 from mloda.user import Options
 from mloda_plugins.feature_group.experimental.aggregated_feature_group.base import AggregatedFeatureGroup
@@ -124,16 +124,18 @@ EXPECTED_OPTIONAL_KEYS: dict[type[Any], frozenset[str]] = {
             DimensionalityReductionFeatureGroup.ISOMAP_N_NEIGHBORS,
         }
     ),
-    ForecastingFeatureGroup: frozenset({ForecastingFeatureGroup.OUTPUT_CONFIDENCE_INTERVALS}),
+    ForecastingFeatureGroup: frozenset(
+        {ForecastingFeatureGroup.OUTPUT_CONFIDENCE_INTERVALS, DefaultOptionKeys.reference_time}
+    ),
     GeoDistanceFeatureGroup: frozenset(),
     NodeCentralityFeatureGroup: frozenset(
         {NodeCentralityFeatureGroup.GRAPH_TYPE, NodeCentralityFeatureGroup.WEIGHT_COLUMN}
     ),
-    EncodingFeatureGroup: frozenset(),
-    SklearnPipelineFeatureGroup: frozenset({SklearnPipelineFeatureGroup.PIPELINE_PARAMS}),
-    ScalingFeatureGroup: frozenset(),
+    EncodingFeatureGroup: frozenset({"artifact_storage_path"}),
+    SklearnPipelineFeatureGroup: frozenset({SklearnPipelineFeatureGroup.PIPELINE_PARAMS, "artifact_storage_path"}),
+    ScalingFeatureGroup: frozenset({"artifact_storage_path"}),
     TextCleaningFeatureGroup: frozenset(),
-    TimeWindowFeatureGroup: frozenset(),
+    TimeWindowFeatureGroup: frozenset({DefaultOptionKeys.reference_time}),
 }
 
 

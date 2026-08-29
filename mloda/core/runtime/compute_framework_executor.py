@@ -143,10 +143,9 @@ class ComputeFrameworkExecutor:
         cfw_uuid: Optional[UUID] = None
 
         if isinstance(step, FeatureGroupStep):
-            for tfs_id in step.tfs_ids:
-                cfw_uuid = self.cfw_register.get_cfw_uuid(step.compute_framework.get_class_name(), tfs_id)
-                if cfw_uuid:
-                    return cfw_uuid
+            resolved_uuid = self.cfw_register.get_unique_cfw_uuid(step.compute_framework.get_class_name(), step.tfs_ids)
+            if resolved_uuid is not None:
+                return resolved_uuid
 
             feature_uuid = step.features.any_uuid
 
@@ -306,3 +305,6 @@ class ComputeFrameworkExecutor:
             process, command_queue, result_queue = existing
 
         self.worker_manager.send_command(cfw_uuid, step)
+        # Record the assignment so a worker that exits still owing these results is
+        # detectable, including the clean exit the data-drop path produces.
+        self.worker_manager.record_assignment(cfw_uuid, set(step.get_uuids()))

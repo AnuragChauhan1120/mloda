@@ -10,7 +10,7 @@ import pytest
 
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda.provider import DefaultOptionKeys
 from mloda.user import Options
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
@@ -151,15 +151,20 @@ class TestForwardedAlgorithmOutsideTheChildValueSpace:
         assert DimensionalityReductionFeatureGroup.ALGORITHM in reason
         assert "kmeans" in reason
 
-    def test_engine_error_keeps_naming_forward_group_exclude(self) -> None:
-        """End-to-end the user still gets the actionable guidance, via the group-option hint."""
+    def test_engine_error_names_the_rejected_key_and_value(self) -> None:
+        """End-to-end the user still learns WHICH key and value lost them the match.
+
+        The speculative extra-group-option hint is gone (#791/#782): it needed a second, speculative
+        match pass, which the single-pass renderer does not do. The value-rejection line survives and
+        carries the actionable detail.
+        """
         feature = Feature("f0__pca_2d", _forwarded_child_options("kmeans"))
         accessible_plugins: FeatureGroupEnvironmentMapping = {
             PandasDimensionalityReductionFeatureGroup: {PandasDataFrame},
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -168,7 +173,6 @@ class TestForwardedAlgorithmOutsideTheChildValueSpace:
 
         message = str(exc_info.value)
         assert "No feature groups found" in message
-        assert "forward_group_exclude" in message
         assert DimensionalityReductionFeatureGroup.ALGORITHM in message
         assert "kmeans" in message
 
@@ -197,7 +201,7 @@ class TestForwardedAlgorithmInsideTheChildValueSpace:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,

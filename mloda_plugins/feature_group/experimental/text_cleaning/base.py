@@ -9,10 +9,10 @@ from typing import Any, Optional
 
 from mloda.provider import FeatureGroup
 from mloda.user import Feature
-from mloda.provider import FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMNWISE_HOOKS
 from mloda.provider import FeatureSet
 from mloda.provider import DefaultOptionKeys
 from mloda.provider import PropertySpec
@@ -87,9 +87,16 @@ class TextCleaningFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     # Define prefix pattern
     PREFIX_PATTERN = r".*__cleaned_text$"
 
+    # The cleaning operations come from options, so the pattern is recognition-only and binds
+    # nothing from the name (#772).
+    RECOGNITION_ONLY_PATTERN = True
+
     # In-feature configuration for FeatureChainParserMixin
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = 1
+
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
 
     # Property mapping for configuration-based features
     PROPERTY_MAPPING = {
@@ -128,26 +135,7 @@ class TextCleaningFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
     @classmethod
     def _extract_cleaning_operations(cls, feature: Feature) -> Optional[tuple[Any, Any]]:
-        """
-        Extract cleaning operations from a feature.
-
-        Tries string-based parsing first, falls back to configuration-based approach.
-
-        Args:
-            feature: The feature to extract operations from
-
-        Returns:
-            Tuple of cleaning operations, or None if not found
-        """
-        # Try string-based parsing first
-        feature_name_str = feature.name
-
-        if FeatureChainParser.is_chained_feature(feature_name_str):
-            # For string-based features, get operations from options
-            operations = feature.options.get(cls.CLEANING_OPERATIONS) or ()
-            return operations  # type: ignore
-
-        # Fall back to configuration-based approach
+        """Cleaning operations from feature options (both paths), or None when absent."""
         operations = feature.options.get(cls.CLEANING_OPERATIONS)
         return operations if operations is not None else None
 
@@ -195,21 +183,6 @@ class TextCleaningFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
     @classmethod
     @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of feature names to check
-
-        Raises:
-            ValueError: If any of the features do not exist in the data.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
     def _get_source_text(cls, data: Any, feature_name: str) -> Any:
         """
         Get the source text from the data.
@@ -220,22 +193,6 @@ class TextCleaningFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
         Returns:
             The source text
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
         """
         ...
 

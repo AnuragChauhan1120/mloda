@@ -11,6 +11,12 @@ from mloda.core.prepare.validators.resolve_link_validator import ResolveLinkVali
 LinkFrameworkTrekker = tuple[Link, type[ComputeFramework], type[ComputeFramework]]
 
 
+def inheritance_distance(child: type, parent: type) -> int:
+    """Steps from child to parent in the MRO, or 9999 if parent is not in child's hierarchy."""
+    mro: tuple[type, ...] = getattr(child, "__mro__", ())
+    return mro.index(parent) if parent in mro else 9999
+
+
 class LinkTrekker:
     """This class is used to keep track of Links and which children depend on this link."""
 
@@ -353,16 +359,7 @@ class ResolveLinks:
         return self._select_most_specific_links(polymorphic_matches, left_fg, right_fg)
 
     def _inheritance_distance(self, child: type, parent: type) -> int:
-        """Calculate the inheritance distance from child to parent in the MRO.
-
-        Returns the number of steps in the Method Resolution Order from child to parent.
-        Returns a large number if parent is not in child's MRO.
-        """
-        try:
-            mro = child.__mro__
-            return mro.index(parent)
-        except (ValueError, AttributeError):
-            return 9999  # Not in hierarchy
+        return inheritance_distance(child, parent)
 
     def _select_most_specific_links(self, links: list[Link], left_fg: type, right_fg: type) -> list[Link]:
         """Select links that are most specific (closest in inheritance hierarchy).
@@ -417,8 +414,9 @@ class ResolveLinks:
         left_frameworks: Optional[set[type[ComputeFramework]]] = None,
         right_frameworks: Optional[set[type[ComputeFramework]]] = None,
     ) -> LinkFrameworkTrekker:
+        """Both sides reduce exactly like Feature.get_compute_framework; the join lookup compares the two."""
         if left_frameworks is None or right_frameworks is None:
             raise ValueError("Left or right frameworks are not set!")
-        left_framework = next(iter(left_frameworks))
-        right_framework = next(iter(right_frameworks))
+        left_framework = ComputeFramework.select_deterministic(left_frameworks)
+        right_framework = ComputeFramework.select_deterministic(right_frameworks)
         return (link, left_framework, right_framework)

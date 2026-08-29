@@ -21,11 +21,16 @@ from mloda.core.prepare.execution_plan import ExecutionPlan
 from mloda.core.prepare.graph.build_graph import BuildGraph
 from mloda.core.prepare.resolve_graph import ResolveGraph
 from mloda.core.runtime.run import ExecutionOrchestrator
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from mloda.core.prepare.identify_feature_group import resolve_or_raise
+from mloda.core.prepare.resolution_types import (
+    EvaluationResult,
+    ResolutionRecord,
+)
 from mloda.core.runtime.flight.runner_flight_server import ParallelRunnerFlightServer
 from mloda.core.abstract_plugins.feature_group import FeatureGroup, format_feature_group_class
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_collection import Features
+from mloda.core.abstract_plugins.components.hashable_dict import _deep_equal
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.components.link import JoinType, Link
 from mloda.core.abstract_plugins.components.validators.link_validator import LinkValidator
@@ -47,6 +52,7 @@ class Engine:
         column_ordering: Optional[str] = None,
     ) -> None:
         # setup variables which track the primary sources and the compute platforms
+        # Holds the Feature objects ResolveComputeFrameworks.links rewrites: hash-stale after planning, so only read it before planning (as today).
         self.feature_group_collection: dict[type[FeatureGroup], set[Feature]] = defaultdict(set)
 
         # use global filters
@@ -64,15 +70,19 @@ class Engine:
         # set api input collection if relevant
         self.api_input_data_collection = api_input_data_collection
 
-        # TODO
         self.plugin_collector = plugin_collector
-        self.copy_compute_frameworks = deepcopy(compute_frameworks)
 
         self.data_access_collection = data_access_collection
         self.column_ordering = column_ordering
         self.request_feature_order: list[str] = [str(f.name) for f in features]
         self._dual_consumption_warned: set[tuple[str, str, frozenset[str]]] = set()
         self._property_mapping_keys_cache: dict[type[FeatureGroup], frozenset[str]] = {}
+        # Intake materialization memo: the strong source reference keeps its id stable, so features
+        # sharing one pre-default Options share one effective Options.
+        self._intake_options_memo: dict[tuple[type[FeatureGroup], int], tuple[Options, Options]] = {}
+        # Declared (pre-default) options per surviving feature uuid, for default-equivalent merge warnings.
+        self._declared_options_by_uuid: dict[UUID, Options] = {}
+        self.resolution_records: list[ResolutionRecord] = []
         self.execution_planner = self.create_setup_execution_plan(features)
         self.tfs_connection_map = self._resolve_tfs_connection_map()
 
@@ -86,7 +96,7 @@ class Engine:
         connection_map: dict[type[ComputeFramework], Any] = {}
         if self.data_access_collection is None:
             return connection_map
-        for tfs in self.execution_planner.tfs_collection:
+        for tfs in self.execution_planner.tfs_collection.values():
             cfw_class = tfs.to_framework
             if cfw_class in connection_map:
                 continue
@@ -109,7 +119,13 @@ class Engine:
         raise ValueError("ExecutionOrchestrator setup failed.")
 
     def create_setup_execution_plan(self, features: Features) -> ExecutionPlan:
+        if self.global_filter:
+            self.global_filter.reset_match_tracking()
+
         self.setup_features_recursion(features)
+
+        if self.global_filter:
+            self.global_filter.warn_on_unmatched_filters()
 
         graph_builder = BuildGraph(self.feature_link_parents, self.feature_group_collection)
         graph_builder.build_graph_from_feature_links()
@@ -127,30 +143,43 @@ class Engine:
             planned_queue, resolver.resolver_links.get_link_trekker()
         )
 
+        if self.global_filter:
+            # Setup still shifts a stored hash: a copied option Feature reaches the host's Feature via child_options.
+            self.global_filter.rehash_stored_filters()
+
         execution_planner = ExecutionPlan(self.global_filter, self.api_input_data_collection)
-        execution_planner.create_execution_plan(planned_queue, graph, resolver.resolver_links.get_link_trekker())
+        execution_planner.create_execution_plan(
+            planned_queue,
+            graph,
+            resolver.resolver_links.get_link_trekker(),
+            resolver.resolver_compute_framework.get_declared_frameworks(),
+        )
         return execution_planner
 
-    def setup_features_recursion(self, features: Features) -> None:
+    def setup_features_recursion(self, features: Features, requested: bool = True) -> None:
         for feature in features:
-            self._process_feature(feature, features)
+            self._process_feature(feature, features, requested)
 
-    def _process_feature(self, feature: Feature, features: Features) -> None:
+    def _process_feature(self, feature: Feature, features: Features, requested: bool) -> None:
         """Processes a single feature by delegating tasks to helper methods."""
 
-        feature_group_class, compute_frameworks = self._identify_feature_group_and_frameworks(feature)
+        feature_group_class, compute_frameworks, result = self._identify_feature_group_and_frameworks(feature)
+        self.resolution_records.append(ResolutionRecord(str(feature.name), requested, result))
         self._warn_on_dual_option_consumption(feature, feature_group_class)
         feature_group = feature_group_class()
 
         self._set_feature_name(feature, feature_group)
         self._set_compute_framework_and_data_type(feature, compute_frameworks, feature_group_class)
 
+        # Stash the declared pre-default options: dependency declaration and child inheritance observe
+        # them; intake materialization canonicalizes default-equivalent twins.
+        declared_options = feature.options
         added = self.add_feature_to_collection(feature_group_class, feature, features.child_uuid)
 
         if added:
             parent_domain = feature.domain.name if feature.domain else None
             self._handle_input_features_recursion(
-                feature_group_class, feature.uuid, feature.options, feature.name, parent_domain=parent_domain
+                feature_group_class, feature.uuid, declared_options, feature.name, parent_domain=parent_domain
             )
 
         if self.global_filter:
@@ -209,12 +238,17 @@ class Engine:
 
     def _identify_feature_group_and_frameworks(
         self, feature: Feature
-    ) -> tuple[type[FeatureGroup], set[type[ComputeFramework]]]:
-        """Identifies the feature group class and compute frameworks for a given feature."""
-        identifier = IdentifyFeatureGroupClass(
-            feature, self.accessible_plugins, self.links, self.data_access_collection
+    ) -> tuple[type[FeatureGroup], set[type[ComputeFramework]], EvaluationResult]:
+        """Identify the winning feature group via the shared helper; on failure it raises the enriched error."""
+        result = resolve_or_raise(
+            feature,
+            self.accessible_plugins,
+            self.links,
+            self.data_access_collection,
+            partial_records=self.resolution_records,
         )
-        return identifier.get()
+        feature_group_class, compute_frameworks = next(iter(result.identified.items()))
+        return feature_group_class, compute_frameworks, result
 
     def _add_index_feature(
         self,
@@ -316,8 +350,17 @@ class Engine:
                 # We assign a new UUID to the filter feature to ensure
                 # it is treated as a separate instance from the original filter feature
                 match.filter_feature.uuid = uuid.uuid4()
-                self.global_filter.add_filter_to_collection(feature_group_class, feature.name, match)
+                # Intake may materialize declared defaults into the filter feature's options: group fills shift
+                # SingleFilter's hash, context fills shift its equality, so intake must run before it is stored.
                 self.add_feature_to_collection(feature_group_class, match.filter_feature, features.child_uuid)
+                # The stored filter needs its own Feature: planner rewrites of the queue twin must not shift its hash.
+                # handle_filter_feature copies via Feature.__copy__, which owns the containers that decide the hash.
+                # The copy keeps the queue twin's uuid on purpose: nothing reads the stored filter feature's uuid.
+                match.filter_feature = match.handle_filter_feature(match.filter_feature)
+                self.global_filter.add_filter_to_collection(feature_group_class, feature.name, match)
+
+            # After the loop, so the recorded filters are the renamed ones.
+            self.global_filter.record_probe(feature_group_class, feature.name, feature.uuid, matched_filters)
 
     def add_feature_link_to_links(self, feature: Feature) -> None:
         """With this functionality, we can add links with a feature instead via mloda API."""
@@ -337,6 +380,15 @@ class Engine:
         child_uuid: Optional[UUID],
         if_index_feature: bool = False,
     ) -> bool:
+        # Materialize declared defaults at intake: default-equivalent twins become equal and merge
+        # via the duplicate path below; identity no-op without concrete defaults.
+        declared_options = feature.options
+        memo_key = (feature_group_class, id(declared_options))
+        entry = self._intake_options_memo.get(memo_key)
+        if entry is None:
+            entry = (declared_options, feature_group_class.options_with_defaults(declared_options))
+            self._intake_options_memo[memo_key] = entry
+        feature.options = entry[1]
         feature_collection = self.feature_group_collection[feature_group_class]
 
         if feature not in feature_collection:
@@ -344,11 +396,13 @@ class Engine:
 
             self.feature_link_parents[feature.uuid] = set()
             feature_collection.add(feature)
+            self._declared_options_by_uuid[feature.uuid] = declared_options
             return True
 
         existing_feature = next((f for f in feature_collection if feature == f), None)
 
         if existing_feature is not None:
+            self._warn_on_default_equivalent_merge(feature, declared_options, existing_feature)
             # Propagate the requested flag: filter twins must not displace requested output columns (issue #712).
             if feature.initial_requested_data and not existing_feature.initial_requested_data:
                 existing_feature.initial_requested_data = True
@@ -357,6 +411,22 @@ class Engine:
                 self._update_feature_link_parents(child_uuid, feature.uuid, existing_feature.uuid, if_index_feature)
 
         return False
+
+    def _warn_on_default_equivalent_merge(
+        self, feature: Feature, declared_options: Options, existing_feature: Feature
+    ) -> None:
+        """Warn when a merge holds only post-materialization: the declared (pre-default) options differ."""
+        survivor_declared = self._declared_options_by_uuid.get(existing_feature.uuid, existing_feature.options)
+        # Reached only when the feature equality probe matched, so cyclic values arrive here too.
+        if _deep_equal(declared_options.group, survivor_declared.group) and _deep_equal(
+            declared_options.context, survivor_declared.context
+        ):
+            return
+        logger.warning(
+            f"Feature '{feature.name}' was requested twice with default-equivalent options: the requests "
+            f"differ only in explicitly-set declared defaults and merged into one feature at intake. "
+            f"Deduplicate the request; dependency declaration follows the first-listed request."
+        )
 
     def _update_feature_link_parents(
         self, child_uuid: UUID, original_uuid: UUID, wanted_uuid: UUID, if_index_feature: bool
@@ -399,18 +469,19 @@ class Engine:
             if features.child_uuid is None:
                 raise ValueError(f"Features {features} has no parent uuid although it should have one.")
             self.feature_link_parents[features.child_uuid] = features.parent_uuids
-            self.setup_features_recursion(features)
+            self.setup_features_recursion(features, requested=False)
 
     def set_compute_framework(self, feature: Feature, compute_frameworks: set[type[ComputeFramework]]) -> Feature:
         """
         This function ensures that the feature always has a compute framework set!
         """
         if feature.compute_frameworks:
-            if feature.get_compute_framework() not in compute_frameworks:
+            if not feature.compute_frameworks & compute_frameworks:
                 raise ValueError(
                     f"Feature {feature.name} does not support compute framework {feature.compute_frameworks}."
                 )
         else:
+            # Hash-safe only because this runs before add_feature_to_collection stores the feature.
             feature.compute_frameworks = compute_frameworks
         return feature
 

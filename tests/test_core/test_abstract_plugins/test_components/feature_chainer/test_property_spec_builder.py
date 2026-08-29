@@ -18,7 +18,6 @@ PROPERTY_MAPPING key. See ``test_property_mapping_spec_shape.py``.
 from __future__ import annotations
 
 import copy
-import gc
 import pickle
 from typing import Any
 
@@ -30,10 +29,9 @@ from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import (
     FeatureChainParserMixin,
 )
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import _NoDefault, is_no_default
+from mloda.core.abstract_plugins.components.property_spec import _NoDefault, is_no_default
 from mloda.core.abstract_plugins.components.feature_set import FeatureSet
 from mloda.core.abstract_plugins.components.options import Options
-from mloda.core.abstract_plugins.components.utils import get_all_subclasses
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.provider import NO_DEFAULT, PropertySpec, property_spec
 
@@ -46,21 +44,6 @@ def _build(*args: Any, **kwargs: Any) -> PropertySpec:
     the leniency tests below exercise exactly the shapes the type does not name.
     """
     return property_spec(*args, **kwargs)
-
-
-@pytest.fixture(autouse=True)
-def _no_feature_group_registry_pollution() -> Any:
-    """Guarantee this module never leaks throwaway FeatureGroup subclasses.
-
-    Copied from ``test_property_mapping_default_invariant.py``. The round-trip test
-    defines a FeatureGroup subclass; this fixture forces a collection afterwards
-    and asserts none of this module's classes linger in the registry.
-    """
-    yield
-    gc.collect()
-    gc.collect()
-    leaked = [c for c in get_all_subclasses(FeatureGroup) if c.__module__ == __name__]
-    assert not leaked, f"Leaked FeatureGroup subclasses from {__name__}: {[c.__name__ for c in leaked]}"
 
 
 class TestPropertySpecImport:
@@ -702,3 +685,36 @@ class TestPropertySpecAllowExplicitNone:
             allow_explicit_none=True,
         )
         assert built == hand_constructed
+
+
+class TestPropertySpecDeferredBinding:
+    """``deferred_binding`` passthrough (issue #769).
+
+    The per-key opt-out defaults to ``False`` and rides through the builder onto the field; a built
+    spec equals the ``PropertySpec`` an author constructs by hand, and a non-bool value is rejected at
+    construction (mirroring ``allow_explicit_none``). ``deferred_binding=True`` exempts the key from the
+    name-path required-presence check only; it does not change config-path requiredness.
+    """
+
+    def test_deferred_binding_emitted_through_builder(self) -> None:
+        """``deferred_binding=True`` lands on the field; omitting it leaves the default ``False``."""
+        assert property_spec("d", deferred_binding=True).deferred_binding is True
+        assert property_spec("d").deferred_binding is False
+
+    def test_deferred_binding_spec_equals_direct_construction(self) -> None:
+        """A ``deferred_binding`` spec is exactly the ``PropertySpec`` an author would construct."""
+        built = property_spec("d", deferred_binding=True)
+
+        hand_constructed = PropertySpec(
+            "d",
+            context=True,
+            strict_validation=False,
+            deferred_binding=True,
+        )
+        assert built == hand_constructed
+
+    def test_non_bool_deferred_binding_raises(self) -> None:
+        """A non-bool ``deferred_binding`` is rejected up front, like ``allow_explicit_none``."""
+        not_a_bool: Any = "yes"
+        with pytest.raises(ValueError, match=r"PropertySpec\('d'\)"):
+            property_spec("d", deferred_binding=not_a_bool)

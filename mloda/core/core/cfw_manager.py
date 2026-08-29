@@ -3,6 +3,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
 from mloda.core.abstract_plugins.function_extender import Extender
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
 
@@ -100,6 +101,25 @@ class CfwManager:
                 return cfw_uuid
         return None
 
+    def get_unique_cfw_uuid(self, cf_class_name: str, tfs_ids: set[UUID]) -> Optional[UUID]:
+        """
+        Resolves a set of tfs_ids to at most one distinct Compute Framework UUID.
+
+        Raises if the tfs_ids resolve to more than one distinct cfw (ambiguous).
+        Returns None if none of the tfs_ids resolve.
+        """
+        resolved_uuids = {resolved for tfs_id in tfs_ids if (resolved := self.get_cfw_uuid(cf_class_name, tfs_id))}
+        if len(resolved_uuids) > 1:
+            raise ValueError(
+                internal_invariant_error(
+                    "step.tfs_ids resolved to more than one distinct compute framework: ambiguous.",
+                    f"cf_class_name={cf_class_name}, resolved cfw_uuids={resolved_uuids}, tfs_ids={tfs_ids}",
+                )
+            )
+        if len(resolved_uuids) == 1:
+            return next(iter(resolved_uuids))
+        return None
+
     def add_to_merge_relation(self, left_uuid: UUID, right_uuid: UUID, cls_name: str) -> None:
         """
         Adds a merge relation between two Compute Framework UUIDs.
@@ -191,9 +211,12 @@ class CfwManager:
         """Retrieves the error flag."""
         return self.error
 
-    def get_error_exception(self) -> Any:
-        """Retrieves the original exception object, if captured."""
-        return self.exception
+    def take_error_exception(self) -> Any:
+        """Hands over the original exception object, if captured, and drops the register's reference."""
+        # error and msg stay set on purpose, so a later flag read still raises the typed fallback.
+        exception = self.exception
+        self.exception = None
+        return exception
 
     def get_error_msg(self) -> Any:
         """Retrieves the error message."""

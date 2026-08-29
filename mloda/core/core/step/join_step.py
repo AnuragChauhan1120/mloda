@@ -18,18 +18,22 @@ class JoinStep(Step):
         required_uuids: set[UUID],
         destination_framework_uuids: set[UUID],
         source_framework_uuids: set[UUID],
+        swap_merge_sides: bool = False,
+        token: Optional[UUID] = None,
     ) -> None:
         self.link = link
+        self.swap_merge_sides = swap_merge_sides
         self.destination_framework = destination_framework
         self.source_framework = source_framework
         self.required_uuids = required_uuids
         self.destination_framework_uuids = destination_framework_uuids
         self.source_framework_uuids = source_framework_uuids
-        self.uuid = uuid4()
+        self.uuid = token if token is not None else uuid4()
         self.step_is_done = False
 
     def get_uuids(self) -> set[UUID]:
-        return {self.uuid, self.link.uuid}
+        """Only this step's uuid is a completion token; the link uuid is shared by both orientations."""
+        return {self.uuid}
 
     def _merge_data(self, cfw: ComputeFramework, from_cfw_data: Any) -> None:
         """Merges data from another ComputeFramework into the current one."""
@@ -37,7 +41,11 @@ class JoinStep(Step):
         framework_connection = cfw.get_framework_connection_object()
         merge_engine_instance = merge_engine_class(framework_connection)
 
-        cfw.data = merge_engine_instance.merge(cfw.data, from_cfw_data, self.link)
+        # Link indices are bound to the feature groups, so the left group's data must stay the left argument.
+        if self.swap_merge_sides:
+            cfw.data = merge_engine_instance.merge(from_cfw_data, cfw.data, self.link)
+        else:
+            cfw.data = merge_engine_instance.merge(cfw.data, from_cfw_data, self.link)
         cfw.set_column_names()
 
     def _upload_data_if_needed(self, cfw: ComputeFramework, cfw_register: CfwManager) -> None:
@@ -89,7 +97,7 @@ class JoinStep(Step):
         If matched, return the uuid of the join step.
         """
 
-        if uuid not in self.required_uuids:
+        if uuid not in self.destination_framework_uuids and uuid not in self.source_framework_uuids:
             return None
 
         if other_framework == self.destination_framework:

@@ -28,7 +28,7 @@ try:
 except ImportError:
     logger.warning("DuckDB or PyArrow is not installed. Some tests will be skipped.")
     duckdb = None  # type: ignore[assignment]
-    pa = None  # type: ignore[assignment]
+    pa = None  # type: ignore[assignment, unused-ignore]
 
 
 @pytest.mark.skipif(duckdb is None or pa is None, reason="DuckDB or PyArrow is not installed. Skipping this test.")
@@ -51,6 +51,12 @@ class TestDuckDBFilterEngine(FilterEngineTestMixin, TimeRangeFilterEngineTestMix
                 "category": ["A", "B", "A", "C", "B"],
             }
         )
+        return DuckdbRelation.from_arrow(connection, arrow_table)
+
+    @pytest.fixture
+    def nullable_category_sample_data(self, connection: Any) -> Any:
+        """Create a sample DuckDB relation with null categories for testing."""
+        arrow_table = pa.Table.from_pydict({"id": [1, 2, 3, 4, 5], "category": ["A", None, "B", None, "C"]})
         return DuckdbRelation.from_arrow(connection, arrow_table)
 
     def get_column_values(self, result: Any, column: str) -> list[Any]:

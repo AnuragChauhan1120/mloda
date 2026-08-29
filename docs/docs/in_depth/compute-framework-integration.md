@@ -10,7 +10,7 @@ One of mloda's key strengths is its ability to decouple feature definitions from
 
 Feature groups specify which compute frameworks they support through the `compute_framework_rule` method:
 
-``` python
+```py
 @classmethod
 def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
     """Define the compute frameworks this feature group supports."""
@@ -25,11 +25,11 @@ feature group runs on SQLite in general, but *this particular operation* is
 unsupported there." For that, override `supports_compute_framework`, a
 per-feature hook evaluated at match time:
 
-``` python
+```py
 @classmethod
 def supports_compute_framework(cls, feature_name, options, compute_framework) -> bool:
     """Reject an operation on a specific framework. Default returns True."""
-    if compute_framework is SQLiteFramework and is_median_op(feature_name, options):
+    if compute_framework is SqliteFramework and is_median_op(feature_name, options):
         return False  # median is unsupported on SQLite
     return True
 ```
@@ -40,15 +40,23 @@ feature only**:
 - If another framework can still run the operation, the matcher routes around
   the rejected one silently (no error).
 - If the only remaining candidate is the rejected framework (for example, the
-  user pinned the feature to it), resolution fails with a dedicated,
-  actionable error that names the unsupported and supported frameworks, e.g.
-  `Unsupported compute framework(s) for feature 'X': ['SQLiteFramework']. Supported on: ['DuckDBFramework', 'PandasDataFrame'].`
+  user pinned the feature to it), resolution fails with the standard
+  "No feature groups found" error, which names the near-miss feature group and
+  why it dropped, one line per eliminated candidate under a
+  "Feature group(s) eliminated while matching '...'" block, e.g.
 
-This is distinct from the "no feature group found" error, so an unsupported
-operation is no longer indistinguishable from an unknown feature. Prefer this
-hook over raising a generic error from inside `calculate_feature`: the
-rejection happens during planning rather than at compute time, and the message
-is built for you.
+```
+No feature groups found for feature name: 'X'.
+Feature group(s) eliminated while matching 'X':
+  - MedianFeatureGroup (compute framework pin): pinned compute framework 'SqliteFramework' is not among its supported ['DuckDBFramework', 'PandasDataFrame']
+Use resolve_feature(name, options=...) to debug feature resolution.
+For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/
+```
+
+The rejected framework is named as a near-miss with its reason rather than
+vanishing into a generic "unknown feature" message. Prefer this hook over
+raising a generic error from inside `calculate_feature`: the rejection happens
+during planning rather than at compute time, and the message is built for you.
 
 The debug inspector `resolve_feature(name)` reflects the hook too, because it
 runs the **same matcher over the same candidate universe as the engine** (it
@@ -77,7 +85,7 @@ instead of a hand-written `supports_compute_framework`.
 
 **The data provider** declares the dimension once with `SUBTYPES`:
 
-``` python
+```py
 class RankFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     SUBTYPES = SubtypeDeclaration(
         key="rank_type",
@@ -101,7 +109,7 @@ Two shapes, enforced at class definition; a half declaration fails at import:
 - Shape B (multi-axis families collapsed into one subtype id): declare the
   universe explicitly with a resolver:
 
-``` python
+```py
 def resolve_window(feature_name: str, options: Options) -> str | None:
     return options.get("window_function")
 
@@ -201,7 +209,7 @@ Feature groups follow a layered architecture:
 
 ```
 FeatureGroup
-  └── BaseFeatureGroup (e.g., ClusteringFeatureGroup)
+  └── BaseFeatureGroup (e.g., SegmentationFeatureGroup)
         ├── PandasImplementation
         ├── PyArrowImplementation
         └── PythonDictFrameworkImplementation
@@ -213,7 +221,7 @@ FeatureGroup
 
 The base class defines the interface and common functionality:
 
-``` python
+```py
 class MyFeatureGroup(FeatureGroup):
     """Base class for MyFeatureGroup."""
     
@@ -232,7 +240,7 @@ Each framework-specific implementation:
 - Specifies which compute frameworks it supports
 - Implements the calculation logic for that framework
 
-``` python
+```py
 class PandasMyFeatureGroup(MyFeatureGroup):
     @classmethod
     def compute_framework_rule(cls):
@@ -269,11 +277,11 @@ For more details on how data transformation works between compute frameworks, se
 
 ## Example
 
-For a clustering feature group:
+For a segmentation feature group:
 
-``` python
+```py
 # Base class (framework-agnostic)
-class ClusteringFeatureGroup(FeatureGroup):
+class SegmentationFeatureGroup(FeatureGroup):
     def input_features(self, options, feature_name):
         # Extract source features from feature name
         
@@ -282,31 +290,31 @@ class ClusteringFeatureGroup(FeatureGroup):
         # This will be overridden by framework-specific implementations
 
 # Pandas implementation
-class PandasClusteringFeatureGroup(ClusteringFeatureGroup):
+class PandasSegmentationFeatureGroup(SegmentationFeatureGroup):
     @classmethod
     def compute_framework_rule(cls):
         return {PandasDataFrame}
     
     @classmethod
     def calculate_feature(cls, data, features):
-        # Pandas-specific clustering implementation
+        # Pandas-specific segmentation implementation
         
 # PyArrow implementation
-class PyArrowClusteringFeatureGroup(ClusteringFeatureGroup):
+class PyArrowSegmentationFeatureGroup(SegmentationFeatureGroup):
     @classmethod
     def compute_framework_rule(cls):
         return {PyArrowTable}
     
     @classmethod
     def calculate_feature(cls, data, features):
-        # PyArrow-specific clustering implementation
+        # PyArrow-specific segmentation implementation
 ```
 
-For an aggregated feature group with Polars support:
+For a summary feature group with Polars support:
 
-``` python
+```py
 # Base class (framework-agnostic)
-class AggregatedFeatureGroup(FeatureGroup):
+class SummaryFeatureGroup(FeatureGroup):
     def input_features(self, options, feature_name):
         # Extract source features from feature name
         
@@ -315,14 +323,14 @@ class AggregatedFeatureGroup(FeatureGroup):
         # This will be overridden by framework-specific implementations
 
 # Polars Lazy implementation
-class PolarsLazyAggregatedFeatureGroup(AggregatedFeatureGroup):
+class PolarsLazySummaryFeatureGroup(SummaryFeatureGroup):
     @classmethod
     def compute_framework_rule(cls):
         return {PolarsLazyDataFrame}
     
     @classmethod
     def calculate_feature(cls, data, features):
-        # Polars lazy-specific aggregation implementation
+        # Polars lazy-specific summary implementation
         # Uses lazy evaluation for query optimization
 ```
 
@@ -330,7 +338,7 @@ Note that Polars supports both eager (`PolarsDataFrame`) and lazy (`PolarsLazyDa
 
 For an analytical feature group with DuckDB support:
 
-``` python
+```py
 # Base class (framework-agnostic)
 class AnalyticalFeatureGroup(FeatureGroup):
     def input_features(self, options, feature_name):
@@ -358,7 +366,7 @@ class DuckDBAnalyticalFeatureGroup(AnalyticalFeatureGroup):
 
 For a distributed processing feature group with Spark support:
 
-``` python
+```py
 # Base class (framework-agnostic)
 class DistributedFeatureGroup(FeatureGroup):
     def input_features(self, options, feature_name):
@@ -395,7 +403,7 @@ The `.types` property returns column types aligned with `.columns`. The element 
 - `DuckdbRelation.types` returns DuckDB-native dtype objects.
 - `SqliteRelation.types` returns PyArrow `pa.DataType` objects (from propagated hints, falling back to SQLite affinity inference).
 
-``` python
+```py
 relation.columns   # ["user_id", "amount"]
 relation.types     # backend-specific dtype objects, same order as columns
 ```
@@ -404,7 +412,7 @@ relation.types     # backend-specific dtype objects, same order as columns
 
 `with_row_number` appends a `ROW_NUMBER()` column; `window` appends an arbitrary window expression. Both quote every identifier and raise `ValueError` if the new `alias` collides with an existing column.
 
-``` python
+```py
 from mloda_plugins.compute_framework.base_implementations.sql.sql_window import (
     OrderBy,
     WindowFrame,

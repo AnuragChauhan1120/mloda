@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, cast, runtime_checkable
 
+from mloda.core.abstract_plugins.components.utils import unhashable_part
+
 
 @runtime_checkable
 class FilterParameter(Protocol):
@@ -20,15 +22,16 @@ class FilterParameter(Protocol):
     def max_exclusive(self) -> bool: ...
 
 
-def _make_hashable(value: Any) -> Any:
-    """Normalize collection values to tuples so the frozen dataclass stays hashable.
+def _normalize_collections(value: Any) -> Any:
+    """Normalize collection values so the frozen dataclass stays hashable.
 
-    Sets are ordered deterministically, str/bytes stay scalar and are never exploded.
+    Sets/frozensets become frozenset, not a repr-sorted tuple: repr isn't cross-type-equality-safe
+    (1 == True), frozenset already is.
     """
     if isinstance(value, (str, bytes)):
         return value
     if isinstance(value, (set, frozenset)):
-        return tuple(sorted(value, key=repr))
+        return frozenset(value)
     if isinstance(value, list):
         return tuple(value)
     return value
@@ -40,7 +43,20 @@ class FilterParameterImpl:
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "FilterParameterImpl":
-        return cls(_raw=tuple(sorted((k, _make_hashable(v)) for k, v in params.items())))
+        # Checked before the sort below, which would otherwise raise a TypeError naming nothing.
+        for key in params:
+            if not isinstance(key, str):
+                raise ValueError(f"Filter parameter key {key!r} is not a string.")
+        normalized = {k: _normalize_collections(v) for k, v in params.items()}
+        # This site rejects what still does not hash; _deep_hashable in hashable_dict coerces instead.
+        for key, value in normalized.items():
+            culprit = unhashable_part(value)
+            if culprit is not None:
+                raise ValueError(
+                    f"Filter parameter '{key}' holds an unhashable {culprit}; "
+                    "filter values must be hashable: scalars, or lists, sets or tuples of hashables."
+                )
+        return cls(_raw=tuple(sorted(normalized.items())))
 
     @property
     def value(self) -> Optional[Any]:
@@ -48,9 +64,11 @@ class FilterParameterImpl:
 
     @property
     def values(self) -> Optional[list[Any]]:
-        # Stored as a tuple for hashability; hand out the declared list type. Filter engines rely
-        # on this: PySpark's Column.isin only unwraps list/set, so a tuple would silently break it.
+        # Stored as a tuple or frozenset for hashability; hand out the declared list type. A
+        # frozenset iterates in hash-seed order, so it's re-sorted here to stay deterministic.
         stored = self._get("values")
+        if isinstance(stored, frozenset):
+            return sorted(stored, key=repr)
         if isinstance(stored, tuple):
             return list(stored)
         return cast(Optional[list[Any]], stored)

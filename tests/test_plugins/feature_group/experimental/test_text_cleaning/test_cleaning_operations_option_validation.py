@@ -10,7 +10,7 @@ import pytest
 
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda.provider import DefaultOptionKeys
 from mloda.user import Options
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
@@ -91,8 +91,9 @@ class TestOrdinaryOperationVerdictsUnchanged:
 
         assert result is True
 
-    def test_name_path_without_options_matches(self) -> None:
-        assert TextCleaningFeatureGroup.match_feature_group_criteria(CLEANED_FEATURE, Options()) is True
+    def test_name_path_without_options_is_a_non_match(self) -> None:
+        """cleaning_operations is option-required on the name path, so its absence is a non-match."""
+        assert TextCleaningFeatureGroup.match_feature_group_criteria(CLEANED_FEATURE, Options()) is False
 
     def test_hashable_unsupported_operation_is_a_non_match(self) -> None:
         """A value the validator can judge (and rejects) keeps its verdict."""
@@ -111,7 +112,7 @@ class TestUnhashableOperationAtEngineLevel:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,

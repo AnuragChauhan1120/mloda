@@ -1,8 +1,18 @@
 """Tests for FilterParameter Protocol and FilterParameterImpl."""
 
+import re
+from decimal import Decimal
+
 import pytest
 from typing import Any
 from mloda.core.filter.filter_parameter import FilterParameter, FilterParameterImpl
+
+
+class AlwaysRaisesOnHash:
+    """Defines __hash__, so it reports as hashable through its type, but raises when hashed."""
+
+    def __hash__(self) -> int:
+        raise TypeError("this object refuses to be hashed")
 
 
 # --- Creation tests ---
@@ -254,8 +264,8 @@ def test_parameter_sorting_is_consistent() -> None:
 
 # --- Collection value normalization tests (see issue #664) ---
 #
-# Contract: collection values are stored hashable (tuple) in `_raw`, but the public `values`
-# property returns a `list`, matching its declared type. Scalars must never be exploded.
+# Contract: collection values are stored hashable in `_raw` (tuple or frozenset), but the public
+# `values` property returns a `list`, matching its declared type. Scalars must never be exploded.
 
 
 def test_from_dict_with_list_values_normalizes_raw_to_tuple() -> None:
@@ -266,11 +276,11 @@ def test_from_dict_with_list_values_normalizes_raw_to_tuple() -> None:
     assert isinstance(hash(filter_param), int)
 
 
-def test_from_dict_with_set_values_is_hashable() -> None:
-    """Test a set value is accepted and does not break hashing."""
-    params: dict[str, Any] = {"values": {"EU", "NA"}}
-    filter_param = FilterParameterImpl.from_dict(params)
+def test_from_dict_with_set_values_normalizes_raw_to_frozenset() -> None:
+    """Test a set value is stored as a frozenset internally so the frozen dataclass stays hashable."""
+    filter_param = FilterParameterImpl.from_dict({"values": {"EU", "NA"}})
 
+    assert filter_param._raw == (("values", frozenset({"EU", "NA"})),)
     assert isinstance(hash(filter_param), int)
 
 
@@ -281,6 +291,50 @@ def test_values_property_returns_list_for_set_input() -> None:
 
     assert isinstance(filter_param.values, list)
     assert sorted(filter_param.values) == ["EU", "NA"]
+
+
+def test_values_property_is_deterministically_ordered_for_set_input() -> None:
+    """Test the public list order does not depend on the set's hash-seed iteration order."""
+    params: dict[str, Any] = {"values": {5, 3, 40, 1, 22}}
+    filter_param = FilterParameterImpl.from_dict(params)
+
+    assert filter_param.values == sorted({5, 3, 40, 1, 22}, key=repr)
+
+
+def test_cross_type_equal_set_values_normalize_equal() -> None:
+    """Test set elements normalize by value equality, not repr, so 1 and True are interchangeable."""
+    from_int = FilterParameterImpl.from_dict({"values": {1, 2}})
+    from_bool = FilterParameterImpl.from_dict({"values": {True, 2}})
+
+    assert from_int == from_bool
+    assert hash(from_int) == hash(from_bool)
+
+
+def test_cross_type_equal_frozenset_values_normalize_equal() -> None:
+    """Test the same cross-type-equal normalization holds for a frozenset input."""
+    from_int = FilterParameterImpl.from_dict({"values": frozenset({1, 2})})
+    from_bool = FilterParameterImpl.from_dict({"values": frozenset({True, 2})})
+
+    assert from_int == from_bool
+    assert hash(from_int) == hash(from_bool)
+
+
+def test_homogeneous_set_values_still_deduplicate_regardless_of_insertion_order() -> None:
+    """Test the pre-existing homogeneous, natively-orderable behavior (dedup, hashability) survives."""
+    first = FilterParameterImpl.from_dict({"values": {"NA", "EU"}})
+    second = FilterParameterImpl.from_dict({"values": {"EU", "NA"}})
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({first, second}) == 1
+
+
+def test_set_and_list_values_no_longer_alias() -> None:
+    """Set stores as frozenset, list as tuple: same elements, no longer equal (was repr-sort luck)."""
+    from_set = FilterParameterImpl.from_dict({"values": {"EU", "NA"}})
+    from_list = FilterParameterImpl.from_dict({"values": ["EU", "NA"]})
+
+    assert from_set != from_list
 
 
 def test_values_property_returns_list_for_tuple_input() -> None:
@@ -320,3 +374,181 @@ def test_list_and_tuple_values_are_equal_and_hash_equal() -> None:
     assert from_list == from_tuple
     assert hash(from_list) == hash(from_tuple)
     assert len({from_list, from_tuple}) == 1
+
+
+# --- Unhashable value rejection tests (see issue #925) ---
+
+
+def test_from_dict_rejects_dict_value() -> None:
+    """Test a dict value is rejected, since normalization leaves it raw and unhashable."""
+    params: dict[str, Any] = {"value": {"a": 1}}
+
+    with pytest.raises(ValueError, match=r"'value'"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_dict_nested_in_list_value() -> None:
+    """Test a list value holding a dict is rejected, since the shallow tuple conversion misses it."""
+    params: dict[str, Any] = {"values": [{"a": 1}]}
+
+    with pytest.raises(ValueError, match="values"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_list_nested_in_list_value() -> None:
+    """Test a list value holding a list is rejected."""
+    params: dict[str, Any] = {"values": [[1, 2]]}
+
+    with pytest.raises(ValueError, match="values"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_dict_nested_in_tuple_value() -> None:
+    """Test a tuple value holding a dict is rejected, even though the tuple itself is a hashable type."""
+    params: dict[str, Any] = {"values": ({"a": 1},)}
+
+    with pytest.raises(ValueError, match="values"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_unhashable_leaf_value() -> None:
+    """Test an unhashable scalar such as bytearray is rejected."""
+    params: dict[str, Any] = {"value": bytearray(b"abc")}
+
+    with pytest.raises(ValueError, match=r"'value'"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_unhashable_range_bound() -> None:
+    """Test the rejection is not limited to the value/values keys."""
+    params: dict[str, Any] = {"min": {"a": 1}, "max": 50}
+
+    with pytest.raises(ValueError, match="min"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_error_names_the_offending_key() -> None:
+    """Test the message names the key that carries the unhashable value, not a neighbouring key."""
+    params: dict[str, Any] = {"min": 1, "payload": {"a": 1}}
+
+    with pytest.raises(ValueError, match="payload"):
+        FilterParameterImpl.from_dict(params)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("sNaN"), memoryview(bytearray(b"ab")), AlwaysRaisesOnHash()],
+    ids=["signaling-nan", "writable-memoryview", "raising-hash"],
+)
+def test_from_dict_rejects_value_whose_hash_raises(value: Any) -> None:
+    """Test a value that defines __hash__ but raises is rejected, not deferred to a later hash call."""
+    with pytest.raises(ValueError, match=r"'value'"):
+        FilterParameterImpl.from_dict({"value": value})
+
+
+def test_from_dict_rejects_value_whose_hash_raises_inside_a_collection() -> None:
+    """Test the raising value is caught through a list too, not only as a bare scalar."""
+    params: dict[str, Any] = {"values": [1, AlwaysRaisesOnHash()]}
+
+    with pytest.raises(ValueError, match=r"'values'"):
+        FilterParameterImpl.from_dict(params)
+
+
+@pytest.mark.parametrize(
+    "params, key, culprit",
+    [
+        ({"value": {"a": 1}}, "value", "dict"),
+        ({"values": [{"a": 1}]}, "values", "dict"),
+        ({"values": [[1, 2]]}, "values", "list"),
+    ],
+    ids=["dict-value", "dict-in-list", "list-in-list"],
+)
+def test_from_dict_error_names_the_offending_type(params: dict[str, Any], key: str, culprit: str) -> None:
+    """Test the message names the inner type that cannot be hashed, since the key alone can mislead."""
+    with pytest.raises(ValueError) as excinfo:
+        FilterParameterImpl.from_dict(params)
+
+    message = str(excinfo.value)
+    assert f"'{key}'" in message, message
+    assert re.search(rf"\b{culprit}\b", message), message
+
+
+def test_from_dict_accepts_deeply_nested_tuple() -> None:
+    """Test a tuple nested past the Python recursion limit stays accepted, since hash() copes with it."""
+    deep: Any = ()
+    for _ in range(1000):
+        deep = (deep,)
+    hash(deep)
+
+    filter_param = FilterParameterImpl.from_dict({"value": deep})
+
+    assert filter_param.value is deep
+    hash(filter_param)
+
+
+# --- Non-string key rejection tests (see issue #959) ---
+
+
+def test_from_dict_rejects_non_string_key() -> None:
+    """Test a non-string key raises ValueError instead of the raw TypeError out of sorted()."""
+    params: dict[Any, Any] = {1: "a", "b": 2}
+
+    with pytest.raises(ValueError, match=r"key 1 is not a string"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_non_string_key_error_names_the_key() -> None:
+    """Test the message names the offending key rather than a neighbouring one."""
+    params: dict[Any, Any] = {"value": 25, ("tuple", "key"): 2}
+
+    with pytest.raises(ValueError) as excinfo:
+        FilterParameterImpl.from_dict(params)
+
+    message = str(excinfo.value)
+    assert "tuple" in message, message
+
+
+def test_from_dict_rejects_non_string_key_even_without_mixed_types() -> None:
+    """Test a key set that sorts fine is still rejected when the keys are not strings."""
+    params: dict[Any, Any] = {1: "a", 2: "b"}
+
+    with pytest.raises(ValueError, match=r"key 1 is not a string"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_none_key() -> None:
+    """Test None as a key is rejected with a ValueError."""
+    params: dict[Any, Any] = {None: "a"}
+
+    with pytest.raises(ValueError, match="None"):
+        FilterParameterImpl.from_dict(params)
+
+
+def test_from_dict_rejects_non_string_key_before_unhashable_value_check() -> None:
+    """Test the key check fires even when another key carries an unhashable value."""
+    params: dict[Any, Any] = {1: "a", "payload": {"a": 1}}
+
+    with pytest.raises(ValueError) as excinfo:
+        FilterParameterImpl.from_dict(params)
+
+    assert "1" in str(excinfo.value), str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"value": 25},
+        {"value": None},
+        {"value": "EU"},
+        {"values": "EU"},
+        {"values": ["A", "B"]},
+        {"values": {"A", "B"}},
+        {"values": ("A", "B")},
+        {"values": [(1, 2), (3, 4)]},
+        {"min": 0, "max": 100, "max_exclusive": True},
+    ],
+    ids=["int", "none", "str", "str-values", "list", "set", "tuple", "list-of-tuples", "range"],
+)
+def test_from_dict_accepts_every_hashable_value_shape(params: dict[str, Any]) -> None:
+    """Test the rejection leaves the supported value shapes untouched."""
+    hash(FilterParameterImpl.from_dict(params))

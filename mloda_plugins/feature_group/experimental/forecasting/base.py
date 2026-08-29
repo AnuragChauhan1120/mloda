@@ -11,10 +11,11 @@ from mloda.provider import FeatureGroup
 from mloda.provider import BaseArtifact
 from mloda.user import Feature
 from mloda.provider import CHAIN_SEPARATOR, FeatureChainParser, FeatureChainParserMixin, FeatureSet
+from mloda.provider import COLUMN_DISCOVERY_HOOKS
 from mloda.user import FeatureName
 from mloda.user import Options
 from mloda.provider import DefaultOptionKeys
-from mloda.provider import PropertySpec
+from mloda.provider import PropertySpec, is_positive_int
 from mloda_plugins.feature_group.experimental.forecasting.forecasting_artifact import ForecastingArtifact
 from mloda_plugins.feature_group.experimental.time_reference_mixin import TimeReferenceMixin
 
@@ -129,6 +130,9 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = 1
 
+    # Hooks calculate_feature calls: _get_available_columns, _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMN_DISCOVERY_HOOKS
+
     # Property mapping for configuration-based features with group/context separation
     PROPERTY_MAPPING = {
         ALGORITHM: PropertySpec(
@@ -141,13 +145,15 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
             "Forecast horizon (number of time units to predict)",
             context=True,
             strict_validation=True,
-            element_validator=lambda x: (isinstance(x, int) or (isinstance(x, str) and x.isdigit())) and int(x) > 0,
+            element_validator=is_positive_int,
+            deferred_binding=True,  # parsed from the name by this group, not a framework-bound capture (#769)
         ),
         TIME_UNIT: PropertySpec(
             "Time unit of the forecast horizon",
             allowed_values=TimeReferenceMixin.TIME_UNITS,
             context=True,
             strict_validation=True,
+            deferred_binding=True,
         ),
         DefaultOptionKeys.in_features: PropertySpec(
             "Source feature to generate forecasts for",
@@ -165,6 +171,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
             element_validator=_is_bool,
             match_guard=_is_bool,
         ),
+        DefaultOptionKeys.reference_time: TimeReferenceMixin.REFERENCE_TIME_SPEC,
     }
 
     @staticmethod
@@ -335,9 +342,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
                     raise ValueError("No artifact to load although it was requested.")
 
             # Check if we should output confidence intervals
-            output_confidence_intervals = cls.options_with_defaults(feature.options).get(
-                cls.OUTPUT_CONFIDENCE_INTERVALS
-            )
+            output_confidence_intervals = feature.options.get(cls.OUTPUT_CONFIDENCE_INTERVALS)
 
             # Perform forecasting using the original clean data
             if output_confidence_intervals:
@@ -491,51 +496,6 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
 
         Raises:
             ValueError: If the reference time column is not a datetime column
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _get_available_columns(cls, data: Any) -> set[str]:
-        """
-        Get the set of available column names from the data.
-
-        Args:
-            data: The input data
-
-        Returns:
-            Set of column names available in the data
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the resolved source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of resolved feature names (may contain ~N suffixes)
-
-        Raises:
-            ValueError: If none of the features exist in the data (partial presence is accepted).
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
         """
         ...
 

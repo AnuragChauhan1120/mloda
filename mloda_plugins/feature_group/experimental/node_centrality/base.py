@@ -13,6 +13,7 @@ from mloda.provider import CHAIN_SEPARATOR, FeatureChainParser
 from mloda.provider import (
     FeatureChainParserMixin,
 )
+from mloda.provider import COLUMNWISE_HOOKS
 from mloda.provider import FeatureSet
 from mloda.provider import DefaultOptionKeys
 from mloda.provider import PropertySpec
@@ -138,6 +139,9 @@ class NodeCentralityFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     MIN_IN_FEATURES = 1
     MAX_IN_FEATURES = 1
 
+    # Hooks calculate_feature calls: _check_source_features_exist, _add_result_to_data.
+    REQUIRED_COLUMNWISE_HOOKS = COLUMNWISE_HOOKS
+
     # Property mapping for configuration-based feature creation
     PROPERTY_MAPPING = {
         # Context parameters (don't affect Feature Group resolution)
@@ -229,9 +233,8 @@ class NodeCentralityFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             centrality_type, source_feature_str = cls._extract_centrality_and_source_feature(feature)
 
             # Common parameter extraction (works for both approaches)
-            opts = cls.options_with_defaults(feature.options)
-            graph_type = opts.get(cls.GRAPH_TYPE)
-            weight_column = opts.get(cls.WEIGHT_COLUMN)
+            graph_type = feature.options.get(cls.GRAPH_TYPE)
+            weight_column = feature.options.get(cls.WEIGHT_COLUMN)
 
             # Validate graph type
             if graph_type not in cls.GRAPH_TYPES:
@@ -294,37 +297,6 @@ class NodeCentralityFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         # Fall back to configuration-based approach
         centrality_type = feature.options.get(cls.CENTRALITY_TYPE)
         return str(centrality_type) if centrality_type is not None else None
-
-    @classmethod
-    @abstractmethod
-    def _check_source_features_exist(cls, data: Any, feature_names: list[str]) -> None:
-        """
-        Check if the source features exist in the data.
-
-        Args:
-            data: The input data
-            feature_names: List of feature names to check
-
-        Raises:
-            ValueError: If any of the features do not exist in the data.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def _add_result_to_data(cls, data: Any, feature_name: str, result: Any) -> Any:
-        """
-        Add the result to the data.
-
-        Args:
-            data: The input data
-            feature_name: The name of the feature to add
-            result: The result to add
-
-        Returns:
-            The updated data
-        """
-        ...
 
     @classmethod
     @abstractmethod

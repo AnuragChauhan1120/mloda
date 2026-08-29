@@ -63,7 +63,8 @@ def _matches(pattern: str, path: str) -> bool:
 
 
 def _markdown_referenced_by_tests() -> set[str]:
-    """Markdown files that the test suite reads or asserts on, so CI must run when they change."""
+    """Markdown files the test suite references, found via literal "foo.md" strings; a glob- or
+    variable-built path is invisible to this scan."""
     referenced: set[str] = set()
     for source in (PROJECT_ROOT / "tests").rglob("*.py"):
         for line in source.read_text(encoding="utf-8").splitlines():
@@ -138,6 +139,8 @@ def test_protected_set_is_not_stale() -> None:
     protected = _protected_paths()
     assert "docs/docs/index.md" in protected, "docs/ markdown is executed by tests/test_documentation"
     assert "CONTRIBUTING.md" in protected, "CONTRIBUTING.md content is asserted by tests/test_project_structure.py"
+    assert "CLAUDE.md" in protected, "CLAUDE.md content is asserted by tests/test_agent_docs_sync.py"
+    assert "AGENTS.md" in protected, "AGENTS.md content is asserted by tests/test_agent_docs_sync.py"
 
 
 def test_paths_ignore_declared_for_push_and_pull_request() -> None:

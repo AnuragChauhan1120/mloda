@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Collection, Mapping
-from typing import Any, ClassVar, Callable, Iterable, Optional, final
+from typing import Any, ClassVar, Callable, Optional, final
 from abc import ABC
 
 from mloda.core.abstract_plugins.components.base_artifact import BaseArtifact
@@ -12,23 +12,37 @@ from mloda.core.abstract_plugins.components.data_types import DataType
 
 from mloda.core.abstract_plugins.components.domain import Domain
 from mloda.core.abstract_plugins.components.base_feature_group_version import BaseFeatureGroupVersion
+from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_author_guards import (
+    install_name_path_presence_guard,
+    install_required_when_guard,
+    validate_name_binding,
+    warn_captureless_without_binding,
+)
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import (
     CHAIN_SEPARATOR,
+    COLUMN_SEPARATOR,
     FeatureChainParser,
+    option_key_is_present,
 )
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import PropertySpec, is_no_default
+from mloda.core.abstract_plugins.components.property_spec import PropertySpec, is_no_default
 from mloda.core.abstract_plugins.components.subtype_declaration import SubtypeDeclaration
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.input_data.api.api_input_data import ApiInputData
 from mloda.core.abstract_plugins.components.input_data.base_input_data import BaseInputData
 from mloda.core.abstract_plugins.components.input_data.creator.data_creator import DataCreator
 from mloda.core.abstract_plugins.components.match_data.match_data import MatchData
+from mloda.core.abstract_plugins.components.match_rejection import INPUT_DATA_OWNED_STAGE, has_match_rejection
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_set import FeatureSet
 from mloda.core.abstract_plugins.components.options import Options, _isolate_forwarded_value
 from mloda.core.abstract_plugins.components.index.index import Index
-from mloda.core.abstract_plugins.components.utils import get_all_subclasses, safe_field
+from mloda.core.abstract_plugins.components.utils import (
+    contained_raise_reason,
+    get_all_subclasses,
+    is_match_abort,
+    safe_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +104,10 @@ class FeatureGroup(ABC):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         FeatureChainParser.validate_property_mapping_defaults(cls.__name__, cls.PROPERTY_MAPPING)
-        FeatureChainParser.install_required_when_guard(cls)
+        validate_name_binding(cls)
+        warn_captureless_without_binding(cls)
+        install_name_path_presence_guard(cls)
+        install_required_when_guard(cls)
         cls._validate_subtype_declaration()
 
     @classmethod
@@ -240,7 +257,7 @@ class FeatureGroup(ABC):
         fills_context: dict[str, Any] = {}
         for key, spec in mapping.items():
             # An opted-in spec honors an explicit None: presence, not non-None-ness, gates the fill (#768).
-            present = key in options if spec.allow_explicit_none else options.get(key) is not None
+            present = option_key_is_present(spec, key, options)
             if present:
                 continue
             if is_no_default(spec.default) or spec.default is None:
@@ -465,7 +482,7 @@ class FeatureGroup(ABC):
 
         Returns the original name if no ~N suffix exists.
         """
-        return column_name.split("~")[0]
+        return column_name.split(COLUMN_SEPARATOR)[0]
 
     @staticmethod
     def expand_feature_columns(feature_name: str, num_columns: int) -> list[str]:
@@ -516,6 +533,7 @@ class FeatureGroup(ABC):
 
         The specific input features may depend on the provided options and the feature name.
         """
+        # Contained: this is the root-feature protocol signal, which is_root reads as "this IS a root" (#845).
         raise NotImplementedError
 
     @classmethod
@@ -593,10 +611,22 @@ class FeatureGroup(ABC):
         feature group, and False otherwise. The criteria may include the feature name,
         options, and data access collection.
 
+        Every caller reads the return for truthiness, so any falsy value is a non-match and any truthy a match.
+
         The if statement contains the rules. Each case has different use cases.
         You can disallow them by removing them. However, often you can just use the default.
         If you want to implement a concrete implementation, e.g. just accept specific names,
         then you can overwrite this function.
+
+        The options view depends on the caller. Feature resolution passes declared (pre-default)
+        options. GlobalFilter matches a filter feature after intake, passing that feature's own
+        options enriched from the resolved feature's effective (post-default) ones: a key the filter
+        feature declares itself keeps its declared value, an omitted key arrives materialized.
+        Matching logic that reads option values can therefore see different values on the two paths.
+        See ``docs/in_depth/property-mapping.md`` ("Applying declared defaults").
+
+        A veto recorded while the user explicitly addressed the reader family gates the name-based
+        rules below; the MatchData rule still decides on its own.
         """
 
         base_feature_name = cls.get_column_base_feature(feature_name)
@@ -606,6 +636,11 @@ class FeatureGroup(ABC):
 
         if cls._matches_data(base_feature_name, options, data_access_collection):
             return True
+
+        # An owned veto: the user explicitly addressed this candidate's reader family and its declaration
+        # rejected the request; recovering by name would only defer the failure to load time in init_reader.
+        if has_match_rejection(INPUT_DATA_OWNED_STAGE):
+            return False
 
         if cls.feature_name_equal_to_class_name(base_feature_name):
             return True
@@ -662,10 +697,10 @@ class FeatureGroup(ABC):
         """Controls whether the framework applies post-calculation row elimination.
 
         This method is independent of inline filter reading. ``features.filters``
-        is always available inside ``calculate_feature()``, regardless of what
-        this method returns. A FeatureGroup may read filters inline (e.g. for
-        conditional masking or predicate pushdown) and still request row
-        elimination by returning ``True``.
+        is set regardless of what this method returns, but it may be ``None`` or an
+        empty set, so guard with ``if features.filters:``. A FeatureGroup may read
+        filters inline (e.g. for conditional masking or predicate pushdown) and
+        still request row elimination by returning ``True``.
 
         Returns:
             None:  Defer to the FilterEngine (default).
@@ -720,6 +755,8 @@ class FeatureGroup(ABC):
         the concrete feature, so it can reject an op on one backend while allowing
         others. If every candidate framework is rejected, the matcher surfaces a
         distinguishable error instead of a generic "no feature group" message.
+        Filter matching consults the same hook and narrows the frameworks an
+        attached filter feature rides.
 
         The default gates a declared canonical subtype by ``supported_subtypes()``;
         everything else (no subtype dimension, unresolved or undeclared subtype) stays open.
@@ -773,17 +810,23 @@ class FeatureGroup(ABC):
             if self.input_features(options, feature_name) is None:
                 # No input features declared, so this is a root feature.
                 return True
-        except NotImplementedError:
-            # input_features not implemented means this is a root feature.
+        # An unimplemented input_features is the documented way to declare a root feature, but this handler
+        # sits above the abort check below it, so a marked raise has to cross it first.
+        except NotImplementedError as exc:
+            if is_match_abort(exc):
+                raise
             return True
-        except Exception:
+        except Exception as exc:
             # Errors in input_features (e.g. validation failures for this feature name)
             # mean the feature group does not match, so it is not a root.
+            if is_match_abort(exc):
+                raise
+            # Text, not exc: a retained record must not pin the traceback, its frames and the plugin class.
             logger.debug(
-                "%s.input_features raised an exception for feature '%s'",
+                "%s.input_features %s for feature '%s'; treating it as a non-root.",
                 type(self).__name__,
+                contained_raise_reason(exc),
                 feature_name,
-                exc_info=True,
             )
         return False
 
@@ -837,15 +880,3 @@ class FeatureGroup(ABC):
 def format_feature_group_class(fg_class: type[FeatureGroup]) -> str:
     """Format a single FeatureGroup class for error messages."""
     return f"{fg_class.__name__} ({fg_class.__module__})"
-
-
-def format_feature_group_classes(feature_groups: Iterable[type[FeatureGroup]], include_domain: bool = False) -> str:
-    """Format FeatureGroup classes for error messages."""
-    lines = []
-    for fg_class in feature_groups:
-        line = f"  - {fg_class.__name__} ({fg_class.__module__})"
-        if include_domain:
-            domain = fg_class.get_domain()
-            line += f" [domain: {domain.name}]"
-        lines.append(line)
-    return "\n".join(lines)

@@ -6,6 +6,7 @@ to its matching FeatureGroup class, with support for subclass filtering
 and candidate tracking.
 """
 
+import ast
 import gc
 import inspect
 import linecache
@@ -20,15 +21,16 @@ from mloda.core.abstract_plugins.components.domain import Domain
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser_mixin import FeatureChainParserMixin
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import property_spec
+from mloda.core.abstract_plugins.components.property_spec import property_spec
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.components.plugin_option.plugin_collector import PluginCollector
 from mloda.core.api.plugin_info import ResolvedFeature
+from mloda.core.api import plugin_docs
 from mloda.core.api.plugin_docs import resolve_feature
-from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping, RedefinitionConflictError
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda.user import PluginLoader
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
 from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import (
@@ -293,6 +295,17 @@ def _forwarded_mismatch_options() -> Options:
     return options
 
 
+def _matches_own_class_name(fg: type[FeatureGroup]) -> bool:
+    """Whether fg matches its own class name; a raising matcher counts as no match.
+
+    The sweeps below call every registered matcher, so one broken candidate must not error the test (#868).
+    """
+    try:
+        return bool(fg.match_feature_group_criteria(FeatureName(fg.get_class_name()), Options(), None))
+    except Exception:
+        return False
+
+
 class TestResolvedFeatureDataclass:
     """Tests for the ResolvedFeature dataclass structure."""
 
@@ -369,7 +382,7 @@ class TestResolveFeatureValidMatch:
 
         all_fgs = get_all_subclasses(FeatureGroup)
         for fg in all_fgs:
-            if not fg.match_feature_group_criteria(FeatureName(fg.get_class_name()), Options(), None):
+            if not _matches_own_class_name(fg):
                 continue
             result = resolve_feature(fg.get_class_name())
             if result.feature_group is not None:
@@ -437,7 +450,7 @@ class TestResolveFeatureCandidates:
         for fg in all_fgs:
             if inspect.isabstract(fg):
                 continue
-            if not fg.match_feature_group_criteria(FeatureName(fg.get_class_name()), Options(), None):
+            if not _matches_own_class_name(fg):
                 continue
             candidates = resolve_feature(fg.get_class_name()).candidates
             if candidates:
@@ -578,14 +591,15 @@ class TestResolveFeatureCapabilityAware:
         assert result.feature_group is None
         assert result.error is not None
 
-        lowered = result.error.lower()
-        assert "unsupported" in lowered, f"Error must signal 'unsupported', got: {result.error}"
+        # Engine wording: the near-miss line names the eliminated candidate and the capability hook.
+        assert "AllRejectedCapResolveFeatureGroup (compute framework):" in result.error, (
+            f"Error must name the eliminated candidate, got: {result.error}"
+        )
+        assert "supports_compute_framework rejected" in result.error, (
+            f"Error must signal the capability hook rejection, got: {result.error}"
+        )
         assert "PandasDataFrame" in result.error, f"Error must name PandasDataFrame, got: {result.error}"
         assert "PythonDictFramework" in result.error, f"Error must name PythonDictFramework, got: {result.error}"
-        # Engine wording: names the capability hook and drops the debug-only phrasings.
-        assert "Pin the feature to a supported compute framework" in result.error, (
-            f"Error must carry the engine's capability-rejection guidance, got: {result.error}"
-        )
         assert "default options" not in result.error, (
             f"Engine error has no 'default options' caveat, got: {result.error}"
         )
@@ -906,7 +920,8 @@ class TestResolveFeatureScopedCapabilityRejection:
         assert result.feature_group is None
         assert result.error is not None
         # After #755 the engine builds the capability-rejection message; the scope callout is retained.
-        assert "Pin the feature to a supported compute framework" in result.error
+        assert "AllRejectedCapResolveFeatureGroup (compute framework):" in result.error
+        assert "supports_compute_framework rejected" in result.error
         assert "PandasDataFrame" in result.error
         assert "PythonDictFramework" in result.error
         assert "Scoped to feature group: 'AllRejectedCapResolveFeatureGroup'." in result.error
@@ -989,7 +1004,7 @@ class TestResolveFeatureScopedEngineParity:
         feature = Feature(SIBLING_SCOPED_FEATURE, feature_group="UnrelatedScopedResolve693FeatureGroup")
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -1022,7 +1037,7 @@ def _exec_conflict_fg(class_name: str, body: str, cell_label: str) -> type[Featu
 
 
 def _raising_match_conflict_source(qualname: str, feature_name: str, extra_body: str = "") -> str:
-    """Source for a conflicting FeatureGroup whose match hook raises a NON-ValueError (RuntimeError)."""
+    """Source for a conflicting FeatureGroup whose match hook raises RuntimeError."""
     return f"""
 from mloda.core.abstract_plugins.feature_group import FeatureGroup as _FG_BASE_
 
@@ -1056,14 +1071,13 @@ def _cleanup_main_after() -> Any:
 
 
 class TestResolveFeatureRaisingMatchDuringConflict:
-    """A conflicting class whose match hook raises a non-ValueError must not escape resolve_feature."""
+    """A redefinition conflict is projected before matching, so a raising match hook cannot escape."""
 
     def test_raising_match_hook_during_redef_conflict_does_not_raise(self, _cleanup_main_after: Any) -> None:
-        """A RuntimeError from match_feature_group_criteria on a conflicting class must surface as an error.
+        """A conflicting class with a raising match hook must still yield a ResolvedFeature with an error.
 
-        The redefinition-conflict branch filters conflicts with a helper that today catches only
-        ValueError, so a conflicting class whose match hook raises RuntimeError propagates out of
-        resolve_feature. The never-raising debug contract requires it to surface in ResolvedFeature.error.
+        The redefinition conflict is projected fail-closed before any matching runs, so the raising
+        match_feature_group_criteria hook is never invoked and cannot take resolve_feature down.
         """
         qualname = "RaiseMatchConflictResolveFG755"
         feature_name = "raise_match_conflict_resolve_feature_755_xyz"
@@ -1111,45 +1125,118 @@ class {qualname}(_FG_BASE_):
 """
 
 
-class TestResolveFeatureConflictBranchDomainParity:
-    """The redefinition-conflict branch must apply the feature's domain when building candidates (#756).
+class TestResolveFeatureConflictBranchProjectsFailure:
+    """The redefinition-conflict branch projects the canonical failure without re-matching (#792).
 
-    The engine adds a class to ``criteria_matched`` (which ``ResolvedFeature.candidates`` mirrors) only
-    AFTER it passes ``_filter_feature_group_by_domain``. The conflict branch of resolve_feature filters
-    conflicts by scope and match criteria only, omitting the domain, so a conflicting class whose domain
-    does not match the feature's domain is wrongly kept as a candidate.
+    A redefinition conflict is an environment-build failure: resolve_feature must project it exactly
+    like the EnvironmentPreconditionError branch, with NO candidates, instead of re-filtering the
+    conflicting classes through scope/match/domain hooks. Candidates are therefore always empty, for
+    matching and non-matching domains alike, and the exec'd conflict class never appears in them.
     """
 
-    def test_conflict_branch_excludes_nonmatching_domain_candidate(self, _cleanup_main_after: Any) -> None:
-        """A conflicting class whose domain differs from the feature's domain must not be a candidate."""
-        qualname = "DomainConflictResolveFG756"
-        feature_name = "domain_conflict_resolve_feature_756_xyz"
-        conflict_domain = "conflict_domain_756"
-        other_domain = "a_different_domain_than_the_conflict_class_756"
+    def test_conflict_branch_reports_no_candidates_for_any_domain(self, _cleanup_main_after: Any) -> None:
+        """Candidates are empty for a matching AND a non-matching domain; the error is the conflict text."""
+        qualname = "ConflictProjectionResolveFG792"
+        feature_name = "conflict_projection_resolve_feature_792_xyz"
+        conflict_domain = "conflict_domain_792"
+        other_domain = "a_different_domain_than_the_conflict_class_792"
 
         src_v1 = _domain_conflict_source(qualname, feature_name, conflict_domain)
         src_v2 = _domain_conflict_source(
             qualname,
             feature_name,
             conflict_domain,
-            extra_body="    def extra_method(self):\n        return 756\n",
+            extra_body="    def extra_method(self):\n        return 792\n",
         )
 
-        _exec_conflict_fg(qualname, src_v1, "cell-domain-conflict-756-v1")
-        conflict_cls = _exec_conflict_fg(qualname, src_v2, "cell-domain-conflict-756-v2")
+        _exec_conflict_fg(qualname, src_v1, "cell-conflict-projection-792-v1")
+        conflict_cls = _exec_conflict_fg(qualname, src_v2, "cell-conflict-projection-792-v2")
 
-        # Sanity: the exec'd conflict class declares the conflict domain.
+        # Sanity: the exec'd class declares the matching domain, so the OLD re-matching behavior
+        # would have kept it as a candidate. The pure projection must not.
         assert conflict_cls.get_domain() == Domain(conflict_domain)
 
-        # Domain mismatch: the feature carries a domain the conflict class does not declare. The engine
-        # would exclude it, so the conflict branch must too. Today it is wrongly kept in candidates.
+        match = resolve_feature(Feature(feature_name, domain=conflict_domain))
+
+        assert match.feature_group is None
+        assert match.error is not None
+        assert "FeatureGroup redefined with different source code" in match.error
+        assert conflict_cls not in match.candidates
+        assert match.candidates == []
+
         mismatch = resolve_feature(Feature(feature_name, domain=other_domain))
 
         assert mismatch.feature_group is None
         assert mismatch.error is not None
-        assert conflict_cls not in mismatch.candidates
+        assert mismatch.candidates == []
 
-        # Guard proving the exclusion is domain-driven, not always-empty: a matching domain keeps the class.
-        match = resolve_feature(Feature(feature_name, domain=conflict_domain))
+    def test_conflict_branch_scoped_string_form_keeps_callout_and_no_candidates(self, _cleanup_main_after: Any) -> None:
+        """The string form with a feature_group scope keeps the scope callout suffix, candidates stay empty."""
+        qualname = "ConflictProjectionScopedResolveFG792"
+        feature_name = "conflict_projection_scoped_resolve_feature_792_xyz"
+        conflict_domain = "conflict_domain_792"
 
-        assert conflict_cls in match.candidates
+        src_v1 = _domain_conflict_source(qualname, feature_name, conflict_domain)
+        src_v2 = _domain_conflict_source(
+            qualname,
+            feature_name,
+            conflict_domain,
+            extra_body="    def extra_method(self):\n        return 793\n",
+        )
+
+        _exec_conflict_fg(qualname, src_v1, "cell-conflict-projection-scoped-792-v1")
+        _exec_conflict_fg(qualname, src_v2, "cell-conflict-projection-scoped-792-v2")
+
+        result = resolve_feature(feature_name, feature_group=qualname)
+
+        assert result.feature_group is None
+        assert result.error is not None
+        assert result.error.endswith(f"Scoped to feature group: '{qualname}'.")
+        assert result.candidates == []
+
+
+class TestResolveFeatureAdapterIsThin:
+    """Structural (#792): resolve_feature is a thin adapter; no matching or provider-hook logic lives in it."""
+
+    @pytest.mark.parametrize(
+        "attribute",
+        [
+            "_matches_criteria_guarded",
+            "_matches_domain_guarded",
+        ],
+    )
+    def test_conflict_branch_helper_is_deleted(self, attribute: str) -> None:
+        """The conflict-branch re-matching helpers no longer exist in plugin_docs."""
+        assert not hasattr(plugin_docs, attribute)
+
+    def test_resolve_feature_source_calls_no_resolution_provider_hooks(self) -> None:
+        """resolve_feature's body invokes no FeatureGroup matching, domain, scope or capability hooks."""
+        source = textwrap.dedent(inspect.getsource(plugin_docs.resolve_feature))
+        tree = ast.parse(source)
+        called: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                called.add(node.attr)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+        forbidden = {
+            "match_feature_group_criteria",
+            "get_domain",
+            "matches_feature_group_scope",
+            "compute_framework_rule",
+            "compute_framework_definition",
+            "supports_compute_framework",
+            "validate_input_features",
+            "validate_output_features",
+            "index_columns",
+            "supports_index",
+            "input_features",
+            "_matches_criteria_guarded",
+            "_matches_domain_guarded",
+        }
+        overlap = sorted(called & forbidden)
+        assert overlap == [], f"resolve_feature invokes resolution provider hooks: {overlap}"
+
+    def test_redefinition_conflict_error_carries_no_conflicts_payload(self) -> None:
+        """RedefinitionConflictError has the plain ValueError __init__, no conflicts parameter."""
+        assert "conflicts" not in inspect.signature(RedefinitionConflictError.__init__).parameters

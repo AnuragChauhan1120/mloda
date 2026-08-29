@@ -6,7 +6,7 @@ mloda provides functions to discover, inspect, and debug plugins at runtime. The
 
 Use `resolve_feature()` to find which FeatureGroup handles a specific feature name:
 
-``` python
+```python
 from mloda.steward import resolve_feature
 
 # Check which FeatureGroup handles a feature
@@ -16,6 +16,8 @@ if result.feature_group:
 else:
     print(f"Resolution failed: {result.error}")
 ```
+
+Plugin authors can also import `resolve_feature` from `mloda.provider`; it is the same function.
 
 This is useful for:
 - Debugging feature resolution issues
@@ -31,15 +33,15 @@ resolves. The remaining differences are presentation-only: `resolve_feature`
 never raises (matching failures land in `result.error`, not an exception), and
 it returns a structured `ResolvedFeature` instead of a plan.
 
-One behavioral exception to the parity: a plugin that raises while declaring its
-frameworks (a broken `compute_framework_rule` / `compute_framework_definition`)
-aborts a real run, but on the debug path it degrades to an empty framework set,
-so it stays a listed candidate that never wins instead of taking the call down.
-The debug tool keeps reporting; the run fails fast.
+This covers a broken framework declaration too: a plugin that raises while
+declaring its frameworks (`compute_framework_rule` /
+`compute_framework_definition`) aborts the environment build on both paths. A run
+raises that failure; `resolve_feature` reports the same failure in `result.error`
+with no candidates, because the build never reaches matching. The difference stays
+presentation-only.
 
-Its environment is a **standalone default**, not a replay of a specific run:
-`ResolvedFeature.environment` reads `"standalone-default"`. The candidate
-universe defaults to every installed compute framework unless you narrow it (see
+Its candidate universe is a **standalone default**, not a replay of a specific
+run: it defaults to every installed compute framework unless you narrow it (see
 [Expressing the full request](#expressing-the-full-request)).
 
 ### Expressing the full request
@@ -49,7 +51,7 @@ too. Pass a `Feature` as the single source of truth for name, `options`, domain,
 compute-framework pin, and scope; passing `options` or `feature_group` alongside
 a `Feature` raises `TypeError`.
 
-``` python
+```python
 from mloda.user import Feature, Options
 
 result = resolve_feature(Feature("sales__sum_aggr", options=Options(group={"partition_by": ["customer_id"]})))
@@ -77,7 +79,7 @@ A FeatureGroup whose `match_feature_group_criteria` or
 supply it. Without `options` the evaluation uses empty `Options`, and such a
 group reports no candidates:
 
-``` python
+```python
 from mloda.steward import resolve_feature
 from mloda.user import Options, PluginLoader
 
@@ -100,7 +102,7 @@ When several FeatureGroups match the same name, such as the framework-specific
 string (the string matches the named class and its subclasses), the same forms
 as `Feature(..., feature_group=...)`:
 
-``` python
+```python
 result = resolve_feature("sales__sum_aggr", feature_group="PandasAggregatedFeatureGroup")
 ```
 
@@ -116,9 +118,12 @@ nothing resolves.
 
 ### Inspecting Candidates
 
-When resolution fails due to conflicts, check the candidates:
+When resolution reached matching but ended ambiguous (multiple FeatureGroups
+matched), `candidates` lists the classes that matched. When the environment
+build itself failed (for example a redefinition conflict), no matching runs,
+so `candidates` is empty and the error text carries the details:
 
-``` python
+```python
 result = resolve_feature("my_feature")
 if result.error:
     print(f"Error: {result.error}")
@@ -129,7 +134,7 @@ if result.error:
 
 Get documentation for available feature groups:
 
-``` python
+```python
 from mloda.steward import get_feature_group_docs
 
 # Get all feature groups
@@ -139,7 +144,7 @@ all_fgs = get_feature_group_docs()
 fgs = get_feature_group_docs(name="timestamp")
 
 # Filter by compute framework
-fgs = get_feature_group_docs(compute_framework="PandasDataframe")
+fgs = get_feature_group_docs(compute_framework="PandasDataFrame")
 ```
 
 Each `FeatureGroupInfo` also carries the subtype declaration: `subtype_key`
@@ -153,7 +158,7 @@ when the declaration is invalid). See
 
 Get documentation for compute frameworks:
 
-``` python
+```python
 from mloda.steward import get_compute_framework_docs
 
 # List every framework (is_available flags whether its backend library is installed)
@@ -167,7 +172,7 @@ available_frameworks = get_compute_framework_docs(available_only=True)
 
 Get documentation for extenders:
 
-``` python
+```python
 from mloda.steward import get_extender_docs
 
 # Get all extenders
@@ -215,10 +220,46 @@ and resolution paths intentionally differ:
 - **`get_*_docs` degrade.** Documentation is a best-effort read-only view, so a
   conflict collapses to the most recently defined (live) class and listing
   continues. There is nothing to execute, so ambiguity is harmless.
-- **`resolve_feature` surfaces the conflict.** Resolution feeds execution, which
-  must be unambiguous to be safe, so it returns `feature_group=None` with the
-  conflict described in `error` and the conflicting classes that match the
-  requested feature name in `candidates` rather than silently picking one.
+- **`resolve_feature` fails closed.** Resolution feeds execution, so the
+  conflict fails closed like any other environment-build failure: it returns
+  `feature_group=None` with the conflict described in `error` and no
+  candidates. The failure is projected from the build error itself, which names
+  the conflicting classes in the message, and no matching runs.
+
+### Broken framework declarations
+
+When a FeatureGroup raises while declaring its frameworks
+(`compute_framework_rule` / `compute_framework_definition`), the catalog and
+resolution paths again differ:
+
+- **`get_*_docs` degrade.** Listing is a read-only view, so the class stays a
+  catalog entry with `compute_frameworks=[]`. This is the annotate tier's
+  `safe_field` guard on that one field.
+- **`resolve_feature` fails closed.** Resolution feeds execution, so it builds its
+  environment the way a run does: the broken declaration aborts the build. It
+  returns `feature_group=None` with the provider's failure in `error` and no
+  candidates, the same failure a run raises.
+
+Failing closed is process-wide, not group-local: the build declares every
+FeatureGroup's frameworks, so one broken plugin fails *every* resolution and run,
+including features it has nothing to do with. The way out is to scope it out of
+the universe. Both filters below drop the class before its declaration is ever
+consulted, so the build succeeds and the feature is an ordinary no-match:
+
+```py
+# One broken third-party plugin, and every call reports its failure:
+resolve_feature("timestamp_unix").error
+# "Failed to build the plugin environment: RuntimeError: ... (raised by pkg.module:BrokenFG while declaring its compute frameworks)"
+
+# Scope it out, and resolution works again:
+resolve_feature("timestamp_unix", plugin_collector=PluginCollector().disabled_feature_groups({BrokenFG}))
+```
+
+`resolve_feature` names the culprit class as `module:qualname` in the error, so you know exactly which plugin to scope out.
+
+Strict mode is the other filter: an unregistered broken plugin is dropped before
+its declaration is read. Both apply identically to a run, so a scope that rescues
+`resolve_feature` rescues the run too.
 
 ### Shared helper
 

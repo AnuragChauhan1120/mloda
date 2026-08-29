@@ -1,3 +1,4 @@
+from copy import copy
 from typing import Any
 import uuid
 
@@ -27,9 +28,13 @@ class SingleFilter:
         self.filter_feature = self.handle_filter_feature(filter_feature)
         self.filter_type = self.handle_filter_type(filter_type)
         self.parameter = self.handle_parameter(parameter)
-        self.name = str(self.filter_feature.name)
 
         self.uuid = uuid.uuid4()
+
+    @property
+    def name(self) -> str:
+        """Read-through to the filter feature so a later rename stays visible."""
+        return str(self.filter_feature.name)
 
     def handle_filter_type(self, filter_type: str | FilterType) -> str:
         if not filter_type:
@@ -46,7 +51,9 @@ class SingleFilter:
         from mloda.core.abstract_plugins.components.feature import Feature
 
         if isinstance(filter_feature, Feature):
-            return filter_feature
+            # The caller keeps its own object: Feature.__copy__ owns the containers that decide the
+            # hash, so a later write to them cannot lose this filter from a set it sits in (#910).
+            return copy(filter_feature)
         elif isinstance(filter_feature, str):
             return Feature(name=filter_feature)
         else:
@@ -64,15 +71,18 @@ class SingleFilter:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SingleFilter):
             return False
+        # Feature excludes feature_group_scope from its own identity, but the scope decides
+        # filter attachment, so the DECLARATION identity must include it.
         return (
             self.filter_feature == other.filter_feature
             and self.filter_type == other.filter_type
             and self.parameter == other.parameter
+            and self.filter_feature.feature_group_scope == other.filter_feature.feature_group_scope
         )
 
     def __hash__(self) -> int:
         # Combine the hashes of the feature, type, and parameter for a unique hash value
-        return hash((self.filter_feature, self.filter_type, self.parameter))
+        return hash((self.filter_feature, self.filter_type, self.parameter, self.filter_feature.feature_group_scope))
 
     def __repr__(self) -> str:
         return f"<SingleFilter(feature_name={self.filter_feature.name}, type={self.filter_type}, parameters={self.parameter})>"

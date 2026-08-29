@@ -51,7 +51,7 @@ Join Types specify how two datasets are merged based on their keys. The framewor
 -   Inner Join,
 -   Left Join,
 -   Outer Join,
--   Right Join (use sparingly; prefer left joins when possible).
+-   Right Join (use sparingly; prefer left joins when possible). The declared left feature group's data is the merge engine's left argument, whichever compute framework the join executes in.
 -   ASOF Join (point-in-time / as-of: equi match on the by-keys, nearest time match on the time columns).
 
 ```python
@@ -319,7 +319,7 @@ When multiple batches match (e.g. three subclasses all matching a base-class lin
 
 #### mlodaAPI
 
-``` python
+```py
 from mloda.user import mloda
 
 set_of_links = {link}
@@ -339,7 +339,7 @@ In the following section, we will see how this can look like.
 The compute framework uses the base class BaseMergeEngine as configuration.
 In this example, we show the PandasMergeEngine.
 
-``` python
+```py
 class PandasDataFrame(ComputeFramework):
     def merge_engine(self) -> Type[BaseMergeEngine]:
         return PandasMergeEngine
@@ -356,7 +356,7 @@ The merge can implement:
 
 These methods are invoked via the final implementation in the abstract class **BaseMergeEngine**:
 
-``` python
+```py
 @final
 def merge(self, left_data: Any, right_data: Any, jointype: JoinType, left_index: Index, right_index: Index) -> Any:
     if jointype == JoinType.INNER:
@@ -367,7 +367,7 @@ def merge(self, left_data: Any, right_data: Any, jointype: JoinType, left_index:
 ```
 
 A simplified MergeEngine implementation looks like this:
-``` python
+```py
 class PandasMergeEngine(BaseMergeEngine):
     def merge_inner(self, left_data: Any, right_data: Any, left_index: Index, right_index: Index) -> Any:
         return self.join_logic("inner", left_data, right_data, left_index, right_index, JoinType.INNER)

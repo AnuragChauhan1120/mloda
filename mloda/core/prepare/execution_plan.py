@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from copy import copy, deepcopy
-from typing import Any, Generator, Optional
-from uuid import UUID
+from typing import Any, Generator, NamedTuple, Optional
+from uuid import UUID, uuid4
 
-from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
+from mloda.core.abstract_plugins.components.error_utils import REPORT_URL, internal_invariant_error
+from mloda.core.abstract_plugins.components.utils import safe_field
 from mloda.core.abstract_plugins.components.index.index import Index
 
 from mloda.core.abstract_plugins.components.input_data.api.api_input_data_collection import (
@@ -13,10 +15,27 @@ from mloda.core.abstract_plugins.components.input_data.api.api_input_data import
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.filter.global_filter import GlobalFilter
 from mloda.core.filter.single_filter import SingleFilter
+from mloda.core.prepare.declared_sides import split_by_declared_side
 from mloda.core.prepare.joinstep_collection import JoinStepCollection
 from mloda.core.prepare.graph.graph import Graph
 from mloda.core.prepare.resolve_graph import PlannedQueue
 from mloda.core.prepare.resolve_links import LinkFrameworkTrekker, LinkTrekker
+from mloda.core.prepare.resolved_join import (
+    DeclinedOrientation,
+    JoinSide,
+    JoinSignature,
+    ResolvedJoin,
+    ResolvedJoinPlan,
+)
+from mloda.core.prepare.resolved_join_builder import (
+    DeclaredFrameworks,
+    build_resolved_join_side,
+    joinstep_signatures,
+    raise_on_join_plan_divergence,
+    wire_join_dependencies,
+)
+from mloda.core.prepare.validate_resolved_join import raise_on_orphaned_join_source
+from mloda.core.core.step.abstract_step import Step
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
 from mloda.core.core.step.join_step import JoinStep
 from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
@@ -31,13 +50,54 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _filter_options_sort_key(single_filter: SingleFilter) -> tuple[str, str]:
+    """Order enrichment variants: stable for values with a value-based repr, repr-identity ordering
+    otherwise; a raising repr degrades to the value's type name."""
+    options = single_filter.filter_feature.options
+    return (
+        repr(sorted((str(k), safe_field(lambda: repr(v), type(v).__name__)) for k, v in options.group.items())),
+        repr(sorted((str(k), safe_field(lambda: repr(v), type(v).__name__)) for k, v in options.context.items())),
+    )
+
+
+def _describe_step(step: Step) -> str:
+    """Name a step of the plan for an error message."""
+    if isinstance(step, JoinStep):
+        return f"JoinStep(link={step.link})"
+    if isinstance(step, FeatureGroupStep):
+        return f"FeatureGroupStep({format_feature_group_class(step.feature_group)}, uuid={step.uuid})"
+    if isinstance(step, TransformFrameworkStep):
+        return (
+            f"TransformFrameworkStep({step.from_framework.get_class_name()} -> "
+            f"{step.to_framework.get_class_name()}, uuid={step.uuid})"
+        )
+    return f"{type(step).__name__}(uuid={step.uuid})"
+
+
+class AppendOrUnionSides(NamedTuple):
+    """The left/right feature uuids and frameworks an APPEND or UNION link resolved to."""
+
+    destination_framework: type[ComputeFramework]
+    source_framework: type[ComputeFramework]
+    left_uuid: UUID
+    right_uuid: UUID
+
+
+class _JoinServedParent(NamedTuple):
+    """Stand-in for a parent delivered by a JoinStep (no TransformFrameworkStep is built for it), so it
+    can still be named in the missing-Links conflict error."""
+
+    from_feature_group: type[FeatureGroup]
+
+
 class ExecutionPlan:
     def __init__(
         self,
         global_filter: Optional[GlobalFilter] = None,
         api_input_data_collection: Optional[ApiInputDataCollection] = None,
     ) -> None:
-        self.tfs_collection: set[TransformFrameworkStep] = set()
+        # Maps a step to itself so a dedup hit can recover the already-inserted canonical member.
+        self.tfs_collection: dict[TransformFrameworkStep, TransformFrameworkStep] = {}
         self.joinstep_collection = JoinStepCollection()
         self.global_filter = global_filter
         self.api_input_data_collection = api_input_data_collection
@@ -45,17 +105,57 @@ class ExecutionPlan:
         # Helper variable
         self.feature_set_collections: list[set[UUID]] = []
 
+        # Report each divergence once, then at DEBUG.
+        self.reported_unmatched: set[tuple[type[FeatureGroup], str, tuple[str, ...]]] = set()
+
+        self.planned_records: list[ResolvedJoin] = []
+        self.declined_orientations: list[LinkFrameworkTrekker] = []
+        self.declared_frameworks: DeclaredFrameworks = {}
+        self.resolved_join_plan = ResolvedJoinPlan((), ())
+        self.join_signatures_at_build: frozenset[JoinSignature] = frozenset()
+
     def __iter__(self) -> Generator[TransformFrameworkStep | JoinStep | FeatureGroupStep, None, None]:
         yield from self.execution_plan
 
     def __len__(self) -> int:
         return len(self.execution_plan)
 
-    def create_execution_plan(self, queue: PlannedQueue, graph: Graph, link_trekker: LinkTrekker) -> None:
+    def create_execution_plan(
+        self,
+        queue: PlannedQueue,
+        graph: Graph,
+        link_trekker: LinkTrekker,
+        declared_frameworks: DeclaredFrameworks | None = None,
+        validate: bool = True,
+    ) -> None:
+        self.planned_records = []
+        self.declined_orientations = []
+        self.tfs_collection = {}
+        self.joinstep_collection = JoinStepCollection()
+        self.feature_set_collections = []
+        self.declared_frameworks = declared_frameworks if declared_frameworks is not None else {}
+
         child_links = self.invert_link_trekker(link_trekker)
         pre_execution_plan = self.add_feature_group_step(queue, graph.parent_to_children_mapping, child_links)
         fw_execution_plan = self.add_joinstep(pre_execution_plan, link_trekker, graph)
+
+        # Built before add_tfs, whose write serialization edges are not part of the join decision.
+        join_steps = [step for step in fw_execution_plan if isinstance(step, JoinStep)]
+        resolved_records = wire_join_dependencies(self.planned_records, join_steps)
+        declined = tuple(DeclinedOrientation(key[0].uuid, key[1], key[2]) for key in self.declined_orientations)
+        self.resolved_join_plan = ResolvedJoinPlan(resolved_records, declined)
+        self.join_signatures_at_build = joinstep_signatures(join_steps)
+        raise_on_join_plan_divergence(self.resolved_join_plan, join_steps)
+        if validate:
+            raise_on_orphaned_join_source(self.resolved_join_plan)
+
         self.execution_plan = self.add_tfs(fw_execution_plan, graph)
+        self.raise_on_step_cycle(self.execution_plan)
+
+        # Only read during add_joinstep above; ExecutionPlan gets deepcopy'd on every Engine.compute()
+        # call, so this (potentially O(#features), UUID-keyed) dict and its live reference into
+        # ResolveComputeFrameworks's own dict must not linger past the plan build that needs it.
+        self.declared_frameworks = {}
 
     def add_feature_group_step(
         self,
@@ -101,7 +201,158 @@ class ExecutionPlan:
 
         fw_execution_plan = self.handle_append_or_union_joinstep(fw_execution_plan)
 
+        self.expand_link_tokens(fw_execution_plan, link_trekker)
+
         return fw_execution_plan
+
+    def expand_link_tokens(
+        self, fw_execution_plan: list[JoinStep | FeatureGroupStep], link_trekker: LinkTrekker
+    ) -> None:
+        """Replace every waited-on link uuid with the uuids of the JoinSteps planned for that link."""
+        links_by_uuid: dict[UUID, Link] = {trekker[0].uuid: trekker[0] for trekker in link_trekker.data}
+
+        joinstep_uuids: dict[UUID, set[UUID]] = defaultdict(set)
+        for step in fw_execution_plan:
+            if isinstance(step, JoinStep):
+                joinstep_uuids[step.link.uuid].add(step.uuid)
+
+        # The planned steps are a source of link uuids of their own, and handle_append_or_union_joinstep waits on them.
+        link_uuids = set(links_by_uuid) | set(link_trekker.order) | set(joinstep_uuids)
+
+        # Collected first: a raise on a later step must not leave a half expanded plan behind.
+        expansions: list[tuple[JoinStep | FeatureGroupStep, set[UUID], set[UUID]]] = []
+        for step in fw_execution_plan:
+            required_links = step.required_uuids & link_uuids
+            if not required_links:
+                continue
+
+            expanded: set[UUID] = set()
+            for link_uuid in required_links:
+                produced = joinstep_uuids.get(link_uuid)
+                if not produced:
+                    raise ValueError(self._no_joinstep_for_link_error(links_by_uuid.get(link_uuid, link_uuid)))
+                expanded.update(produced)
+
+            # A step must never wait for a token it produces itself.
+            expansions.append((step, required_links, expanded - step.get_uuids()))
+
+        for step, required_links, expanded in expansions:
+            step.required_uuids.difference_update(required_links)
+            step.required_uuids.update(expanded)
+
+    @staticmethod
+    def _no_joinstep_for_link_error(link: Link | UUID) -> str:
+        """A link a step waits for that planned no join step is a configuration problem, not a bug."""
+        return (
+            f"No join step was planned for a link that a step of the plan waits for: {link}\n"
+            "Possible causes:\n"
+            "  - The left_discriminator or right_discriminator values match none of the features' options.\n"
+            "  - The left compute framework of the link is not the compute framework of the child feature.\n"
+            "Resolution: align the discriminator values with the options you set on the features, and declare "
+            "the link on the compute framework the child is computed in.\n"
+            f"If neither applies, please report this issue at {REPORT_URL} with the full traceback."
+        )
+
+    @staticmethod
+    def _parents_linked_by_join(uuid_a: UUID, uuid_b: UUID, join_steps: set[JoinStep]) -> bool:
+        """Whether two parents are linked, directly or transitively, via JoinSteps' genuine sides
+        (not ``required_uuids``, which unions all of a join's consumers' parents, not just its own two)."""
+        if uuid_a == uuid_b:
+            return True
+
+        adjacency: dict[UUID, set[UUID]] = defaultdict(set)
+        for js in join_steps:
+            for dest_uuid in js.destination_framework_uuids:
+                adjacency[dest_uuid].update(js.source_framework_uuids)
+            for src_uuid in js.source_framework_uuids:
+                adjacency[src_uuid].update(js.destination_framework_uuids)
+
+        visited = {uuid_a}
+        frontier = {uuid_a}
+        while frontier:
+            frontier = set().union(*(adjacency[node] for node in frontier)) - visited
+            if uuid_b in frontier:
+                return True
+            visited |= frontier
+        return False
+
+    @staticmethod
+    def _conflicting_transform_hops_error(
+        ep: FeatureGroupStep,
+        first_hop: TransformFrameworkStep | _JoinServedParent,
+        second_hop: TransformFrameworkStep | _JoinServedParent,
+    ) -> str:
+        """A FeatureGroupStep can only bind one incoming source; two distinct, unlinked ones is a
+        missing-Link configuration problem, not a bug."""
+        feature_name = format_feature_group_class(ep.feature_group)
+        first_name = format_feature_group_class(first_hop.from_feature_group)
+        second_name = format_feature_group_class(second_hop.from_feature_group)
+        first_class_name = first_hop.from_feature_group.get_class_name()
+        second_class_name = second_hop.from_feature_group.get_class_name()
+
+        return f"""
+Feature group '{feature_name}' depends on parents from two different, unlinked source feature
+groups: '{first_name}' and '{second_name}'.
+
+When a feature depends on multiple input features from different sources, you must provide explicit
+Links to specify how to merge them. Without Links, the framework cannot determine how to combine the
+data, and only one of the two sources would ever be read.
+
+Option 1: Explicit JoinSpec (works with any feature group):
+    from mloda.user import Link, JoinSpec
+
+    links = {{
+        Link.inner(
+            JoinSpec({first_class_name}, "shared_column"),
+            JoinSpec({second_class_name}, "shared_column"),
+        )
+    }}
+
+Option 2: Shorthand via index_columns() (requires feature groups to define index_columns()):
+    from mloda.user import Link
+
+    links = {{
+        Link.inner_on({first_class_name}, {second_class_name})
+    }}
+
+Available join types:
+- Link.inner(left, right)    - Keep only matching rows from both sides
+- Link.left(left, right)     - Keep all rows from left, matching from right
+- Link.right(left, right)    - Keep all rows from right, matching from left
+- Link.outer(left, right)    - Keep all rows from both sides
+- Link.inner_on(left, right) - Shorthand using index_columns() definitions
+""".strip()
+
+    def raise_on_step_cycle(self, steps: Sequence[Step]) -> None:
+        """Required tokens order the steps of the finished plan against each other, and a cycle would never run."""
+        producer_of: dict[UUID, UUID] = {}
+        steps_by_uuid: dict[UUID, Step] = {}
+        for step in steps:
+            steps_by_uuid[step.uuid] = step
+            for token in step.get_uuids():
+                producer_of[token] = step.uuid
+
+        # A token no step produces is not a cycle; the runtime reports it as a missing producer.
+        pending = {
+            step.uuid: {producer_of[token] for token in step.required_uuids if token in producer_of} for step in steps
+        }
+
+        while True:
+            ready = {uuid for uuid, waits_for in pending.items() if not waits_for}
+            if not ready:
+                break
+            for uuid in ready:
+                del pending[uuid]
+            for waits_for in pending.values():
+                waits_for -= ready
+
+        if pending:
+            raise ValueError(
+                internal_invariant_error(
+                    "the steps of the plan form a cycle.",
+                    f"steps={sorted(_describe_step(steps_by_uuid[uuid]) for uuid in pending)}",
+                )
+            )
 
     def handle_append_or_union_joinstep(
         self,
@@ -154,16 +405,11 @@ class ExecutionPlan:
         return fw_execution_plan
 
     def fill_tfs_by_joinstep(self, ep: JoinStep) -> TransformFrameworkStep:
-        """
-        We switch here only the feature group, as the other is already switched during run_link
-        """
-
-        if ep.link.jointype == JoinType.RIGHT:
-            from_feature_group = ep.link.left_feature_group
-            to_feature_group = ep.link.right_feature_group
+        """The hop moves the source side into the destination side; swap_merge_sides names which side that is."""
+        if ep.swap_merge_sides:
+            from_feature_group, to_feature_group = ep.link.left_feature_group, ep.link.right_feature_group
         else:
-            from_feature_group = ep.link.right_feature_group
-            to_feature_group = ep.link.left_feature_group
+            from_feature_group, to_feature_group = ep.link.right_feature_group, ep.link.left_feature_group
 
         return TransformFrameworkStep(
             from_framework=ep.source_framework,
@@ -183,15 +429,28 @@ class ExecutionPlan:
         left_join_frameworks: set[JoinStep] = {ep for ep in execution_plan if isinstance(ep, JoinStep)}
         need_to_upload_collector: set[UUID] = set()
 
+        # Features produced together by one FeatureGroupStep live on the same physical source cfw
+        # instance, so a hop should key on the owning step, not each member feature's own uuid.
+        owning_step_of: dict[UUID, UUID] = {
+            feature_uuid: ep.uuid
+            for ep in execution_plan
+            if isinstance(ep, FeatureGroupStep)
+            for feature_uuid in ep.get_uuids()
+        }
+
         for ep in execution_plan:
             if isinstance(ep, JoinStep):
                 if ep.destination_framework != ep.source_framework:
                     new_tfs = self.fill_tfs_by_joinstep(ep)
 
-                    if new_tfs not in self.tfs_collection:
-                        self.tfs_collection.add(new_tfs)
+                    # Safe to reuse the canonical hop here: link_id is part of its identity, so both joins
+                    # of this link re-find the hopped framework by link.uuid.
+                    canonical_tfs = self.tfs_collection.get(new_tfs)
+                    if canonical_tfs is None:
+                        self.tfs_collection[new_tfs] = new_tfs
                         new_execution_plan.append(new_tfs)
-                        ep.required_uuids.add(new_tfs.uuid)
+                        canonical_tfs = new_tfs
+                    ep.required_uuids.add(canonical_tfs.uuid)
 
                     need_to_upload_collector.update(ep.source_framework_uuids)
 
@@ -242,25 +501,28 @@ class ExecutionPlan:
                 if ep.features.any_uuid is None:
                     raise ValueError(f"Feature group {format_feature_group_class(ep.feature_group)} has no uuid.")
 
-                parents = graph.parent_to_children_mapping[ep.features.any_uuid]
-                parent_parents = self.get_parent_parents(parents, graph)
+                parents: set[UUID] = set()
+                for member_uuid in ep.get_uuids():
+                    member_parents = graph.parent_to_children_mapping.get(member_uuid, set())
+                    parents |= member_parents - self.get_parent_parents(member_parents, graph)
+
+                # Explicit hops and join-served parents (delivered pre-merged by a JoinStep, no hop built)
+                # both compete for this step's one binding, so both get grouped by the same linkage test
+                # below. Order-independent: collected here, grouped once after the loop.
+                bound_entries: list[tuple[TransformFrameworkStep | _JoinServedParent, UUID]] = []
+                join_served_entries: list[tuple[type[FeatureGroup], UUID]] = []
+                seen_hop_uuids: set[UUID] = set()
 
                 for parent in parents:
-                    match = set()
                     parent_node_property = graph.get_nodes()[parent]
-
-                    for js in left_join_frameworks:
-                        found = js.matched(ep.compute_framework, parent_node_property.feature.uuid)
-                        if found:
-                            match.add(found)
-                            break
-                    if match:
-                        # We add the uuid of the joinstep to the required_uuids of the feature group.
-                        ep.required_uuids.union(match)
-                        continue
-
-                    # We only want to add TFS for direct parents and not for parent parents.
-                    if parent in parent_parents:
+                    matching_join_steps = [
+                        js
+                        for js in left_join_frameworks
+                        if js.matched(ep.compute_framework, parent_node_property.feature.uuid)
+                    ]
+                    if matching_join_steps:
+                        # Served by a join, no explicit hop needed.
+                        join_served_entries.append((parent_node_property.feature_group_class, parent))
                         continue
 
                     if ep.compute_framework != parent_node_property.feature.get_compute_framework():
@@ -270,52 +532,93 @@ class ExecutionPlan:
                             required_uuids={parent},
                             from_feature_group=parent_node_property.feature_group_class,
                             to_feature_group=ep.feature_group,
+                            source_step_uuid=owning_step_of.get(parent, parent),
                         )
-                        if new_tfs not in self.tfs_collection:
-                            self.tfs_collection.add(new_tfs)
+                        canonical_tfs = self.tfs_collection.get(new_tfs)
+                        if canonical_tfs is None:
+                            self.tfs_collection[new_tfs] = new_tfs
                             new_execution_plan.append(new_tfs)
-                            ep.required_uuids.add(new_tfs.uuid)
+                            canonical_tfs = new_tfs
 
-                        # We update the any_uuid of the feature group to the uuid of the TFS.
-                        # This way we make sure that the TFS is used later.
-                        ep.tfs_ids.add(new_tfs.uuid)
+                        if canonical_tfs.uuid not in seen_hop_uuids:
+                            seen_hop_uuids.add(canonical_tfs.uuid)
+                            bound_entries.append((canonical_tfs, parent))
+
+                        # Records every parent the hop covers; they all share one owning step, so
+                        # this doesn't change the scheduling gate.
+                        canonical_tfs.required_uuids.add(parent)
+                        ep.required_uuids.add(canonical_tfs.uuid)
+
+                        # Record the surviving hop's uuid so the step resolves its compute framework from it.
+                        ep.tfs_ids.add(canonical_tfs.uuid)
 
                         need_to_upload_collector.add(parent)
+
+                # Group entries by transitive linkage: same feature-group class, one entry's own class a
+                # subclass (or superclass) of the other's (catches a case-override hop whose parent lost the
+                # JoinStep's own uuid to a same-role sibling, see `_case_override_beats_nearer_wrong_framework_left`,
+                # without also bridging two entries that merely share an unrelated common ancestor via some
+                # third join's declared side), or `_parents_linked_by_join`.
+                def _entries_linked(
+                    entry_a: tuple[TransformFrameworkStep | _JoinServedParent, UUID],
+                    entry_b: tuple[TransformFrameworkStep | _JoinServedParent, UUID],
+                ) -> bool:
+                    hop_a, parent_a = entry_a
+                    hop_b, parent_b = entry_b
+                    if hop_a.from_feature_group is hop_b.from_feature_group:
+                        return True
+                    if issubclass(hop_a.from_feature_group, hop_b.from_feature_group) or issubclass(
+                        hop_b.from_feature_group, hop_a.from_feature_group
+                    ):
+                        return True
+                    return self._parents_linked_by_join(parent_a, parent_b, left_join_frameworks)
+
+                def _add_to_groups(
+                    groups: list[list[tuple[TransformFrameworkStep | _JoinServedParent, UUID]]],
+                    entry: tuple[TransformFrameworkStep | _JoinServedParent, UUID],
+                ) -> None:
+                    linked_groups = [
+                        group for group in groups if any(_entries_linked(entry, member) for member in group)
+                    ]
+                    if linked_groups:
+                        target_group = linked_groups[0]
+                        target_group.append(entry)
+                        for other_group in linked_groups[1:]:
+                            target_group.extend(other_group)
+                            groups.remove(other_group)
+                    else:
+                        groups.append([entry])
+
+                hop_groups: list[list[tuple[TransformFrameworkStep | _JoinServedParent, UUID]]] = []
+                for entry in bound_entries:
+                    _add_to_groups(hop_groups, entry)
+
+                # Join-served parents compete for the same binding, so merge them into the same groups too.
+                for served_feature_group, served_parent in join_served_entries:
+                    _add_to_groups(hop_groups, (_JoinServedParent(served_feature_group), served_parent))
+
+                if len(hop_groups) > 1:
+                    raise ValueError(
+                        self._conflicting_transform_hops_error(ep, hop_groups[0][0][0], hop_groups[1][0][0])
+                    )
 
             else:
                 raise ValueError(f"Element {ep} is not a valid element.")
             new_execution_plan.append(ep)
 
-            # We define that every parent of a transform framework step needs to be uploaded.
-            # This step is only relevant for multi processing.
-            for _ep in new_execution_plan:
-                if isinstance(_ep, FeatureGroupStep):
-                    if _ep.features.any_uuid in need_to_upload_collector:
-                        _ep.need_to_upload = True
-
-        # 1.7.2024
-        # print()
-        # for ep in new_execution_plan:
-        #    print("--------")
-        #    if isinstance(ep, FeatureGroupStep):
-        #        print("FGS", ep.feature_group.get_class_name(), ep.features.get_all_feature_ids())
-        #        print(ep.features.get_all_names())
-        #        print(ep.children_if_root)
-        #        # print(next(iter(ep.features.features)).compute_frameworks)
-        #        print(ep.required_uuids)
-        #    elif isinstance(ep, TransformFrameworkStep):
-        #        print("TFS")
-        #        print(ep.from_feature_group.get_class_name(), " -> ", ep.to_feature_group.get_class_name())
-        #        print(ep.from_framework.get_class_name(), " -> ", ep.to_framework.get_class_name())
-        #        print(ep.required_uuids)
-        #    elif isinstance(ep, JoinStep):
-        #        print("JOIN")
-        #        print(ep.link.uuid)
-        #        print(ep.destination_framework_uuids)
-        #        print(ep.source_framework_uuids)
-        #       print(ep.source_framework.get_class_name(), " -> ", ep.destination_framework.get_class_name())
-        #        print(ep.required_uuids)
-        # print("###############################")
+        # We define that every parent of a transform framework step needs to be uploaded.
+        # This step is only relevant for multi processing.
+        #
+        # One pass over the finished plan, not one per appended step: the marking is
+        # monotone (only ever set to True, and need_to_upload_collector only grows),
+        # nothing inside add_tfs reads need_to_upload, and no step escapes the list
+        # mid-build - so a step ends up marked iff it is non-disjoint from the FINAL
+        # collector either way. That drops the pass from O(steps^2 * features) to
+        # O(steps * features).
+        for _ep in new_execution_plan:
+            if isinstance(_ep, FeatureGroupStep):
+                if not need_to_upload_collector.isdisjoint(_ep.get_uuids()):
+                    _ep.need_to_upload = True
 
         return new_execution_plan
 
@@ -395,10 +698,27 @@ class ExecutionPlan:
     def get_parent_parents(self, parents: set[UUID], graph: Graph) -> set[UUID]:
         parent_parents = set()
         for parent in parents:
-            parent_parent = graph.parent_to_children_mapping[parent]
+            parent_parent = graph.parent_to_children_mapping.get(parent, set())
             if len(parent_parent) > 0:
                 parent_parents.update(parent_parent)
         return parent_parents
+
+    @staticmethod
+    def _validate_join_step_uuids(
+        link: Link,
+        destination_framework_uuids: set[UUID],
+        source_framework_uuids: set[UUID],
+    ) -> None:
+        """Both JoinStep sides must name at least one parent; the runtime later reads
+        them with next(iter(...))."""
+        if not destination_framework_uuids or not source_framework_uuids:
+            raise ValueError(
+                internal_invariant_error(
+                    "run_link resolved an empty destination_framework_uuids or source_framework_uuids.",
+                    f"link={link}, destination_framework_uuids={destination_framework_uuids}, "
+                    f"source_framework_uuids={source_framework_uuids}",
+                )
+            )
 
     def run_link(
         self,
@@ -417,16 +737,22 @@ class ExecutionPlan:
 
         # This gets the id of the children which needs the link to be calculated.
         children_uuids: set[UUID] = set()
+        attempted_key = link_fw
 
         for stored_links, uuids in link_trekker.data.items():
             if link_fw == stored_links:
                 children_uuids.update(uuids)
             # this part is not working!
 
+        swap_merge_sides = False
+
         if len(children_uuids) == 0:
             # No child needs the declared orientation, so destination and source are the other way around.
             destination_framework = link_fw[2]
             source_framework = link_fw[1]
+            # The join then executes in the right feature group's framework, so the merge arguments are inverted.
+            swap_merge_sides = True
+            attempted_key = (link, destination_framework, source_framework)
 
             for stored_links, uuids in link_trekker.data.items():
                 if (link, destination_framework, source_framework) == stored_links:
@@ -442,16 +768,28 @@ class ExecutionPlan:
         for uuid in children_uuids:
             required_uuids.update(graph.parent_to_children_mapping[uuid])
 
+        # Split before the order-edge link uuids join required_uuids.
+        split = split_by_declared_side(link, required_uuids, graph)
+
         # This filters the required_uuids to only the one with the final compute framework.
         destination_framework_uuids: set[UUID] = set()
         source_framework_uuids: set[UUID] = set()
 
         for uuid in required_uuids:
-            if graph.get_nodes()[uuid].feature.get_compute_framework() == destination_framework:
+            node_framework = graph.get_nodes()[uuid].feature.get_compute_framework()
+
+            if node_framework == destination_framework:
                 destination_framework_uuids.add(uuid)
 
-            if graph.get_nodes()[uuid].feature.get_compute_framework() == source_framework:
+            if node_framework == source_framework:
                 source_framework_uuids.add(uuid)
+
+        declared_left_frameworks = {graph.get_nodes()[u].feature.get_compute_framework() for u in split.left_uuids}
+        declared_right_frameworks = {graph.get_nodes()[u].feature.get_compute_framework() for u in split.right_uuids}
+        widened_right_frameworks = {
+            graph.get_nodes()[u].feature.get_compute_framework()
+            for u in split.right_uuids_any_distance - split.left_uuids
+        }
 
         # The order shows which items should be added first.
         # Thus, we need to make sure that higher ordered links are calculated first.
@@ -464,6 +802,19 @@ class ExecutionPlan:
         # if len(children_uuids) > 1:
         #    raise ValueError("This is not supported yet.")
 
+        # Hoisted above the case-override loop: a case helper's result is in declared left/right
+        # order, so orienting it needs swap_sides.
+        swap_sides = self.swap_merge_sides_by_declared_side(
+            destination_framework=destination_framework,
+            source_framework=source_framework,
+            trekker_left_framework=link_fw[1],
+            declared_left_frameworks=declared_left_frameworks,
+            declared_right_frameworks=declared_right_frameworks,
+            widened_right_frameworks=widened_right_frameworks,
+            fallback=swap_merge_sides,
+            jointype=link.jointype,
+        )
+
         # This part is for handling specific join cases. Currently, we only deal with equal feature groups.
         for children_uuid in children_uuids:
             children_fw = graph.get_nodes()[children_uuid].feature.get_compute_framework()
@@ -472,29 +823,166 @@ class ExecutionPlan:
             # result = True
             result = self.is_valid_join_step(link_fw, children_fw, children_uuid, graph)
             if result is False:
+                self.declined_orientations.append(attempted_key)
                 return None
             elif result is True:
                 pass
             else:
-                destination_framework_uuids, source_framework_uuids = result
+                # case_link_fw_is_equal_to_children_fw and case_link_equal_feature_groups both
+                # guarantee, by construction, that result[0] runs on link_fw[1] and result[1] runs
+                # on link_fw[2]; unlike the nearest-split-derived swap_sides, that framework
+                # identity cannot disagree with which side the case helper actually bound. Only
+                # fall back to swap_sides when the frameworks coincide and identity cannot decide.
+                # The destination side follows the same identity, so the record and the merge
+                # argument order agree with the parents actually bound.
+                if destination_framework != source_framework:
+                    if destination_framework == link_fw[1]:
+                        destination_framework_uuids, source_framework_uuids = result
+                        swap_sides = False
+                    else:
+                        source_framework_uuids, destination_framework_uuids = result
+                        swap_sides = True
+                elif swap_sides:
+                    source_framework_uuids, destination_framework_uuids = result
+                else:
+                    destination_framework_uuids, source_framework_uuids = result
 
+        join_step_required_uuids: set[UUID]
         if link.jointype in (JoinType.APPEND, JoinType.UNION):
-            js = self.create_joinstep_in_case_of_append_or_union(
-                link, link_fw, required_uuids, graph, pre_execution_plan
-            )
+            sides = self.resolve_append_or_union_sides(link, link_fw, required_uuids, graph, pre_execution_plan)
+            destination_framework = sides.destination_framework
+            source_framework = sides.source_framework
+            side = JoinSide.LEFT
+            destination_framework_uuids = {sides.left_uuid}
+            source_framework_uuids = {sides.right_uuid}
+            left_uuids = frozenset({sides.left_uuid})
+            right_uuids = frozenset({sides.right_uuid})
+            # Append/union gates only on its own two feature uuids, not on the general required_uuids.
+            join_step_required_uuids = {sides.left_uuid, sides.right_uuid}
+            join_uuids_left, join_uuids_right = left_uuids, right_uuids
         else:
-            js = JoinStep(
-                link,
-                destination_framework,
-                source_framework,
-                required_uuids,
-                destination_framework_uuids,
-                source_framework_uuids,
-            )
+            side = JoinSide.RIGHT if swap_sides else JoinSide.LEFT
+            destination = frozenset(destination_framework_uuids)
+            source = frozenset(source_framework_uuids)
+            resolved_left, resolved_right = (destination, source) if side is JoinSide.LEFT else (source, destination)
+            left_from_split = split.left_uuids & resolved_left
+            right_from_split = split.right_uuids & resolved_right
+            if (
+                split.left_uuids <= resolved_left
+                and split.right_uuids <= resolved_right
+                and split.left_uuids != split.right_uuids
+            ):
+                left_uuids, right_uuids = split.left_uuids, split.right_uuids
+            elif left_from_split and right_from_split and left_from_split != right_from_split:
+                # The full containment check failed (the declared side spans more than one framework), but
+                # intersecting the declared split with the framework-resolved buckets still recovers the
+                # declared-side members that fall in this step's own framework bucket, and drops any
+                # unrelated parent that only shares a framework with one side. A declared-side member
+                # sitting in the *other* bucket is not recovered here; it belongs to a different join
+                # step/framework hop and is dropped by design.
+                left_uuids, right_uuids = left_from_split, right_from_split
+            else:
+                # The step's own sets; a same-framework self link lands here too. Framework-broad, so
+                # join_uuids_left/right below narrow independently rather than reusing these.
+                left_uuids, right_uuids = resolved_left, resolved_right
+            join_step_required_uuids = required_uuids
+
+            # destination_uuids/source_uuids must only ever name genuine declared-side members, regardless
+            # of which branch above ran; any-distance widening keeps a nearer wrong-framework sibling from
+            # hiding a farther, correct one.
+            declared_side_uuids = split.left_uuids_any_distance | split.right_uuids_any_distance
+            join_uuids_left = resolved_left & declared_side_uuids
+            join_uuids_right = resolved_right & declared_side_uuids
+
+        destination_uuids, source_uuids = (
+            (join_uuids_right, join_uuids_left) if side is JoinSide.RIGHT else (join_uuids_left, join_uuids_right)
+        )
+        self._validate_join_step_uuids(link, set(destination_uuids), set(source_uuids))
+
+        record = ResolvedJoin(
+            link_uuid=link.uuid,
+            jointype=link.jointype,
+            left=build_resolved_join_side(
+                link.left_feature_group, link.left_index, left_uuids, self.declared_frameworks
+            ),
+            right=build_resolved_join_side(
+                link.right_feature_group, link.right_index, right_uuids, self.declared_frameworks
+            ),
+            destination_side=side,
+            destination_uuids=frozenset(destination_uuids),
+            source_uuids=frozenset(source_uuids),
+            destination_framework=destination_framework,
+            source_framework=source_framework,
+            consumers=frozenset(children_uuids),
+            depends_on=frozenset(),
+            token=uuid4(),
+        )
+        js = JoinStep(
+            link=link,
+            destination_framework=record.destination_framework,
+            source_framework=record.source_framework,
+            required_uuids=join_step_required_uuids,
+            destination_framework_uuids=set(record.destination_uuids),
+            source_framework_uuids=set(record.source_uuids),
+            swap_merge_sides=record.inverted,
+            token=record.token,
+        )
+        self.planned_records.append(record)
 
         # This makes sure that we do not write on the same datasets due to overlapping joins at once.
         self.joinstep_collection.add(js)
         return js
+
+    @staticmethod
+    def swap_merge_sides_by_declared_side(
+        destination_framework: type[ComputeFramework],
+        source_framework: type[ComputeFramework],
+        trekker_left_framework: type[ComputeFramework],
+        declared_left_frameworks: set[type[ComputeFramework]],
+        declared_right_frameworks: set[type[ComputeFramework]],
+        widened_right_frameworks: set[type[ComputeFramework]],
+        fallback: bool,
+        jointype: JoinType,
+    ) -> bool:
+        """The declared left group's data must stay the merge engine's left argument, wherever the join runs.
+
+        Declared-side membership decides first, whenever exactly one side names the destination framework.
+        For a key in declared order, `run_link` sets destination_framework to link_fw[2] for JoinType.RIGHT,
+        and link_fw[2] there is the declared right framework, so membership settles on right. For a key
+        reversed upstream by `LinkTrekker.invert_link`, link_fw[2] instead holds the declared left framework,
+        and membership settles on left just the same, before the jointype check below ever runs; that is why
+        the jointype check is ordered after the membership checks, not before it. See
+        `test_a_right_join_reached_through_a_reversed_key_keeps_the_declared_merge_sides` for that reversed
+        case. Only when membership is genuinely ambiguous (both sides silent, or both claiming the
+        destination framework, which happens when left and right share one framework) does a RIGHT join fall
+        through to jointype, which then always resolves to the declared right side. For other jointypes the
+        trekker key breaks the tie instead: destination is always one of the key's two framework positions.
+        ``trekker_left_framework`` is that key's first position (``link_fw[1]``): it is the destination
+        exactly when `run_link` kept the queued (non-flipped) orientation, and the source when it flipped.
+        It does not reliably mean "declared left", for the same reversed-key reason above. Links keyed on one
+        single framework make the tie-break tautological, so the trekker-flip fallback stays for that case:
+        it is a common path in practice, not a rare or unreachable one, hit by ordinary same-framework
+        INNER/LEFT/APPEND/UNION/ASOF joins and self-joins throughout the test suite. When destination and
+        source frameworks differ, a single-sided membership answer is trusted only after checking the other
+        side's full (any-distance) candidates for a competing claim on the destination framework."""
+        holds_left = destination_framework in declared_left_frameworks
+        holds_right = destination_framework in declared_right_frameworks
+
+        if jointype == JoinType.RIGHT and destination_framework != source_framework:
+            if holds_left and not holds_right and destination_framework in widened_right_frameworks:
+                # A farther, non-canonical right parent also sits on the destination framework, so the
+                # nearest-only split's silence on the right side is not real ambiguity-free evidence.
+                holds_right = True
+
+        if holds_left and not holds_right:
+            return False
+        if holds_right and not holds_left:
+            return True
+        if jointype == JoinType.RIGHT:
+            return True
+        if destination_framework != source_framework:
+            return destination_framework != trekker_left_framework
+        return fallback
 
     def find_fg_per_uuid(
         self, pre_execution_plan: list[LinkFrameworkTrekker | FeatureGroupStep], uuid: UUID
@@ -510,20 +998,33 @@ class ExecutionPlan:
                     return element.feature_group
         raise ValueError(f"Feature group for UUID {uuid} not found.")
 
-    def create_joinstep_in_case_of_append_or_union(
+    @staticmethod
+    def _append_or_union_orientation_error(
+        link: Link,
+        side: str,
+        queued_framework: type[ComputeFramework],
+        resolved_framework: type[ComputeFramework],
+    ) -> str:
+        return (
+            f"{link.jointype.value} link {link} cannot run: the {side} side was queued on "
+            f"{queued_framework.get_class_name()}, but the link's declared {side} index feature resolves to "
+            f"{resolved_framework.get_class_name()}.\n"
+            "One possible cause is that the link got scheduled in an inverted orientation; unlike INNER/LEFT/RIGHT "
+            "links, APPEND and UNION links do not support inversion.\n"
+            "Resolution: keep the link's declared left/right sides aligned with the compute frameworks its "
+            "features resolve to."
+        )
+
+    def resolve_append_or_union_sides(
         self,
         link: Link,
         link_fw: LinkFrameworkTrekker,
         required_uuids: set[UUID],
         graph: Graph,
         pre_execution_plan: list[LinkFrameworkTrekker | FeatureGroupStep],
-    ) -> JoinStep:
-        """
-        Create a JoinStep for APPEND or UNION operations in the framework execution plan.
-
-        This function identifies the left and right feature UUIDs required for a join operation,
-        validates the frameworks and indices, and constructs a JoinStep.
-        """
+    ) -> AppendOrUnionSides:
+        """Resolve the left/right feature uuids and frameworks for an APPEND or UNION link; neither
+        inverts, so the resolved sides stay in declared order."""
 
         # Unpack link-related data
         left_index, right_index = link.left_index, link.right_index
@@ -567,26 +1068,13 @@ class ExecutionPlan:
                 f"Are the indexes for the append or union set correctly? {left_index.index, right_index.index}"
             )
 
-        # Sanity check for framework consistency
         if link_fw[1] != destination_framework:
-            raise ValueError(
-                f"Destination framework does not match the left framework of the link. "
-                f"{destination_framework}. This is a sanity check!"
-            )
-        if link_fw[2] != source_framework:
-            raise ValueError(
-                f"Source framework does not match the right framework of the link. "
-                f"{source_framework}. This is a sanity check!"
-            )
+            raise ValueError(self._append_or_union_orientation_error(link, "left", link_fw[1], destination_framework))
 
-        return JoinStep(
-            link=link,
-            destination_framework=destination_framework,
-            source_framework=source_framework,
-            required_uuids={left_feature_uuid, right_feature_uuid},
-            destination_framework_uuids={left_feature_uuid},
-            source_framework_uuids={right_feature_uuid},
-        )
+        if link_fw[2] != source_framework:
+            raise ValueError(self._append_or_union_orientation_error(link, "right", link_fw[2], source_framework))
+
+        return AppendOrUnionSides(destination_framework, source_framework, left_feature_uuid, right_feature_uuid)
 
     def reduce_children_to_one_level(self, children_uuids: set[UUID], graph: Graph) -> set[UUID]:
         """
@@ -630,12 +1118,6 @@ class ExecutionPlan:
     def case_link_fw_is_equal_to_children_fw(
         self, link_fw: LinkFrameworkTrekker, children_uuid: UUID, graph: Graph
     ) -> bool | tuple[set[UUID], set[UUID]]:
-        # check that we only support non-right joins for equal/polymorphic feature groups
-        if link_fw[0].jointype == JoinType.RIGHT:
-            raise Exception(
-                f"Right joins are not supported for equal or polymorphic feature groups. link: {link_fw[0]}"
-            )
-
         # get feature which could be left
         parents = graph.parent_to_children_mapping[children_uuid]
         local_feature_set_collection = deepcopy(self.feature_set_collections)
@@ -716,6 +1198,12 @@ class ExecutionPlan:
                 ]
                 if len(filtered) == 1:
                     return filtered[0]
+
+        # check that we only support non-right joins for equal/polymorphic feature groups
+        if link_fw[0].jointype == JoinType.RIGHT:
+            raise Exception(
+                f"Right joins are not supported for equal or polymorphic feature groups. link: {link_fw[0]}"
+            )
 
         raise ValueError(
             "There are more than one solution for the join. "
@@ -849,12 +1337,17 @@ class ExecutionPlan:
             )
 
     def _matches_discriminator(self, discriminator: dict[str, Any], graph: Graph, uuid: UUID) -> bool:
-        """Check if a node's feature options match the discriminator key-value pairs."""
-        for k, v in graph.nodes[uuid].feature.options.items():
-            for dk, dv in discriminator.items():
-                if k == dk and v == dv:
-                    return True
-        return False
+        """Check that every discriminator key-value pair is present in a node's feature options.
+
+        A discriminator identifies one node among several same-class FeatureGroup instances, so a
+        partial overlap is not enough: two nodes that differ on the deciding key but share another
+        one would both match.
+        """
+        options = graph.nodes[uuid].feature.options
+        for dk, dv in discriminator.items():
+            if dk not in options or options.get(dk) != dv:
+                return False
+        return True
 
     def check_pointer(
         self, pointer_dict: dict[str, Any], link_fw: LinkFrameworkTrekker, graph: Graph, uuid: UUID
@@ -1020,29 +1513,77 @@ class ExecutionPlan:
         if len(self.global_filter.collection.keys()) == 0:
             return
 
-        relevant_filters: set[SingleFilter] = set()
+        feature_names = {feature.name for feature in feature_set.features}
+        probed_union = self._probed_filters_for_set(feature_group, feature_set)
 
+        # One representative per declared filter: enrichment variants of one declaration share
+        # its uuid; the resolved column name stays in the key because renames change the predicate.
+        representatives: dict[tuple[UUID, str], tuple[tuple[int, str, str], SingleFilter]] = {}
         for (
             filtered_feature_group,
             filtered_feature_name,
         ), single_filters in self.global_filter.collection.items():
-            # check for correct feature group
-            if filtered_feature_group == feature_group:
-                # check if filter feature is a feature of this feature set
-                for feature in feature_set.features:
-                    if feature.name == filtered_feature_name:
-                        if len(relevant_filters) == 0:
-                            relevant_filters = single_filters
-                        else:
-                            if relevant_filters != single_filters:
-                                raise ValueError(
-                                    f"""Feature group {feature_group} has different filters for different features {filtered_feature_name}.
-                                      This is currently not allowed. Please make sure that all features of the same feature group have the same filters.
-                                      If this has a business use case, where this does not make sense, please contact the developers.
-                                      """
-                                )
+            if filtered_feature_group != feature_group or filtered_feature_name not in feature_names:
+                continue
+            for single_filter in single_filters:
+                key = (single_filter.uuid, str(single_filter.filter_feature.name))
+                # A variant this run's features probed outranks stale ones a reused GlobalFilter kept.
+                rank = (0 if single_filter in probed_union else 1, *_filter_options_sort_key(single_filter))
+                current = representatives.get(key)
+                if current is None or rank < current[0]:
+                    representatives[key] = (rank, single_filter)
 
+        # Fresh set; the elements remain the collection's live objects.
+        relevant_filters = {single_filter for _, single_filter in representatives.values()}
+
+        self._warn_on_unmatched_features(feature_group, feature_set, relevant_filters)
         feature_set.add_filters(relevant_filters)
+
+    def _probed_filters_for_set(self, feature_group: type[FeatureGroup], feature_set: FeatureSet) -> set[SingleFilter]:
+        """Union of the filters this set's features probed; unprobed features contribute nothing."""
+        probed_union: set[SingleFilter] = set()
+        if self.global_filter is None:
+            return probed_union
+        for feature in feature_set.features:
+            probed = self.global_filter.probes.get((feature_group, feature.name, feature.uuid))
+            if probed is not None:
+                probed_union |= probed
+        return probed_union
+
+    def _warn_on_unmatched_features(
+        self, feature_group: type[FeatureGroup], feature_set: FeatureSet, relevant_filters: set[SingleFilter]
+    ) -> None:
+        """Warn about features that declined a filter their feature set gets anyway."""
+        if self.global_filter is None or not relevant_filters:
+            return
+
+        for feature in feature_set.features:
+            probed = self.global_filter.probes.get((feature_group, feature.name, feature.uuid))
+            # Filter and index features enter the collection without being probed.
+            if probed is None:
+                continue
+            # Diff by declared-filter identity so a match under another enrichment still counts.
+            probed_keys = {(f.uuid, str(f.filter_feature.name)) for f in probed}
+            unmatched = sorted(
+                {
+                    str(f.filter_feature.name)
+                    for f in relevant_filters
+                    if (f.uuid, str(f.filter_feature.name)) not in probed_keys
+                }
+            )
+            if not unmatched:
+                continue
+            key = (feature_group, str(feature.name), tuple(unmatched))
+            first = key not in self.reported_unmatched
+            self.reported_unmatched.add(key)
+            logger.log(
+                logging.WARNING if first else logging.DEBUG,
+                "The filter feature(s) %s were not matched for feature '%s' of %s, but the filter still applies "
+                "because the filter scope is the FeatureSet.",
+                ", ".join(f"'{name}'" for name in unmatched),
+                feature.name,
+                format_feature_group_class(feature_group),
+            )
 
     def get_parent_children_mapping(self, parent_to_children_mapping: dict[UUID, set[UUID]]) -> dict[UUID, set[UUID]]:
         inverted_dict: dict[UUID, set[UUID]] = {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 from mloda.core.abstract_plugins.components.data_types import DataType
@@ -9,7 +10,13 @@ if TYPE_CHECKING:
 
 from mloda.core.abstract_plugins.components.domain import Domain
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
-from mloda.core.abstract_plugins.components.hashable_dict import _make_hashable
+from mloda.core.abstract_plugins.components.hashable_dict import (
+    _CYCLE,
+    HashableDict,
+    _deep_equal,
+    _deep_hashable,
+    _reduce_dict_items,
+)
 from mloda.core.abstract_plugins.components.index.index import Index
 from mloda.core.abstract_plugins.components.link import Link
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
@@ -49,13 +56,14 @@ class Feature:
     Attributes:
         name (FeatureName): The name of the feature.
         options (Options): The options associated with the feature.
-        domain (Optional[Domain]): The domain of the feature.
+        domain (Optional[str | Domain]): The domain of the feature.
         compute_frameworks (Optional[Set[Type[ComputeFramework]]]): The compute frameworks supported by the feature.
         data_type (Optional[DataType]): The data type of the feature.
         initial_requested_data (bool): Whether the data was initially requested.
         link (Optional[Link]): The link associated with the feature.
         index (Optional[Index]): The index associated with the feature.
-        feature_group_scope (str | type[FeatureGroup] | None): Resolution-only scope; excluded from identity.
+        feature_group_scope (str | type[FeatureGroup] | None): Read by feature resolution and filter
+            matching; excluded from identity.
 
     Quick start (recommended progression)::
 
@@ -97,7 +105,7 @@ class Feature:
         self,
         name: str | FeatureName,
         options: Optional[dict[str, Any] | Options] = None,
-        domain: Optional[str] = None,
+        domain: Optional[str | Domain] = None,
         compute_framework: Optional[str] = None,
         data_type: Optional[DataType | str] = None,
         initial_requested_data: bool = False,
@@ -113,6 +121,10 @@ class Feature:
         self.name = FeatureName(name) if isinstance(name, str) else name
         self.options = Options(options) if isinstance(options, dict) else options
         self.domain = self._set_domain(domain, self.options.get("domain"))
+        if "domain" in self.options.group:
+            # Copy first: options may be a caller-owned Options instance, not a private dict.
+            self.options = copy(self.options)
+            self.options.group.pop("domain", None)
 
         cf = self._set_compute_framework(compute_framework, self.options.get("compute_framework"))
         self.compute_frameworks = {cf} if cf else None
@@ -140,7 +152,8 @@ class Feature:
         self.link = link
         self.index = index  # Index is a feature currently only used for append/union features.
 
-        # feature_group_scope is resolution-only metadata, excluded from equality and hash like link/index.
+        # feature_group_scope is read by feature resolution and by filter matching,
+        # excluded from equality and hash like link/index.
         self.feature_group_scope = self._set_feature_group_scope(feature_group)
 
         # Resolution-only metadata stamped by the engine: one (consumer class name, consumer
@@ -329,7 +342,8 @@ class Feature:
         return (
             self.name == other.name
             and self.options == other.options
-            and self.options.context == other.options.context
+            # __hash__ excludes context, so this probe meets cyclic contexts and needs the cycle-safe walk.
+            and _deep_equal(self.options.context, other.options.context)
             and self.domain == other.domain
             and self.compute_frameworks == other.compute_frameworks
             and self.data_type == other.data_type
@@ -351,6 +365,29 @@ class Feature:
                 self._child_options_key(),
             )
         )
+
+    def __copy__(self) -> Feature:
+        """A value-equal Feature owning the mutable containers __eq__/__hash__ read (#910).
+
+        options and child_options are rebuilt while every option VALUE stays shared by reference:
+        _deep_hashable falls back to repr() for an unhashable non-container leaf and the default repr
+        embeds the object address, so deep-copying a value would silently shift this Feature's hash and
+        break the very dedup the copy protects. Both containers are written in place by the engine
+        (intake forwarding, strict_type_enforcement, matcher writes), which is what the copy stops.
+
+        compute_frameworks is hashed too, so it is owned for the same reason. A shallow set() copy is
+        enough: its elements are classes, not option values with a repr/address hazard.
+        """
+        # One level: a Feature nested inside child_options.group keeps sharing its own options, the
+        # documented limitation class of _isolate_forwarded_value.
+        duplicate = self.__class__.__new__(self.__class__)
+        duplicate.__dict__.update(self.__dict__)
+        duplicate.options = copy(self.options)
+        if self.child_options is not None:
+            duplicate.child_options = copy(self.child_options)
+        if self.compute_frameworks is not None:
+            duplicate.compute_frameworks = set(self.compute_frameworks)
+        return duplicate
 
     def _child_options_key(self) -> Any:
         """Cycle-safe identity view of child_options for __eq__/__hash__ (#608).
@@ -383,15 +420,23 @@ class Feature:
             )
         if isinstance(value, Options):
             return ("options", Feature._reduce(value.group, seen))
+        if isinstance(value, HashableDict):
+            # _reduce's output is an equality key, so a node keeps its type tag here.
+            return ("hashable_dict", Feature._reduce(value.data, seen))
+        if isinstance(value, (dict, list, tuple, frozenset, set)):
+            # _reduce handles containers itself, so it needs the same cycle guard as _deep_hashable.
+            if id(value) in seen:
+                return _CYCLE
+            seen = seen | {id(value)}
         if isinstance(value, dict):
-            return tuple(
-                sorted(((key, Feature._reduce(val, seen)) for key, val in value.items()), key=lambda kv: kv[0])
-            )
+            items = [(key, Feature._reduce(val, seen)) for key, val in value.items()]
+            # Same canonical reduction as _deep_hashable uses.
+            return _reduce_dict_items(items)
         if isinstance(value, (frozenset, set)):
             return frozenset(Feature._reduce(item, seen) for item in value)
         if isinstance(value, (list, tuple)):
             return tuple(Feature._reduce(item, seen) for item in value)
-        return _make_hashable(value)
+        return _deep_hashable(value)
 
     def is_different_data_type(self, other: Feature) -> bool:
         return self.name == other.name and self.data_type != other.data_type
@@ -404,7 +449,7 @@ class Feature:
         relevant = {key: context[key] for key in split_keys if key in context}
         if not relevant:
             return ()
-        return _make_hashable(relevant)
+        return _deep_hashable(relevant)
 
     def _grouping_hash(self, split_keys: frozenset[str] | None, include_data_type: bool) -> int:
         keys = self.options.inherited_context_keys if split_keys is None else split_keys
@@ -439,11 +484,11 @@ class Feature:
         """
         return self._grouping_hash(split_keys, include_data_type=False)
 
-    def _set_domain(self, domain: Optional[str], domain_options: Optional[str]) -> None | Domain:
+    def _set_domain(self, domain: Optional[str | Domain], domain_options: Optional[str | Domain]) -> None | Domain:
         if domain:
-            return Domain(domain)
+            return domain if isinstance(domain, Domain) else Domain(domain)
         elif domain_options:
-            return Domain(domain_options)
+            return domain_options if isinstance(domain_options, Domain) else Domain(domain_options)
         return None
 
     def _set_compute_framework(
@@ -462,4 +507,4 @@ class Feature:
     def get_compute_framework(self) -> type[ComputeFramework]:
         FeatureValidator.validate_compute_frameworks_resolved(self.compute_frameworks, str(self.name))
         assert self.compute_frameworks is not None
-        return next(iter(self.compute_frameworks))
+        return ComputeFramework.select_deterministic(self.compute_frameworks)

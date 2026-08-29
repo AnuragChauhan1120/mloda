@@ -1,25 +1,14 @@
-"""Failing tests (TDD Red, issue #757) for resolve_feature routing its universe through PreFilterPlugins.
+"""resolve_feature routes its candidate universe through PreFilterPlugins (#757).
 
-Today ``resolve_feature`` hand-builds its candidate universe from every installed FeatureGroup and
-only applies the collector's applicability (enabled/disabled) filter. It never applies registry strict
-mode, never intersects a caller-supplied compute-framework set, and never labels the environment it
-resolved against. That diverges from what a real run's engine sees, which is built by
-``PreFilterPlugins`` in ``mloda/core/prepare/accessible_plugins.py`` (see ``Engine.__init__``).
+``PreFilterPlugins`` (``mloda/core/prepare/accessible_plugins.py``) is the same builder ``Engine.__init__``
+uses, so the debug API resolves against the universe a real run sees. What that routing pins:
 
-Target contract for the Green phase (these tests encode it and must FAIL today):
-
-  1. DoD-1: a new keyword-only ``compute_frameworks: Optional[set[type[ComputeFramework]]]`` parameter.
-     Restricting to a framework a matching group does not declare empties its available set, so the
-     group fails to resolve, mirroring how ``PreFilterPlugins`` intersects the caller's framework set.
-  2. DoD-2: passing a ``plugin_collector`` yields the same universe the engine builds via
-     ``PreFilterPlugins`` - including registry strict mode, which resolve_feature ignores today.
-  3. DoD-3: ``ResolvedFeature`` gains ``environment: str = "standalone-default"``, carried on every
-     result (success and error paths).
-  4. Never-raising is preserved under the new routing.
-
-Right-reason failures today: DoD-1 tests raise ``TypeError`` (no ``compute_frameworks`` parameter);
-DoD-2 asserts a strict-mode drop resolve_feature does not yet apply; DoD-3 and DoD-4 touch the
-not-yet-existing ``environment`` field (``AttributeError``).
+  1. A keyword-only ``compute_frameworks: Optional[set[type[ComputeFramework]]]`` parameter. Restricting to
+     a framework a matching group does not declare empties its available set, so the group fails to resolve,
+     mirroring how ``PreFilterPlugins`` intersects the caller's framework set.
+  2. A ``plugin_collector`` yields the same universe the engine builds, registry strict mode included.
+  3. Scoping the universe (strict mode, and equally a collector's enabled/disabled filter) drops a broken
+     plugin before its declaration is consulted, so it cannot abort the build for everyone (#790).
 """
 
 import gc
@@ -34,7 +23,6 @@ from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.api.plugin_docs import resolve_feature
-from mloda.core.api.plugin_info import ResolvedFeature
 from mloda.core.prepare.accessible_plugins import PreFilterPlugins
 from mloda.user import PluginCollector, PluginLoader
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
@@ -43,7 +31,6 @@ from mloda_plugins.compute_framework.base_implementations.python_dict.python_dic
 )
 
 
-PLAIN_FEATURE_757 = "PlainResolve757Feature"
 PYTHON_DICT_ONLY_FEATURE = "PythonDictOnlyResolve757Feature"
 STRICT_EXCLUDED_FEATURE = "StrictExcludedResolve757Feature"
 BROKEN_RULE_FEATURE_757 = "broken_rule_resolve_757_feature"
@@ -53,26 +40,6 @@ BROKEN_RULE_FEATURE_757 = "broken_rule_resolve_757_feature"
 def load_plugins() -> None:
     """Load all plugins before running tests in this module."""
     PluginLoader.all()
-
-
-class PlainResolve757FeatureGroup(FeatureGroup):
-    """A plain, unambiguously resolvable fixture matching its own feature name."""
-
-    @classmethod
-    def compute_framework_rule(cls) -> set[type[ComputeFramework]] | None:
-        return {PandasDataFrame, PythonDictFramework}
-
-    @classmethod
-    def match_feature_group_criteria(
-        cls,
-        feature_name: FeatureName | str,
-        options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ) -> bool:
-        return str(feature_name) == PLAIN_FEATURE_757
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
-        return None
 
 
 class PythonDictOnlyResolve757FeatureGroup(FeatureGroup):
@@ -211,47 +178,34 @@ class TestResolveFeatureCollectorUniverseParity:
         assert scoped.error is not None
 
 
-class TestResolvedFeatureEnvironmentLabel:
-    """DoD-3: ResolvedFeature gains environment: str = "standalone-default", carried on every result (#757)."""
+class TestScopingABrokenPluginOutOfTheUniverse:
+    """DoD-4: scoping the universe keeps a broken plugin from ever being consulted (#757, #790)."""
 
-    def test_dataclass_default_is_standalone_default(self) -> None:
-        """The 4-positional-arg constructor still works and defaults environment to the literal label."""
-        result = ResolvedFeature("n", None, [], None)
-        assert result.environment == "standalone-default"
+    def test_strict_collector_drops_broken_plugin_before_its_declaration_is_consulted(self) -> None:
+        """A broken plugin scoped out of the universe yields an ordinary no-match, not a build failure.
 
-    def test_resolving_result_carries_environment(self) -> None:
-        """A successful resolution reports the standalone-default environment."""
-        collector = PluginCollector.enabled_feature_groups({PlainResolve757FeatureGroup})
+        Environment building is fail-closed (#790): one plugin that raises while declaring its frameworks
+        aborts the build for every feature in the process. Scoping the universe is the escape hatch from
+        that blast radius. Strict mode drops the unregistered class in _set_feature_groups, BEFORE the
+        declaration loop consults it (a PluginCollector's enabled/disabled filter does the same), so the
+        build succeeds and the feature simply does not resolve.
 
-        result = resolve_feature(PLAIN_FEATURE_757, plugin_collector=collector)
-
-        assert result.feature_group is PlainResolve757FeatureGroup
-        assert result.environment == "standalone-default"
-
-    def test_no_match_error_result_carries_environment(self) -> None:
-        """A no-match / error result also reports the standalone-default environment."""
-        result = resolve_feature("CompletelyMissing757FeatureXYZ")
-
-        assert result.feature_group is None
-        assert result.error is not None
-        assert result.environment == "standalone-default"
-
-
-class TestResolveFeatureNeverRaisesUnderNewRouting:
-    """DoD-4: the never-raising contract survives a broken-plugin / strict scenario (#757)."""
-
-    def test_broken_rule_under_strict_collector_fails_closed_without_raising(self) -> None:
-        """A broken-rule group under a strict collector fails closed and is labelled, never raising."""
+        The absent attribution prefix is what makes this test non-vacuous: it is the only thing that tells
+        "scoped out, never consulted" apart from "consulted and aborted the build".
+        """
         broken_fg = _make_broken_rule_fg_757()
         try:
             collector = PluginCollector().set_strict_mode("strict")
 
             result = resolve_feature(BROKEN_RULE_FEATURE_757, plugin_collector=collector)
-
-            assert isinstance(result, ResolvedFeature)
-            assert result.feature_group is None
-            assert result.error is not None
-            assert result.environment == "standalone-default"
+            winner_name = result.feature_group.get_class_name() if result.feature_group is not None else None
+            error = result.error
+            del result
         finally:
             del broken_fg
             gc.collect()
+
+        assert winner_name is None
+        assert error is not None
+        assert f"No feature groups found for feature name: '{BROKEN_RULE_FEATURE_757}'" in error
+        assert "Failed to build the plugin environment" not in error

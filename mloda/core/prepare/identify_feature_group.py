@@ -1,13 +1,39 @@
 import inspect
-from dataclasses import dataclass, field
-from difflib import get_close_matches
-from typing import Iterable, Literal, Optional
+from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import replace
+from typing import Optional
 
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
+
+# Not a re-export facade: every import here is used by this module and ruff F401 fails any added just to re-export.
+from mloda.core.prepare.resolution_types import (
+    CandidateFrameworks,
+    Elimination,
+    EliminationStage,
+    EvaluationResult,
+    NAME_INDEPENDENT_STAGES,
+    PARTIAL_RECORDS_CAP,
+    RenderFacts,
+    ResolutionRecord,
+    rejection_elimination_stage,
+)
+from mloda.core.prepare.resolution_failure_renderer import (
+    render_resolution_failure,
+    _prefix_name,
+    _supported_feature_names,
+)
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
-from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import PropertyValueRejection
-from mloda.core.abstract_plugins.components.feature_name import FeatureName
-from mloda.core.abstract_plugins.components.options import NON_FORWARDED_KEYS, Options
+from mloda.core.abstract_plugins.components.domain import Domain
+from mloda.core.abstract_plugins.components.match_rejection import MatchRejection
+from mloda.core.abstract_plugins.components.match_hook import probe_match_criteria
+from mloda.core.abstract_plugins.components.utils import (
+    as_str,
+    contained_raise_log_level,
+    contained_raise_reason,
+    safe_exc_str,
+    safe_field,
+)
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.abstract_plugins.components.feature import Feature
@@ -18,51 +44,34 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class EvaluationResult:
-    """Non-raising result of matching a feature against accessible plugins."""
+class FeatureResolutionError(ValueError):
+    """Typed resolution failure carrying the feature name, the EvaluationResult of its single pass,
+    and the records resolved before the failure, capped at PARTIAL_RECORDS_CAP."""
 
-    identified: FeatureGroupEnvironmentMapping
-    criteria_matched: set[type[FeatureGroup]] = field(default_factory=set)
-    abstract_matched: set[type[FeatureGroup]] = field(default_factory=set)
+    def __init__(
+        self,
+        message: str,
+        feature_name: str,
+        result: EvaluationResult,
+        partial_records: Sequence[ResolutionRecord] = (),
+    ) -> None:
+        super().__init__(message)
+        self.feature_name = feature_name
+        self.result = result
+        # Cap then snapshot: slicing before deepcopy keeps the copied payload bounded on huge requests.
+        self.partial_records: tuple[ResolutionRecord, ...] = tuple(
+            deepcopy(record) for record in partial_records[-PARTIAL_RECORDS_CAP:]
+        )
 
-    @property
-    def failure_kind(self) -> Literal["multiple", "abstract_only", "none"] | None:
-        # "none" means no winner in the identified mapping, not that nothing matched: an all-rejected
-        # concrete group still yields "none" with a non-empty criteria_matched.
-        n = len(self.identified)
-        if n == 1:
-            return None
-        if n > 1:
-            return "multiple"
-        if self.abstract_matched:
-            return "abstract_only"
-        return "none"
+    def __reduce__(
+        self,
+    ) -> tuple[type["FeatureResolutionError"], tuple[str, str, EvaluationResult, tuple[ResolutionRecord, ...]]]:
+        # The default reduction reconstructs from args=(message,) and drops the extra constructor arguments.
+        return type(self), (str(self), self.feature_name, self.result, self.partial_records)
 
 
-def split_frameworks_by_capability(
-    feature_groups: Iterable[type[FeatureGroup]],
-    feature_name: FeatureName | str,
-    options: Options,
-) -> tuple[set[type[ComputeFramework]], set[type[ComputeFramework]]]:
-    """Split each feature group's available frameworks into (supported, rejected)
-    by the match-time capability hook.
-
-    For each feature group, considers the frameworks it declares via
-    compute_framework_definition() that are currently available
-    (ComputeFramework.is_available()), and partitions them by
-    supports_compute_framework(feature_name, options, cfw)."""
-    supported: set[type[ComputeFramework]] = set()
-    rejected: set[type[ComputeFramework]] = set()
-    for fg in feature_groups:
-        for cfw in fg.compute_framework_definition():
-            if not cfw.is_available():
-                continue
-            if fg.supports_compute_framework(feature_name, options, cfw):
-                supported.add(cfw)
-            else:
-                rejected.add(cfw)
-    return supported, rejected
+class ComputeFrameworkPinError(ValueError):
+    """User pinned more than one compute framework; validated before matching (#851)."""
 
 
 def matches_feature_group_scope(feature_group: type[FeatureGroup], scope: str | type[FeatureGroup]) -> bool:
@@ -75,7 +84,7 @@ def matches_feature_group_scope(feature_group: type[FeatureGroup], scope: str | 
     """
     if isinstance(scope, type):
         return issubclass(feature_group, scope)
-    # Name first: get_class_name() is @final and just returns __name__, while issubclass() on an ABCMeta
+    # Name first: __name__ is an attribute read no plugin can raise out of, while issubclass() on an ABCMeta
     # class is the expensive check, so the name gate keeps it off nearly every MRO entry.
     return any(
         ancestor.__name__ == scope and ancestor is not FeatureGroup and issubclass(ancestor, FeatureGroup)
@@ -83,32 +92,48 @@ def matches_feature_group_scope(feature_group: type[FeatureGroup], scope: str | 
     )
 
 
-def scope_callout(scope: str | type[FeatureGroup] | None) -> str | None:
-    """Render the shared scope callout, or None when the scope is unset."""
-    if scope is None:
-        return None
-    scope_name = scope.get_class_name() if isinstance(scope, type) else scope
-    return f"Scoped to feature group: '{scope_name}'."
+def validate_single_framework_pin(feature: Feature) -> None:
+    """Raise if the user pinned more than one compute framework; this misuse is only a programmer error."""
+    pinned = feature.compute_frameworks
+    if pinned is not None and len(pinned) > 1:
+        names = ", ".join(sorted(cfw.get_class_name() for cfw in pinned))
+        raise ComputeFrameworkPinError(
+            f"Feature '{feature.name}' is pinned to more than one compute framework ({names}); "
+            f"pin at most one compute framework."
+        )
 
 
 class IdentifyFeatureGroupClass:
     _criteria_matched_feature_groups: set[type[FeatureGroup]]
     _abstract_matched_feature_groups: set[type[FeatureGroup]]
+    _candidate_frameworks: dict[type[FeatureGroup], CandidateFrameworks]
+    _match_rejections: dict[type[FeatureGroup], MatchRejection]
+    _matcher_errors: dict[type[FeatureGroup], str]
+    _eliminations: dict[type[FeatureGroup], Elimination]
     _data_access_collection: Optional[DataAccessCollection]
+    # Per-evaluation memos of the hooks more than one reader wants. evaluate() builds a fresh instance, so
+    # they are scoped to one resolution attempt and never cache across runs.
+    _domain_outcomes: dict[type[FeatureGroup], tuple[Optional[Domain], Optional[Exception]]]
+    _links_outcomes: dict[type[FeatureGroup], tuple[Optional[bool], Optional[Exception]]]
+    _declared_frameworks: dict[type[FeatureGroup], frozenset[type[ComputeFramework]]]
+    _supported_names: dict[type[FeatureGroup], frozenset[str]]
+    _prefixes: dict[type[FeatureGroup], str]
 
-    def __init__(
-        self,
-        feature: Feature,
-        accessible_plugins: FeatureGroupEnvironmentMapping,
-        links: Optional[set[Link]],
-        data_access_collection: Optional[DataAccessCollection] = None,
-    ):
-        result = self.evaluate(feature, accessible_plugins, links, data_access_collection)
-        self._criteria_matched_feature_groups = result.criteria_matched
-        self._abstract_matched_feature_groups = result.abstract_matched
+    def __init__(self, data_access_collection: Optional[DataAccessCollection] = None) -> None:
+        self._criteria_matched_feature_groups = set()
+        self._abstract_matched_feature_groups = set()
+        self._candidate_frameworks = {}
+        # Reasons the first match pass recorded, keyed by candidate class.
+        self._match_rejections = {}
+        # Contained matcher raises as text, keyed by candidate class: never the exception object.
+        self._matcher_errors = {}
+        self._eliminations = {}
+        self._domain_outcomes = {}
+        self._links_outcomes = {}
+        self._declared_frameworks = {}
+        self._supported_names = {}
+        self._prefixes = {}
         self._data_access_collection = data_access_collection
-        self.validate(result.identified, feature, accessible_plugins)
-        self.feature_group_compute_framework_mapping = result.identified
 
     @classmethod
     def evaluate(
@@ -119,16 +144,289 @@ class IdentifyFeatureGroupClass:
         data_access_collection: Optional[DataAccessCollection] = None,
     ) -> EvaluationResult:
         """Run the matching/filter logic without raising, returning a structured result."""
-        self = cls.__new__(cls)
-        self._criteria_matched_feature_groups = set()
-        self._abstract_matched_feature_groups = set()
-        self._data_access_collection = data_access_collection
-        identified = self._filter_loop(feature, accessible_plugins, links, data_access_collection)
-        return EvaluationResult(
-            identified=identified,
-            criteria_matched=self._criteria_matched_feature_groups,
-            abstract_matched=self._abstract_matched_feature_groups,
+        # Pre-matching guard: a >1 pin fires regardless of whether any candidate matches (the old check
+        # sat inside the filter loop, so it never ran when the name matched nothing).
+        validate_single_framework_pin(feature)
+        self = cls(data_access_collection)
+        try:
+            identified = self._filter_loop(feature, accessible_plugins, links, data_access_collection)
+            result = EvaluationResult(
+                identified=identified,
+                criteria_matched=self._criteria_matched_feature_groups,
+                abstract_matched=self._abstract_matched_feature_groups,
+                candidate_frameworks=self._candidate_frameworks,
+                eliminations=self._eliminations,
+            )
+            if result.failure_kind is not None:
+                # Every elimination (value_rejection included) was already recorded during the single filter pass;
+                # this only captures the non-elimination facts the messages still need.
+                result = replace(result, facts=self._capture_render_facts(result, accessible_plugins, feature, links))
+        finally:
+            # A captured exception pins its traceback, whose frames pin this instance: a refcount cycle that would
+            # keep both alive until a gc pass. Dropping the outcomes makes each memo's lifetime what it claims,
+            # in a finally because a re-raising gate or an escalated match abort leaves without a return.
+            self._domain_outcomes.clear()
+            self._links_outcomes.clear()
+        return result
+
+    def _capture_render_facts(
+        self,
+        result: EvaluationResult,
+        accessible_plugins: FeatureGroupEnvironmentMapping,
+        feature: Feature,
+        links: Optional[set[Link]],
+    ) -> RenderFacts:
+        """Capture the non-elimination facts the messages still need. Only reached when the pass has no winner.
+
+        The renderer alone owns which message wins, so this does not mirror its branch order: the four cheap
+        facts are captured whatever the failure kind is. domains feeds the multiple message, concrete_frameworks
+        the abstract_only message, and known_names, eliminated_hints and dead_only_names the none message.
+        dead_only_names is the one exception, gated on its own kind: its sweep retests the links gate over every
+        accessible plugin, which on a linked run costs provider hooks per candidate for a fact only the none
+        message reads. Every provider hook here is best-effort: a raising one degrades its own fact, never this
+        call or a sibling's fact.
+        """
+        return RenderFacts(
+            domains=self._capture_domains(result),
+            concrete_frameworks=self._concrete_implementation_frameworks(result, accessible_plugins),
+            known_names=self._capture_known_names(accessible_plugins),
+            eliminated_hints=self._capture_eliminated_hints(result),
+            dead_only_names=(
+                self._capture_dead_only_names(result, accessible_plugins, feature, links)
+                if result.failure_kind == "none"
+                else frozenset()
+            ),
         )
+
+    def _capture_eliminated_hints(self, result: EvaluationResult) -> frozenset[str]:
+        """Class name and prefix of every eliminated near-miss, so the none message can suppress a
+        'Did you mean' suggestion that merely echoes a candidate its near-miss block already names."""
+        hints: set[str] = set()
+        for feature_group in result.eliminations:
+            # __name__, unlike the catalog: this suppresses what the near-miss block renders, which is __name__.
+            hints.add(feature_group.__name__)
+            prefix = self._prefix_of(feature_group)
+            if prefix:
+                hints.add(prefix)
+        return frozenset(hints)
+
+    def _domain_outcome(self, feature_group: type[FeatureGroup]) -> tuple[Optional[Domain], Optional[Exception]]:
+        """Memoized get_domain() OUTCOME, value or raise, so one candidate's hook runs once per evaluation.
+
+        The outcome rather than the value, because the two readers disagree on error semantics: the decision
+        filter re-raises, the render capture degrades. Caching successes only would re-call a raising hook.
+
+        Unlike safe_field, this retains the exception object, not str(exc): re-raising it needs the object.
+        That pins a traceback and its frames, so evaluate() clears this memo before returning rather than
+        leaving the cycle for the collector.
+        """
+        if feature_group not in self._domain_outcomes:
+            try:
+                self._domain_outcomes[feature_group] = (feature_group.get_domain(), None)
+            except Exception as exc:  # noqa: BLE001  (outcome capture; each reader decides how to react)
+                self._domain_outcomes[feature_group] = (None, exc)
+        return self._domain_outcomes[feature_group]
+
+    def _domain_name(self, feature_group: type[FeatureGroup]) -> str | None:
+        """Best-effort domain name. None when get_domain() raised or returned no Domain: renders without a suffix."""
+        field = f"{feature_group.__name__}.get_domain"
+        domain, error = self._domain_outcome(feature_group)
+        # error, not domain, is what tells a raise apart from a malformed return: both leave domain unusable.
+        if error is not None:
+            logger.warning("Degraded field '%s': %s", field, contained_raise_reason(error))
+            return None
+        if not isinstance(domain, Domain):
+            # Annotated to return a Domain; a provider that returns something else costs only its own suffix.
+            logger.warning("Degraded field '%s': expected Domain, got %s", field, type(domain).__name__)
+            return None
+        try:
+            return domain.name
+        except Exception as exc:  # noqa: BLE001  (plugin-owned property read; same contract as the two guards above)
+            logger.warning("Degraded field '%s': %s", field, contained_raise_reason(exc))
+            return None
+
+    def _declared_frameworks_of(self, feature_group: type[FeatureGroup]) -> frozenset[type[ComputeFramework]]:
+        """Memoized compute_framework_definition(), which drives compute_framework_rule(): once per candidate.
+
+        Best-effort, and both readers guard it identically, so the value alone is enough to cache.
+        """
+        if feature_group not in self._declared_frameworks:
+            self._declared_frameworks[feature_group] = safe_field(
+                lambda: frozenset(feature_group.compute_framework_definition()),
+                frozenset(),
+                field=f"{feature_group.__name__}.compute_framework_definition",
+            )
+        return self._declared_frameworks[feature_group]
+
+    def _declared_framework_names(self, feature_group: type[FeatureGroup]) -> set[str]:
+        """Best-effort names of every framework one candidate declares, available or not, as the message wants them.
+
+        Guards the projection, not just the declaration read: a declaration holding something that is not a
+        ComputeFramework costs the whole candidate its names, well-formed entries included, as before the memo.
+        """
+        return safe_field(
+            lambda: {as_str(cfw.get_class_name()) for cfw in self._declared_frameworks_of(feature_group)},
+            set(),
+            field=f"{feature_group.__name__}.compute_framework_definition",
+        )
+
+    def _capture_domains(self, result: EvaluationResult) -> dict[type[FeatureGroup], str]:
+        """Domain name of every identified candidate, skipping the ones whose get_domain() raised."""
+        domains: dict[type[FeatureGroup], str] = {}
+        for feature_group in result.identified:
+            domain = self._domain_name(feature_group)
+            if domain is not None:
+                domains[feature_group] = domain
+        return domains
+
+    def _concrete_implementation_frameworks(
+        self, result: EvaluationResult, accessible_plugins: FeatureGroupEnvironmentMapping
+    ) -> tuple[str, ...]:
+        """Frameworks declared by the accessible concrete subclasses of an abstract-matched base."""
+        frameworks: set[str] = set()
+        for candidate in accessible_plugins:
+            if inspect.isabstract(candidate):
+                continue
+            if not any(issubclass(candidate, abstract_fg) for abstract_fg in result.abstract_matched):
+                continue
+            frameworks.update(self._declared_framework_names(candidate))
+        return tuple(sorted(frameworks))
+
+    def _supported_names_of(self, feature_group: type[FeatureGroup]) -> frozenset[str]:
+        """Memoized feature_names_supported(): the name catalog and the dead-name capture share one call.
+
+        Degrades exactly as _supported_feature_names does: a raising hook costs that candidate its whole catalog.
+        """
+        if feature_group not in self._supported_names:
+            self._supported_names[feature_group] = frozenset(_supported_feature_names(feature_group))
+        return self._supported_names[feature_group]
+
+    def _prefix_of(self, feature_group: type[FeatureGroup]) -> str:
+        """Memoized prefix(), read by the name catalog and by the live side of the dead-name difference."""
+        if feature_group not in self._prefixes:
+            self._prefixes[feature_group] = _prefix_name(feature_group)
+        return self._prefixes[feature_group]
+
+    def _catalog_names_of(self, feature_group: type[FeatureGroup]) -> list[str]:
+        """One candidate's whole contribution to the name catalog, in capture order."""
+        # get_class_name(), because that is the name the default matcher accepts, so a renaming override stays
+        # reachable. Guarded, and falling back to __name__: a placeholder would seed a name no candidate carries.
+        names = [
+            safe_field(
+                lambda: as_str(feature_group.get_class_name()),
+                feature_group.__name__,
+                field=f"{feature_group.__name__}.get_class_name",
+            ),
+            *self._supported_names_of(feature_group),
+        ]
+        prefix = self._prefix_of(feature_group)
+        if prefix:
+            names.append(prefix)
+        return names
+
+    def _capture_known_names(self, accessible_plugins: FeatureGroupEnvironmentMapping) -> tuple[str, ...]:
+        known_names: list[str] = []
+        for fg_class in accessible_plugins:
+            known_names.extend(self._catalog_names_of(fg_class))
+        return tuple(known_names)
+
+    def _fails_name_blind_gate(
+        self, feature_group: type[FeatureGroup], feature: Feature, links: Optional[set[Link]]
+    ) -> bool:
+        """Capture-side retest of the three name-blind gates, scope then domain then links, that never raises.
+
+        Links last because it is the costliest: the only one of the three reading a provider hook that neither
+        the catalog nor a sibling fact already needs.
+        """
+        if not self._filter_feature_group_by_scope(feature_group, feature):
+            return True
+        if self._fails_domain_gate(feature_group, feature):
+            return True
+        if links is None:
+            # Without links the gate passes every candidate, so it decides nothing: returning before the memo
+            # is what keeps a link-free run from reading index_columns() at all.
+            return False
+        # The gate reads two hooks and the guard cannot tell which raised, so the report names the pair rather
+        # than the one it starts with. The fallback leaves the gate undecided: an unreadable index is not a lost
+        # gate, so the candidate stays live.
+        return not safe_field(
+            lambda: self._filter_feature_group_by_links(feature_group, links),
+            True,
+            field=f"{feature_group.__name__}.index_columns/supports_index",
+        )
+
+    def _fails_domain_gate(self, feature_group: type[FeatureGroup], feature: Feature) -> bool:
+        """Capture-side retest of the domain gate alone, which only fires for a domain-carrying request."""
+        if feature.domain is None:
+            return False
+        domain, error = self._domain_outcome(feature_group)
+        # _domain_name is what reports either degrade, and both readers share one memo, so reading through it
+        # keeps this at a single get_domain() call per candidate.
+        if self._domain_name(feature_group) is None:
+            # A raise leaves the gate undecided, so nothing is known and the candidate stays live. A malformed
+            # return is decided: the gate compares it and drops the candidate, for every name it declares.
+            # A raising Domain.name is also undecided: error is None yet domain is still a genuine Domain.
+            return error is None and not isinstance(domain, Domain)
+        # The gate's own comparison, never a name one: a Domain subclass with a custom __eq__ must not pass the
+        # gate and fail this retest.
+        return domain != feature.domain
+
+    def _is_dead(
+        self,
+        result: EvaluationResult,
+        feature_group: type[FeatureGroup],
+        compute_frameworks: set[type[ComputeFramework]],
+        feature: Feature,
+        links: Optional[set[Link]],
+    ) -> bool:
+        """No name at all can resolve to this candidate: it has no framework left, or it lost at a name-blind gate.
+
+        The framework set is tested before the elimination lookup because it kills the candidate without one:
+        a record only exists for the name that was asked about, while an empty set routes EVERY name to
+        frameworks_not_enabled.
+        """
+        if not compute_frameworks:
+            return True
+        # _filter_loop parks an abstract base in abstract_matched and never in the identified mapping, whatever
+        # name it is asked about.
+        if inspect.isabstract(feature_group):
+            return True
+        # A candidate that never matched the requested name carries no record at all, so the name-blind gates
+        # are retested directly here: scope, domain and links, the empty framework set above being the fourth.
+        if self._fails_name_blind_gate(feature_group, feature, links):
+            return True
+        elimination = result.eliminations.get(feature_group)
+        return elimination is not None and elimination.stage in NAME_INDEPENDENT_STAGES
+
+    def _capture_dead_only_names(
+        self,
+        result: EvaluationResult,
+        accessible_plugins: FeatureGroupEnvironmentMapping,
+        feature: Feature,
+        links: Optional[set[Link]],
+    ) -> frozenset[str]:
+        """Catalog names of dead candidates that no live candidate owns and no live candidate's prefix covers.
+
+        A difference, not a per-candidate drop: one accessible group that is still alive keeps its name
+        suggestible, whatever a dead sibling also declares. Prefixes because the default matcher owns names
+        by class-name prefix too, so a live group covers names it never declares. The matcher's data-access
+        branches stay out: deciding one needs the speculative second match the renderer's contract refuses.
+        """
+        dead: set[str] = set()
+        live: set[str] = set()
+        live_prefixes: set[str] = set()
+        for feature_group, compute_frameworks in accessible_plugins.items():
+            if self._is_dead(result, feature_group, compute_frameworks, feature, links):
+                # The whole catalog, as the live branch collects it: the default matcher owns a candidate's
+                # class name and its class-name prefix too, and a dead candidate resolves neither.
+                dead.update(self._catalog_names_of(feature_group))
+                continue
+            live.update(self._catalog_names_of(feature_group))
+            # Non-empty only: _prefix_name degrades a raising prefix() to "", which every name starts with.
+            prefix = self._prefix_of(feature_group)
+            if prefix:
+                live_prefixes.add(prefix)
+        return frozenset(name for name in dead - live if not any(name.startswith(prefix) for prefix in live_prefixes))
 
     def _filter_loop(
         self,
@@ -140,16 +438,36 @@ class IdentifyFeatureGroupClass:
         _identified_feature_groups: FeatureGroupEnvironmentMapping = {}
 
         for feature_group, compute_frameworks in accessible_plugins.items():
+            # A criteria non-match records a value_rejection only when the first pass recorded a reason for it:
+            # a plain name mismatch is not a near-miss, but a value the candidate declined (with a reportable
+            # reason) is. The criteria call above just recorded any rejection under this candidate's window, so
+            # this reads it back for a criteria-FAILING candidate only; a matched/winning/abstract candidate is
+            # never probed. Recorded regardless of domain/scope or of the overall outcome (a sibling may win).
             if not self._filter_feature_group_by_criteria(feature_group, feature, data_access_collection):
+                # A contained matcher raise is always a near-miss: the raise says nothing about name ownership.
+                # Deliberate precedence: a contained crash outranks a recorded decline for the same candidate.
+                matcher_error = self._matcher_errors.get(feature_group)
+                if matcher_error is not None:
+                    self._record_elimination(feature_group, "matcher_error", matcher_error)
+                    continue
+                rejection = self._value_rejection(feature_group)
+                if rejection is not None:
+                    # The shared mapper owns the projection, so both seams spell the taxonomy the same way.
+                    self._record_elimination(
+                        feature_group, rejection_elimination_stage(rejection.stage), rejection.reason
+                    )
                 continue
 
             if not self._filter_feature_group_by_domain(feature_group, feature):
+                self._record_elimination(feature_group, "domain", self._domain_reason(feature_group, feature))
                 continue
 
             if not self._filter_feature_group_by_scope(feature_group, feature):
+                self._record_elimination(feature_group, "scope", "outside the requested feature group scope")
                 continue
 
-            # Abstract bases can match name+domain+scope but cannot be instantiated; never let one win.
+            # Abstract bases can match name+domain+scope but cannot be instantiated; never let one win, and
+            # never record one as a near-miss: the abstract_only message owns them.
             if inspect.isabstract(feature_group):
                 self._abstract_matched_feature_groups.add(feature_group)
                 continue
@@ -162,19 +480,100 @@ class IdentifyFeatureGroupClass:
                 if feature_group.supports_compute_framework(feature.name, feature.options, cfw)
             }
 
+            # The split the capability hook just produced over this candidate's own accessible frameworks:
+            # keeping it costs no extra hook call. frozenset() first: callers may pass any iterable.
+            self._candidate_frameworks[feature_group] = CandidateFrameworks(
+                supported=frozenset(supported_frameworks),
+                rejected=frozenset(compute_frameworks) - frozenset(supported_frameworks),
+            )
+
+            # Decide the empty-supported case FIRST so a pin over an empty supported set reports the deeper
+            # capability / not-enabled reason rather than framework_pin. The identification decision (all three
+            # gates must hold) is order-independent, so this reordering only changes which reason is recorded.
+            if not supported_frameworks:
+                if compute_frameworks:
+                    rejected_names = sorted(cfw.get_class_name() for cfw in compute_frameworks)
+                    self._record_elimination(
+                        feature_group, "capability", f"supports_compute_framework rejected {rejected_names}"
+                    )
+                else:
+                    self._record_elimination(
+                        feature_group,
+                        "frameworks_not_enabled",
+                        "none of its compute frameworks are enabled for this run",
+                    )
+                continue
+
             if not self._filter_feature_group_by_framework(supported_frameworks, feature):
+                pin_name = feature.get_compute_framework().get_class_name()
+                supported_names = sorted(cfw.get_class_name() for cfw in supported_frameworks)
+                self._record_elimination(
+                    feature_group,
+                    "framework_pin",
+                    f"pinned compute framework '{pin_name}' is not among its supported {supported_names}",
+                )
                 continue
 
             if not self._filter_feature_group_by_links(feature_group, links):
+                self._record_elimination(feature_group, "links", "no index column matches the run's links")
                 continue
 
-            if supported_frameworks:
-                _identified_feature_groups[feature_group] = supported_frameworks
+            _identified_feature_groups[feature_group] = supported_frameworks
 
         _identified_feature_groups = self.filter_subclasses(_identified_feature_groups)
         return _identified_feature_groups
 
+    def _record_elimination(self, feature_group: type[FeatureGroup], stage: EliminationStage, reason: str) -> None:
+        """Record the first gate a non-winning name-matching candidate failed; one entry per candidate."""
+        self._eliminations.setdefault(feature_group, Elimination(stage=stage, reason=reason))
+
+    def _value_rejection(self, feature_group: type[FeatureGroup]) -> Optional[MatchRejection]:
+        """The MatchRejection the first match pass recorded for this candidate class, if any.
+
+        The candidate's criteria match records its own rejection under a per-candidate window; this
+        only reads that record back, so no rejection hook is ever reran on the failure path.
+        """
+        return self._match_rejections.get(feature_group)
+
+    def _domain_reason(self, feature_group: type[FeatureGroup], feature: Feature) -> str:
+        """Reason wording for a candidate dropped at the domain gate, which only fires for a domain-carrying request."""
+        assert feature.domain is not None  # the domain gate only drops a candidate when the request carries a domain
+        requested = feature.domain.name
+        candidate_domain = self._domain_name(feature_group)
+        if candidate_domain is None:
+            return f"does not declare the requested domain '{requested}'"
+        return f"declares domain '{candidate_domain}', but the run requested '{requested}'"
+
     def _filter_feature_group_by_links(self, feature_group: type[FeatureGroup], links: Optional[set[Link]]) -> bool:
+        """Decision-side links gate: unguarded, so a raising index hook still fails the engine loudly."""
+        supported, error = self._links_outcome(feature_group, links)
+        if error is not None:
+            raise error
+        # None is the memo's unreadable marker, never a verdict, so an outcome without an error always has one.
+        assert supported is not None
+        return supported
+
+    def _links_outcome(
+        self, feature_group: type[FeatureGroup], links: Optional[set[Link]]
+    ) -> tuple[Optional[bool], Optional[Exception]]:
+        """Memoized links-gate OUTCOME, verdict or raise, so one candidate's index hooks run once per evaluation.
+
+        The outcome rather than the verdict, for the reason _domain_outcome caches one: the decision filter
+        re-raises, the render capture degrades. The candidate alone keys it, because links is one value for the
+        whole evaluation. Retains the exception object, so evaluate() clears this memo as it clears that one.
+
+        The verdict is None, not False, when the gate raised: unreadable is not lost, and a reader that skipped
+        the error check would otherwise read a raise as a candidate that failed the gate.
+        """
+        if feature_group not in self._links_outcomes:
+            try:
+                self._links_outcomes[feature_group] = (self._links_gate(feature_group, links), None)
+            except Exception as exc:  # noqa: BLE001  (outcome capture; each reader decides how to react)
+                self._links_outcomes[feature_group] = (None, exc)
+        return self._links_outcomes[feature_group]
+
+    @staticmethod
+    def _links_gate(feature_group: type[FeatureGroup], links: Optional[set[Link]]) -> bool:
         # Case index columns not given, so no validation possible
         if feature_group.index_columns() is None:
             return True
@@ -199,18 +598,59 @@ class IdentifyFeatureGroupClass:
         feature: Feature,
         data_access_collection: Optional[DataAccessCollection],
     ) -> bool:
-        """A rejected option value is a non-match, whoever calls the parser: a candidate that overrides the match
-        hook and calls FeatureChainParser directly must not take the whole filter loop down. Only the rejection is
-        caught, so a plain ValueError (the forwarded-name-mismatch guidance) still reaches the user.
+        """A raise out of the match hook is a non-match for that candidate only, not a run-wide abort (#845).
+
+        The shared probe owns the per-candidate window and the containment; this seam keeps only its own
+        policy: the option rollback on a contained raise and the per-candidate recording, never as an
+        exception object whose traceback would pin the plugin class.
+
+        Mark-or-contain policy: see call_match_hook.
         """
-        try:
-            return feature_group.match_feature_group_criteria(feature.name, feature.options, data_access_collection)
-        except PropertyValueRejection as exc:
-            logger.debug("%s rejected an option value while matching '%s': %s", feature_group, feature.name, exc)
-            return False
+        # Shallow copies, taken per candidate so an earlier match's write survives a later candidate's raise.
+        group_before = dict(feature.options.group)
+        context_before = dict(feature.options.context)
+        probe = probe_match_criteria(feature_group, feature.name, feature.options, data_access_collection)
+        if probe.matcher_error is not None or probe.value_rejection is not None:
+            # Only the contained branch rolls back: a matcher that returns True keeps its write,
+            # which is how a matched reader is linked through mloda.
+            feature.options.group.clear()
+            feature.options.group.update(group_before)
+            feature.options.context.clear()
+            feature.options.context.update(context_before)
+        if probe.value_rejection is not None:
+            exc = probe.value_rejection
+            # Text, not exc: a retained record must not pin the traceback, its frames and the plugin class.
+            logger.debug(
+                "%s rejected an option value while matching '%s': %s",
+                # A plugin-owned read past the hook call's containment, so it degrades instead of escaping the seam.
+                safe_field(lambda: feature_group.get_class_name(), "<unnamed feature group>"),
+                feature.name,
+                safe_exc_str(exc),
+            )
+        elif probe.matcher_error is not None:
+            reason = contained_raise_reason(probe.matcher_error)
+            logger.log(
+                contained_raise_log_level(probe.matcher_error),
+                "%s %s while matching '%s'; treating it as a non-match.",
+                safe_field(lambda: feature_group.get_class_name(), "<unnamed feature group>"),
+                reason,
+                feature.name,
+            )
+            self._matcher_errors[feature_group] = reason
+        if not probe.matched and probe.rejection is not None:
+            # Everything recorded during this candidate's window belongs to this candidate, whatever
+            # owner name an inner delegation stamped.
+            self._match_rejections[feature_group] = probe.rejection
+        return probe.matched
 
     def _filter_feature_group_by_domain(self, feature_group: type[FeatureGroup], feature: Feature) -> bool:
-        return not feature.domain or feature_group.get_domain() == feature.domain
+        """Decision-side domain gate: unguarded, so a raising get_domain() or Domain.name fails the engine loudly."""
+        if not feature.domain:
+            return True
+        domain, error = self._domain_outcome(feature_group)
+        if error is not None:
+            raise error
+        return domain == feature.domain
 
     def _filter_feature_group_by_scope(self, feature_group: type[FeatureGroup], feature: Feature) -> bool:
         scope = feature.feature_group_scope
@@ -221,220 +661,11 @@ class IdentifyFeatureGroupClass:
         compute_frameworks: set[type[ComputeFramework]],
         feature: Feature,
     ) -> bool:
+        # Cardinality (<=1) is validated up front in evaluate(), so no >1 pin reaches here.
         if feature.compute_frameworks is None:
             return True
 
-        if len(feature.compute_frameworks) > 1:
-            raise ValueError(f"Feature should only have one compute framework when set by user {feature.name}.")
-
         return feature.get_compute_framework() in compute_frameworks
-
-    def validate(
-        self,
-        feature_group: FeatureGroupEnvironmentMapping,
-        feature: Feature,
-        accessible_plugins: FeatureGroupEnvironmentMapping,
-    ) -> None:
-        if not feature_group or len(feature_group) == 0:
-            raise ValueError(self._build_no_feature_group_error(feature, accessible_plugins))
-        if len(feature_group) > 1:
-            from mloda.core.abstract_plugins.feature_group import format_feature_group_classes
-
-            callout = scope_callout(feature.feature_group_scope)
-            scope_line = f"{callout}\n" if callout else ""
-
-            raise ValueError(
-                f"Multiple feature groups found for feature '{feature.name}':\n"
-                f"{format_feature_group_classes(feature_group.keys(), include_domain=True)}\n"
-                f"{scope_line}"
-                "For troubleshooting guide, see: https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/"
-            )
-
-    def _capability_rejection_message(self, feature: Feature) -> Optional[str]:
-        supported, rejected = split_frameworks_by_capability(
-            self._criteria_matched_feature_groups, feature.name, feature.options
-        )
-
-        if not rejected:
-            return None
-
-        rejected_names = sorted(fw.get_class_name() for fw in rejected)
-        msg = f"Unsupported compute framework(s) for feature '{str(feature.name)}': {rejected_names}."
-
-        if supported:
-            supported_names = sorted(fw.get_class_name() for fw in supported)
-            msg += f" Supported on: {supported_names}."
-
-        msg += " Pin the feature to a supported compute framework or override supports_compute_framework."
-        return msg
-
-    def _value_rejection_reason(self, feature_group: type[FeatureGroup], feature: Feature) -> Optional[str]:
-        """The candidate's own message for rejecting an option VALUE, if it has one."""
-        rejection_check = getattr(feature_group, "_strict_validation_rejection_reason", None)
-        if rejection_check is None:
-            return None
-        reason: Optional[str] = rejection_check(feature.name, feature.options)
-        return reason
-
-    def _input_feature_forwarding_hint(
-        self, feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping
-    ) -> Optional[str]:
-        reserved = NON_FORWARDED_KEYS
-        offending = sorted(str(k) for k in feature.options.group if k not in reserved)
-        if not offending:
-            return None
-
-        # Did any offending key arrive BY forwarding, rather than being set on this feature directly?
-        forwarded_offenders = [key for key in offending if key in feature.options.inherited_group_keys]
-
-        bare = Options(
-            context=dict(feature.options.context),
-            propagate_context_keys=feature.options.propagate_context_keys,
-        )
-
-        culprits: list[type[FeatureGroup]] = []
-        for feature_group in accessible_plugins:
-            if not self._filter_feature_group_by_domain(feature_group, feature):
-                continue
-            if not self._filter_feature_group_by_scope(feature_group, feature):
-                continue
-            # A rejected VALUE the caller set HERE is not a forwarding problem: carving the key out
-            # would not fix the value, and the value-rejection hint already says what is wrong. A
-            # value that arrived by forwarding is both, and carving the key out is exactly the fix,
-            # so that candidate still earns the hint.
-            if self._value_rejection_reason(feature_group, feature) is not None and not forwarded_offenders:
-                continue
-            accepts_bare = feature_group.match_feature_group_criteria(feature.name, bare, self._data_access_collection)
-            rejects_actual = not feature_group.match_feature_group_criteria(
-                feature.name, feature.options, self._data_access_collection
-            )
-            if accepts_bare and rejects_actual:
-                culprits.append(feature_group)
-
-        if not culprits:
-            return None
-
-        names = sorted(fg.get_class_name() for fg in culprits)
-        return (
-            f"Feature group(s) {names} match the name '{str(feature.name)}' but reject it because of "
-            f"extra group option(s) {offending}. Group options flow onto input features from the consumer "
-            f"by default; these keys either flowed in that way or were set directly on this feature. "
-            f"Keep them off '{str(feature.name)}' by setting forward_group_exclude={{...}}, an allowlist, "
-            f"or forward_group=False on the child in the consumer's input_features."
-        )
-
-    def _strict_validation_rejection_hint(
-        self, feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping
-    ) -> Optional[str]:
-        reasons: list[tuple[str, str]] = []
-        for feature_group in accessible_plugins:
-            if not self._filter_feature_group_by_domain(feature_group, feature):
-                continue
-            if not self._filter_feature_group_by_scope(feature_group, feature):
-                continue
-
-            reason = self._value_rejection_reason(feature_group, feature)
-            if reason is not None:
-                reasons.append((feature_group.get_class_name(), reason))
-
-        if not reasons:
-            return None
-
-        lines = "\n".join(f"  - {class_name}: {reason}" for class_name, reason in sorted(reasons))
-        return f"Feature group(s) rejected an option value while matching '{str(feature.name)}':\n{lines}"
-
-    def _abstract_only_message(
-        self, feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping
-    ) -> Optional[str]:
-        """Message for the case where the only name matches were abstract bases.
-
-        Names the compute frameworks that the concrete (non-abstract) subclasses of
-        those abstract bases declare, since those are what a user must enable.
-        """
-        if not self._abstract_matched_feature_groups:
-            return None
-
-        frameworks: set[str] = set()
-        for candidate in accessible_plugins:
-            if inspect.isabstract(candidate):
-                continue
-            if not any(issubclass(candidate, abstract_fg) for abstract_fg in self._abstract_matched_feature_groups):
-                continue
-            for cfw in candidate.compute_framework_definition():
-                frameworks.add(cfw.get_class_name())
-
-        feature_name = str(feature.name)
-        if not frameworks:
-            return (
-                f"No feature groups found for feature name: '{feature_name}'. "
-                f"Only abstract feature group base(s) matched, which cannot be instantiated; "
-                f"no concrete implementation is available or enabled."
-            )
-
-        framework_names = sorted(frameworks)
-        return (
-            f"No feature groups found for feature name: '{feature_name}'. "
-            f"Its concrete implementations require compute framework(s) {framework_names}, "
-            f"none of which are available or enabled for this run."
-        )
-
-    def _build_no_feature_group_error(
-        self, feature: Feature, accessible_plugins: FeatureGroupEnvironmentMapping
-    ) -> str:
-        callout = scope_callout(feature.feature_group_scope)
-
-        # Capability rejections are concrete and specific; prefer them over the abstract-only fallback.
-        capability_message = self._capability_rejection_message(feature)
-        if capability_message is not None:
-            if callout:
-                return f"{capability_message} {callout}"
-            return capability_message
-
-        abstract_only_message = self._abstract_only_message(feature, accessible_plugins)
-        if abstract_only_message is not None:
-            if callout:
-                return f"{abstract_only_message} {callout}"
-            return abstract_only_message
-
-        feature_name = str(feature.name)
-        msg = f"No feature groups found for feature name: '{feature_name}'."
-
-        if callout:
-            msg += f" {callout}"
-
-        if not accessible_plugins:
-            msg += "\nNo plugins are loaded. Did you call PluginLoader.all()?"
-            return msg
-
-        forwarding_hint = self._input_feature_forwarding_hint(feature, accessible_plugins)
-        if forwarding_hint is not None:
-            msg += f"\n{forwarding_hint}"
-
-        strict_validation_hint = self._strict_validation_rejection_hint(feature, accessible_plugins)
-        if strict_validation_hint is not None:
-            msg += f"\n{strict_validation_hint}"
-
-        known_names: list[str] = []
-        for fg_class in accessible_plugins:
-            known_names.append(fg_class.get_class_name())
-            known_names.extend(fg_class.feature_names_supported())
-            if fg_class.prefix():
-                known_names.append(fg_class.prefix())
-
-        similar = get_close_matches(feature_name, known_names, n=5, cutoff=0.5)
-        if similar:
-            msg += f"\nDid you mean one of: {similar}?"
-
-        pointer_args = "name, options=..., feature_group=..." if callout else "name, options=..."
-        msg += (
-            f"\nUse resolve_feature({pointer_args}) to debug feature resolution."
-            "\nFor troubleshooting guide, see: "
-            "https://mloda-ai.github.io/mloda/in_depth/troubleshooting/feature-group-resolution-errors/"
-        )
-        return msg
-
-    def get(self) -> tuple[type[FeatureGroup], set[type[ComputeFramework]]]:
-        return next(iter(self.feature_group_compute_framework_mapping.items()))
 
     def filter_subclasses(
         self, _identified_feature_groups: FeatureGroupEnvironmentMapping
@@ -459,3 +690,30 @@ class IdentifyFeatureGroupClass:
             _identified_feature_groups.pop(fg)
 
         return _identified_feature_groups
+
+
+def evaluate_and_render(
+    feature: Feature,
+    accessible_plugins: FeatureGroupEnvironmentMapping,
+    links: Optional[set[Link]] = None,
+    data_access_collection: Optional[DataAccessCollection] = None,
+) -> tuple[EvaluationResult, str | None]:
+    """One resolution pass plus its failure message; the message is None iff the feature resolved."""
+    # Unguarded: ComputeFrameworkPinError is a misuse validated before matching, so it escapes unconverted.
+    result = IdentifyFeatureGroupClass.evaluate(feature, accessible_plugins, links, data_access_collection)
+    return result, render_resolution_failure(result, feature)
+
+
+def resolve_or_raise(
+    feature: Feature,
+    accessible_plugins: FeatureGroupEnvironmentMapping,
+    links: Optional[set[Link]] = None,
+    data_access_collection: Optional[DataAccessCollection] = None,
+    partial_records: Sequence[ResolutionRecord] = (),
+) -> EvaluationResult:
+    """Evaluate one feature and raise the typed FeatureResolutionError on failure."""
+    result, message = evaluate_and_render(feature, accessible_plugins, links, data_access_collection)
+    if message is not None:
+        # The constructor does the cap-then-deepcopy snapshot, so the records are forwarded as they are.
+        raise FeatureResolutionError(message, str(feature.name), result, partial_records=partial_records)
+    return result

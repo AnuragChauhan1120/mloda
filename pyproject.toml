@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mloda"
-version = "0.10.0"
+version = "0.11.1"
 description = "mloda.ai: Open Data Access for ML and AI"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
@@ -152,6 +152,7 @@ module = [
     "pyarrow.csv",
     "pyarrow.feather",
     "pyarrow.flight",
+    "pyarrow.ipc",
     "pyarrow.json",
     "pyarrow.orc",
     "pyarrow.parquet",
@@ -185,4 +186,10 @@ constraint-dependencies = [
     "mistune>=3.3.0",
     "soupsieve>=2.8.4",
     "nbconvert>=7.17.1",
+]
+# Overrides, not constraints: marimo pins `pymdown-extensions<11`, and the fix for the
+# b64 path-traversal advisory only ships in 11.0. A constraint cannot beat that upper
+# pin, so the pin is overridden here. Drop this once marimo allows 11.x.
+override-dependencies = [
+    "pymdown-extensions>=11.0.1",
 ]

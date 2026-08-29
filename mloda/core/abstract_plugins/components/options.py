@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any, Optional, TYPE_CHECKING, cast
 from copy import deepcopy
 
-from mloda.core.abstract_plugins.components.hashable_dict import _make_hashable
+from mloda.core.abstract_plugins.components.hashable_dict import _deep_equal, _deep_hashable, register_deep_node
 from mloda.core.abstract_plugins.components.validators.options_validator import OptionsValidator
 from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
 
@@ -13,7 +14,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-NON_FORWARDED_KEYS: frozenset[str] = frozenset({DefaultOptionKeys.in_features})
+NON_FORWARDED_KEYS: frozenset[str] = frozenset({DefaultOptionKeys.in_features.value})
+
+
+def is_non_forwarded_key(key: Any) -> bool:
+    """Match a never-forwarded key in either its string or its DefaultOptionKeys form."""
+    return str(key) in NON_FORWARDED_KEYS
 
 
 def _safe_deepcopy(value: Any, memo: dict[int, Any]) -> Any:
@@ -27,12 +33,13 @@ def _safe_deepcopy(value: Any, memo: dict[int, Any]) -> Any:
         return value
 
 
-def _isolate_forwarded_value(value: Any, memo: dict[int, Any]) -> Any:
-    """Copy the mutable-container spine so nested-container mutation cannot leak back to the
+def _isolate_forwarded_value(value: Any, memo: dict[int, Any], leaf: Callable[[Any], Any] | None = None) -> Any:
+    """Copy the container spine so nested-container mutation cannot leak back to the
     consumer, while sharing every non-container leaf (validators, models, handles, unpicklable
     objects) by reference to preserve the identity the framework relies on for dedup, hashing,
-    and conflict detection. Custom container types (anything other than dict/list/set/tuple) are
-    shared by reference (documented limitation)."""
+    and conflict detection; a given ``leaf`` replaces that sharing with its own result. Custom
+    container types (anything other than dict/list/set/tuple/frozenset) are shared by reference
+    (documented limitation)."""
     vid = id(value)
     if vid in memo:
         return memo[vid]
@@ -40,23 +47,27 @@ def _isolate_forwarded_value(value: Any, memo: dict[int, Any]) -> Any:
         result: dict[Any, Any] = {}
         memo[vid] = result
         for k, v in value.items():
-            result[k] = _isolate_forwarded_value(v, memo)
+            result[k] = _isolate_forwarded_value(v, memo, leaf)
         return result
     if isinstance(value, list):
         result_list: list[Any] = []
         memo[vid] = result_list
         for v in value:
-            result_list.append(_isolate_forwarded_value(v, memo))
+            result_list.append(_isolate_forwarded_value(v, memo, leaf))
         return result_list
     if isinstance(value, set):
-        result_set = {_isolate_forwarded_value(v, memo) for v in value}
+        result_set = {_isolate_forwarded_value(v, memo, leaf) for v in value}
         memo[vid] = result_set
         return result_set
+    if isinstance(value, frozenset):
+        result_frozenset = frozenset(_isolate_forwarded_value(v, memo, leaf) for v in value)
+        memo[vid] = result_frozenset
+        return result_frozenset
     if isinstance(value, tuple):
-        result_tuple = tuple(_isolate_forwarded_value(v, memo) for v in value)
+        result_tuple = tuple(_isolate_forwarded_value(v, memo, leaf) for v in value)
         memo[vid] = result_tuple
         return result_tuple
-    return value
+    return value if leaf is None else leaf(value)
 
 
 def _normalize_reader_class_keys(d: dict[str, Any]) -> dict[str, Any]:
@@ -151,15 +162,6 @@ class Options:
         OptionsValidator.validate_no_duplicate_keys(self.group, self.context)
         OptionsValidator.validate_propagate_keys_in_context(self.propagate_context_keys, self.context)
 
-    def add(self, key: str, value: Any) -> None:
-        """
-        Legacy method for backward compatibility.
-        Adds to group to maintain existing behavior during migration.
-
-        Possibility that we keep this as default method for adding options in the future.
-        """
-        self.add_to_group(key, value)
-
     def add_to_group(self, key: str, value: Any) -> None:
         """Add parameter to group (affects Feature Group resolution/splitting)."""
         OptionsValidator.validate_can_add_to_group(key, value, self.group, self.context)
@@ -175,7 +177,7 @@ class Options:
         Hash based only on group parameters.
         Context parameters don't affect Feature Group resolution/splitting.
         """
-        return hash(_make_hashable(self.group))
+        return hash(_deep_hashable(self.group))
 
     def __eq__(self, other: object) -> bool:
         """
@@ -184,7 +186,7 @@ class Options:
         """
         if not isinstance(other, Options):
             return False
-        return self.group == other.group
+        return _deep_equal(self.group, other.group)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a value, searching group then context; return ``default`` only when the key is absent from both.
@@ -249,6 +251,10 @@ class Options:
         val = self.get(DefaultOptionKeys.in_features)
 
         if not val:
+            if DefaultOptionKeys.in_features in self:
+                raise ValueError(
+                    f"The key '{DefaultOptionKeys.in_features}' is set to {val!r}, which resolves to no input features."
+                )
             raise ValueError(
                 f"Input features not found in options. Please ensure that the key '{DefaultOptionKeys.in_features}' is set."
             )
@@ -278,22 +284,31 @@ class Options:
             return frozenset([_convert_to_feature(val)])
         else:
             raise TypeError(
-                f"Unsupported type for source feature: {type(val)}. "
+                f"Unsupported source feature {val!r} of type {type(val).__name__}. "
                 "Expected list, tuple, set, frozenset, str, or Feature object."
             )
+
+    def _rebuild(self, group: dict[str, Any], context: dict[str, Any]) -> "Options":
+        """A new Options over the given dicts, carrying this one's provenance bookkeeping over."""
+        copied = Options(group=group, context=context, propagate_context_keys=self.propagate_context_keys)
+        copied.inherited_group_keys = self.inherited_group_keys
+        copied.inherited_context_keys = self.inherited_context_keys
+        copied.last_forwarded_group_keys = self.last_forwarded_group_keys
+        return copied
+
+    def __copy__(self) -> "Options":
+        """A new Options owning its group/context dicts while sharing every value by reference.
+
+        Container ownership without __deepcopy__'s copy requirement on the values themselves.
+        """
+        return self._rebuild(dict(self.group), dict(self.context))
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "Options":
         def safe_deepcopy_dict(d: dict[str, Any]) -> dict[str, Any]:
             """Safely deepcopy a dictionary, falling back to shallow copy for unpickleable objects."""
             return {key: _safe_deepcopy(value, memo) for key, value in d.items()}
 
-        copied_group = safe_deepcopy_dict(self.group)
-        copied_context = safe_deepcopy_dict(self.context)
-        copied = Options(group=copied_group, context=copied_context, propagate_context_keys=self.propagate_context_keys)
-        copied.inherited_group_keys = self.inherited_group_keys
-        copied.inherited_context_keys = self.inherited_context_keys
-        copied.last_forwarded_group_keys = self.last_forwarded_group_keys
-        return copied
+        return self._rebuild(safe_deepcopy_dict(self.group), safe_deepcopy_dict(self.context))
 
     def __str__(self) -> str:
         parts = f"Options(group={self.group}, context={self.context}"
@@ -334,8 +349,8 @@ class Options:
         Every key actually forwarded (including keys self already held with an equal value) is
         unioned into self.inherited_group_keys, so provenance accumulates across consumers.
 
-        Forwarded values are isolated by a container-spine copy as they are stored: the mutable
-        container spine (dict/list/set/tuple) is copied recursively so nested mutation on the child
+        Forwarded values are isolated by a container-spine copy as they are stored: the
+        container spine (dict/list/set/tuple/frozenset) is copied recursively so nested mutation on the child
         never leaks back to the consumer or to a sibling input feature, while every non-container
         leaf (validators, models, handles, unpicklable values) is shared by reference to preserve
         the identity the framework relies on for dedup, hashing, and conflict detection. Custom
@@ -363,7 +378,6 @@ class Options:
 
         memo: dict[int, Any] = {}
 
-        excluded = NON_FORWARDED_KEYS
         validate_forwarding_directives(forward_group, forward_group_exclude)
 
         if forward_group is False:
@@ -382,7 +396,7 @@ class Options:
 
         inherited: set[str] = set()
         for key in sorted(group_keys):
-            if key in excluded or key not in consumer.group:
+            if is_non_forwarded_key(key) or key not in consumer.group:
                 continue
             if key in new_context and new_context[key] != consumer.group[key]:
                 owner_clause = f" on input feature '{owner}'" if owner is not None else " on the input feature"
@@ -407,7 +421,7 @@ class Options:
 
         inherited_context: set[str] = set()
         for key in inherit_context_keys:
-            if key in excluded or key not in consumer.context:
+            if is_non_forwarded_key(key) or key not in consumer.context:
                 continue
             value = _isolate_forwarded_value(consumer.context[key], memo)
             OptionsValidator.validate_can_add_to_context(key, value, new_group, new_context)
@@ -416,7 +430,9 @@ class Options:
 
         if consumer.propagate_context_keys and forward_group is not False:
             propagating = {
-                k: v for k, v in consumer.context.items() if k in consumer.propagate_context_keys and k not in excluded
+                k: v
+                for k, v in consumer.context.items()
+                if k in consumer.propagate_context_keys and not is_non_forwarded_key(k)
             }
 
             OptionsValidator.validate_no_context_group_conflicts(set(propagating.keys()), set(new_group.keys()))
@@ -436,3 +452,7 @@ class Options:
         self.last_forwarded_group_keys = frozenset(inherited)
         self.inherited_context_keys = self.inherited_context_keys | frozenset(inherited_context)
         return frozenset(inherited)
+
+
+# group only: equality and hashing ignore context.
+register_deep_node(Options, lambda node: node.group)

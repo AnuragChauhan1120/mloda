@@ -285,6 +285,59 @@ class TestWorkerManagerResultPolling:
         assert UUID(uuid2) in manager.result_uuids_collection
         assert len(manager.result_uuids_collection) == 2
 
+    def test_poll_result_queues_ignores_stale_drop_complete_tuple(self) -> None:
+        """A stale ("DROP_COMPLETE", cfw_uuid) control tuple must not be parsed as a UUID.
+
+        The worker's single result_queue carries BOTH step-completion UUID
+        strings and ("DROP_COMPLETE", cfw_uuid) control tuples. When a drop
+        wait times out, the tuple lingers in the queue and a later poll picks
+        it up. poll_result_queues must skip it instead of calling
+        ``UUID(("DROP_COMPLETE", cfw_uuid))`` (which raises
+        ``AttributeError: 'tuple' object has no attribute 'replace'``).
+        """
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        mock_queue = MagicMock()
+        mock_queue.get.side_effect = [("DROP_COMPLETE", cfw_uuid), queue.Empty()]
+        manager.result_queues_collection.add(mock_queue)
+
+        # Must not raise; the control tuple is ignored, not interpreted as a UUID.
+        manager.poll_result_queues()
+
+        assert cfw_uuid not in manager.result_uuids_collection
+        assert manager.result_uuids_collection == set()
+
+    def test_poll_result_queues_keeps_valid_uuid_when_interleaved_with_stale_tuple(self) -> None:
+        """A valid UUID string must still be collected even when a stale tuple follows it.
+
+        Mirrors production: one poll consumes the step-completion UUID string,
+        a later poll consumes the lingering ("DROP_COMPLETE", cfw_uuid) tuple.
+        Extra ``queue.Empty()`` sentinels keep the test robust whether the fix
+        keeps single-get-per-poll semantics or drains each queue to empty.
+        """
+        manager = WorkerManager()
+        valid_uuid = str(uuid4())
+        other_uuid = uuid4()
+
+        mock_queue = MagicMock()
+        mock_queue.get.side_effect = [
+            valid_uuid,
+            ("DROP_COMPLETE", other_uuid),
+            queue.Empty(),
+            queue.Empty(),
+            queue.Empty(),
+        ]
+        manager.result_queues_collection.add(mock_queue)
+
+        # First poll picks up the valid UUID; the second reaches the stale tuple,
+        # which must be ignored rather than raise AttributeError.
+        manager.poll_result_queues()
+        manager.poll_result_queues()
+
+        assert UUID(valid_uuid) in manager.result_uuids_collection
+        assert other_uuid not in manager.result_uuids_collection
+
 
 class TestWorkerManagerStepCompletion:
     """Test checking if steps are completed."""
@@ -303,6 +356,156 @@ class TestWorkerManagerStepCompletion:
         step_uuid = uuid4()
 
         assert manager.is_step_done(step_uuid) is False
+
+
+class TestWorkerManagerDeadWorkerDetection:
+    """Test detection of abnormally-terminated worker processes (e.g. OOM SIGKILL)."""
+
+    @pytest.mark.timeout(30)
+    def test_find_dead_workers_detects_sigkilled_worker(self) -> None:
+        """find_dead_workers must report a worker that died abnormally.
+
+        A worker SIGKILL'd by the OOM killer never emits its step UUID and
+        never runs its except block (so no error is set on cfw_register). The
+        only observable signal is the process exitcode, which is non-zero
+        (``-9`` for SIGKILL). find_dead_workers must surface it as a
+        (cfw_uuid, exitcode) entry so the run loop can abort instead of
+        spinning forever.
+        """
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        process, _, _ = manager.create_worker_process(cfw_uuid=cfw_uuid, target=_loop_forever_target, args=())
+        process.kill()
+        process.join(timeout=5)
+
+        # Sanity: the real process died abnormally (non-zero, non-None exit).
+        assert process.exitcode is not None
+        assert process.exitcode != 0
+
+        dead = manager.find_dead_workers()
+
+        assert any(entry[0] == cfw_uuid for entry in dead)
+
+    def test_find_dead_workers_ignores_alive_and_clean_workers(self) -> None:
+        """find_dead_workers must return [] when every worker is healthy.
+
+        A healthy worker is either still alive (exitcode is None) or exited
+        cleanly via STOP (exitcode 0). Neither counts as a dead worker.
+        """
+        manager = WorkerManager()
+
+        alive_process = MagicMock()
+        alive_process.exitcode = None
+        alive_process.is_alive.return_value = True
+        manager.process_register[uuid4()] = (alive_process, MagicMock(), MagicMock())
+
+        clean_process = MagicMock()
+        clean_process.exitcode = 0
+        clean_process.is_alive.return_value = False
+        manager.process_register[uuid4()] = (clean_process, MagicMock(), MagicMock())
+
+        assert manager.find_dead_workers() == []
+
+
+class TestWorkerManagerOrphanedStepDetection:
+    """A worker that exits while steps are still assigned to it must be detectable.
+
+    find_dead_workers only reports a non-zero exitcode. The data-drop path breaks the
+    worker loop and the process exits with code 0, so it is invisible there while the steps
+    dispatched to it stay in currently_running_steps with no result ever arriving.
+    """
+
+    @staticmethod
+    def _exited(manager: WorkerManager, exitcode: int) -> UUID:
+        """Register a worker whose process has already exited with *exitcode*."""
+        cfw_uuid = uuid4()
+        process = MagicMock()
+        process.exitcode = exitcode
+        process.is_alive.return_value = False
+        manager.process_register[cfw_uuid] = (process, MagicMock(), MagicMock())
+        return cfw_uuid
+
+    def test_a_clean_exit_owing_a_step_is_reported(self) -> None:
+        """Exitcode 0 is the case find_dead_workers cannot see, so it is the case that matters."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+
+        # Premise: the existing check stays silent, which is why this one has to exist.
+        assert manager.find_dead_workers() == []
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, [step_uuid])]
+
+    def test_an_abnormal_exit_owing_a_step_is_reported_too(self) -> None:
+        """Any exitcode counts: an exited process will never answer, whatever the code."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, -9)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, -9, [step_uuid])]
+
+    def test_a_step_whose_result_already_arrived_is_not_reported(self) -> None:
+        """The worker finished its work and then exited; nothing was lost."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        step_uuid = uuid4()
+        manager.record_assignment(cfw_uuid, {step_uuid})
+        manager.result_uuids_collection.add(step_uuid)
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_only_the_steps_still_owed_are_named(self) -> None:
+        """A partially-drained worker reports the remainder, not everything it was sent."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        done, pending = uuid4(), uuid4()
+        manager.record_assignment(cfw_uuid, {done, pending})
+        manager.result_uuids_collection.add(done)
+
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, [pending])]
+
+    def test_a_live_worker_is_never_orphaned(self) -> None:
+        """A running worker still owes results; that is work in progress, not a loss."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        process = MagicMock()
+        process.exitcode = None
+        process.is_alive.return_value = True
+        manager.process_register[cfw_uuid] = (process, MagicMock(), MagicMock())
+        manager.record_assignment(cfw_uuid, {uuid4()})
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_an_exited_worker_with_no_assignments_is_not_reported(self) -> None:
+        """A worker stopped after draining its queue exits owing nothing."""
+        manager = WorkerManager()
+        self._exited(manager, 0)
+
+        assert manager.find_orphaned_steps() == []
+
+    def test_record_assignment_accumulates_across_dispatches(self) -> None:
+        """multi_execute_step runs once per step, so assignments must union, not replace."""
+        manager = WorkerManager()
+        cfw_uuid = self._exited(manager, 0)
+        first, second = uuid4(), uuid4()
+        manager.record_assignment(cfw_uuid, {first})
+        manager.record_assignment(cfw_uuid, {second})
+
+        assert manager.assigned_steps[cfw_uuid] == {first, second}
+        assert manager.find_orphaned_steps() == [(cfw_uuid, 0, sorted([first, second], key=str))]
+
+    def test_each_exited_worker_is_reported_separately(self) -> None:
+        """The run loop names every affected cfw, not only the first one found."""
+        manager = WorkerManager()
+        first_cfw = self._exited(manager, 0)
+        second_cfw = self._exited(manager, 0)
+        manager.record_assignment(first_cfw, {uuid4()})
+        manager.record_assignment(second_cfw, {uuid4()})
+
+        assert {entry[0] for entry in manager.find_orphaned_steps()} == {first_cfw, second_cfw}
 
 
 class TestWorkerManagerDropCompletion:

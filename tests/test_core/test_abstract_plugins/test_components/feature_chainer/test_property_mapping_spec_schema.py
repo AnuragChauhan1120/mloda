@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from mloda.core.abstract_plugins.components.feature_chainer.property_spec import PropertySpec
+from mloda.core.abstract_plugins.components.property_spec import PropertySpec
 
 TYPO_STRICT_FIELD = "strict_validaton"  # the headline typo: 'strict_validation' minus one 'i'
 STALE_ELEMENT_VALIDATOR_FIELD = "validation_function"
@@ -45,7 +45,7 @@ class TestTheConstructorIsTheSchema:
     """The dataclass field set is the whole schema; an unknown field cannot exist."""
 
     def test_field_set_is_exactly_the_schema(self) -> None:
-        """The schema is these nine fields, nothing more: there is no key set to drift from."""
+        """The schema is these twelve fields, nothing more: there is no key set to drift from."""
         assert {field.name for field in dataclasses.fields(PropertySpec)} == {
             "explanation",
             "allowed_values",
@@ -56,6 +56,9 @@ class TestTheConstructorIsTheSchema:
             "match_guard",
             "required_when",
             "allow_explicit_none",
+            "deferred_binding",
+            "framework_set",
+            "scalar_only",
         }
 
     def test_typo_field_is_a_constructor_type_error_naming_the_offender(self) -> None:

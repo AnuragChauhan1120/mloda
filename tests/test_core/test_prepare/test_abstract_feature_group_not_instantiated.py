@@ -23,7 +23,7 @@ from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.abstract_plugins.plugin_loader.plugin_loader import PluginLoader
 from mloda.core.api.request import mlodaAPI
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
 
 
@@ -249,7 +249,7 @@ class TestAbstractOnlyMessageCorrectness:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -266,8 +266,8 @@ class TestAbstractOnlyMessageCorrectness:
     def test_capability_rejection_not_shadowed_by_abstract_only(self) -> None:
         """Finding B: a concrete subclass matched criteria/domain/scope but its available
         framework was rejected by ``supports_compute_framework`` (a capability rejection).
-        The user must get the capability-rejection message, NOT the abstract-only message
-        that wrongly claims the framework is 'none of which are available or enabled'.
+        os-011 keeps the abstract-only sentence AND appends the near-miss block, so the concrete
+        subclass's capability rejection is surfaced alongside the abstract note rather than shadowed.
         """
         feature = Feature(CAPABILITY_SHADOW_FEATURE)
 
@@ -277,7 +277,7 @@ class TestAbstractOnlyMessageCorrectness:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,
@@ -285,15 +285,15 @@ class TestAbstractOnlyMessageCorrectness:
             )
 
         error_message = str(exc_info.value)
-        lowered = error_message.lower()
 
-        assert "none of which are available or enabled" not in error_message, (
-            f"A capability rejection must not be shadowed by the abstract-only message; the "
-            f"framework IS available and was rejected by supports_compute_framework, but got: {error_message}"
+        assert "Feature group(s) eliminated while matching" in error_message, (
+            f"The concrete subclass's capability rejection must surface as a near-miss line, but got: {error_message}"
         )
-        assert "supports_compute_framework" in error_message or "unsupported compute framework" in lowered, (
-            f"Error should be the capability-rejection message (mentioning 'supports_compute_framework' "
-            f"or 'Unsupported compute framework'), but got: {error_message}"
+        assert "supports_compute_framework rejected" in error_message, (
+            f"The near-miss line must name the supports_compute_framework rejection, but got: {error_message}"
+        )
+        assert CapabilityShadowConcrete.get_class_name() in error_message, (
+            f"The near-miss line must name the rejected concrete subclass, but got: {error_message}"
         )
 
 
@@ -316,7 +316,7 @@ class TestAbstractFeatureGroupNotSelectedByResolution:
         }
 
         with pytest.raises(ValueError) as exc_info:
-            IdentifyFeatureGroupClass(
+            evaluate_or_raise(
                 feature=feature,
                 accessible_plugins=accessible_plugins,
                 links=None,

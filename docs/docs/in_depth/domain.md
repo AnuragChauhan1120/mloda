@@ -22,6 +22,8 @@ Feature(name="Revenue",
 )
 ```
 
+A `Domain` instance can be passed directly in both places instead of a string, with the same effect.
+
 The domain can also be set in the feature group.
 
 **Feature group**
@@ -33,7 +35,7 @@ class ExampleFeature(FeatureGroup):
     @classmethod
     def get_domain(cls) -> Domain:
         """This function should return the domain for the feature group"""
-        return "example_domain"
+        return Domain("example_domain")
 ```
 For feature groups, the default domain is default_domain.
 

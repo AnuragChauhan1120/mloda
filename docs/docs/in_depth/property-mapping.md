@@ -15,7 +15,7 @@ Two rules carry most of the model:
 
 ## The spec type
 
-``` python
+```python
 from mloda.provider import PropertySpec
 
 PROPERTY_MAPPING = {
@@ -39,12 +39,16 @@ PROPERTY_MAPPING = {
 | `match_guard` | `Callable \| None` | `None` | Whole-value predicate. A falsy return is a non-match. |
 | `required_when` | `Callable \| None` | `None` | `(Options) -> bool`: the key is required only when it returns truthy. |
 | `allow_explicit_none` | `bool` | `False` | Opt-in so an explicit `None` is honored (not treated as absent) and flows through validation. |
+| `deferred_binding` | `bool` | `False` | Exempts a required key from the string-named path presence check only; its value is bound outside match-time name capture. Not optionality: the key stays required on the config path. See [Required presence on the string-named path](#required-presence-on-the-string-named-path). |
 
-`property_spec(...)` is a thin builder over the same fields. Its keyword is `strict=`,
-which sets `strict_validation`. Both it and `PropertySpec` are exported from
-`mloda.provider`.
+**`property_spec(...)` is the authoring path to reach for.** It is a thin builder over the
+same fields, its keyword is `strict=` (which sets `strict_validation`), and it keeps the
+declaration readable. `PropertySpec` is the lower-level form: it is the type the builder
+returns and the type the schema is validated against, so reach for it directly when you need
+the class itself (subclassing, `isinstance` checks, or constructing a spec programmatically).
+Both are exported from `mloda.provider`.
 
-``` python
+```python
 from mloda.provider import property_spec
 
 PROPERTY_MAPPING = {
@@ -71,10 +75,16 @@ does not understand can be absorbed silently.
 | Class definition (`FeatureGroup.__init_subclass__`) | Spec type | Every spec IS a `PropertySpec` | Every value in the mapping | `ValueError` naming the class and the key |
 | Match time (parser) | `allowed_values` membership | Each element of a **present** option is in the accepted set | One element | `ValueError`, surfaced to the end user |
 | Match time (parser) | `element_validator` | Each element of a **present** option satisfies a predicate | One element | `ValueError`, surfaced to the end user |
-| Match time (parser) | Required presence | A key that declares no `default` and no `required_when` was provided | The options | Non-match (`False`), configuration-based path only |
+| Match time (parser) | Required presence (config path) | A key that declares no `default` and no `required_when` was provided | The options | Non-match (`False`) |
+| Match time (parser) | Required presence (string-named path) | Same, after declared defaults and name bindings resolve; `deferred_binding=True` and the source (`in_features`) key are exempt | The name-bound options | Non-match (`False`), with a warning naming the missing key(s) |
 | Match time (mixin) | `match_guard` | The whole value has an acceptable shape | The raw value | Non-match (`False`) |
 | Match time (mixin) | `MIN/MAX_IN_FEATURES` | In-feature count is within bounds | The in-features | Non-match (`False`) |
 | Match time (guard installed at class definition) | `required_when` | A conditionally required option is present | `Options` | Non-match (`False`) |
+| Class definition (mixin) | Universal-matcher diagnostic | An all-optional `PROPERTY_MAPPING` inherits the configuration matcher, so it matches any name with empty options | The class | `logger.warning`, unless `ALLOW_UNIVERSAL_MATCHER = True` |
+| Author time (reader surface) | `mypy --strict` | `READER_OPTIONS` holds `PropertySpec` values | The constructor call | mypy error at the declaration |
+| Class definition (`BaseInputData.__init_subclass__`) | Spec type + surface guard | Every value IS a `PropertySpec` and declares nothing inert on a reader (`match_guard`, `deferred_binding`, `context=False`, enforcement fields on a `framework_set` key); the reserved key's **winning** declaration across the MRO keeps `framework_set=True` | Every value in that class's declaration, plus the reserved key as the MRO merge resolves it | `ValueError` naming class, key and field |
+| Match time (reader selection) | Presence + strict validation | Required keys are present and present strict values pass, element-wise unless `scalar_only` rejects a collection outright; `framework_set` keys exempt | The candidate's merged specs and the options | Reader non-match. Addressed-reader and supplied-value failures record a `stage="input_data"` rejection; unaddressed absence and an unjudgeable predicate decline silently |
+| Match time (reader code) | `reader_option(key, options)` | Supplied value, else the declared `default` | The key name and the options | `ValueError` for an undeclared key or an absent `NO_DEFAULT` one |
 
 A spec is constructed inside the class body, so its own rules fire before the class exists.
 Class definition is left with exactly one rule: the type itself. Within `__post_init__` the
@@ -89,15 +99,105 @@ short-circuits, and `match_guard` is never reached.
 
 Value validation does not depend on how the feature was created: membership and
 `element_validator` run on **both** match paths, the configuration-based one and the
-string-named one. Only required **presence** differs, enforced on the configuration-based
-path alone, because a key the feature name encodes is satisfied by the name. So
-`"income__pca_2d"` with no options at all still matches, while the same feature group with
-`pca_svd_solver="bogus"` in its options is rejected either way.
+string-named one. Required **presence** runs on both too: the string-named path rejects a
+missing required key exactly like the configuration path does
+(see [Required presence on the string-named path](#required-presence-on-the-string-named-path)).
+A key the name encodes, a `deferred_binding=True` key, a declared-default key, and the source
+(`in_features`) key are never falsely reported missing. So `"income__pca_2d"` with no options at
+all still matches, while the same feature group with `pca_svd_solver="bogus"` in its options is
+rejected either way.
 
 `required_when` is the one mechanism that does not live inside a matcher. A class that
 declares it gets its resolved `match_feature_group_criteria` wrapped at class definition,
 and the wrapper runs the predicates after that matcher returns `True`. Overriding the
 matcher therefore keeps the contract, whether the override delegates or not.
+
+The last four rows are the whole reader surface, and the match-time ones sit outside the ordered
+sequence above: a user-facing `READER_OPTIONS` key is consumed during reader selection, and no other
+moment fires for it. The reserved `"BaseInputData"` key is the exception, written at selection and read
+back at load time by `BaseInputData.init_reader` and by `SQLITEReader.get_table`.
+See [One spec type, two surfaces](#one-spec-type-two-surfaces).
+
+## One spec type, two surfaces
+
+Option keys are declared in two places, with one spec type, and the two surfaces enforce it
+differently because they consume values at different moments.
+
+| Surface | Declared on | What the framework does with it |
+| --- | --- | --- |
+| `PROPERTY_MAPPING` | a `FeatureGroup` | Enforces it and applies it: value validation (`allowed_values`, `element_validator`), presence and `required_when`, and materialization of declared defaults into `Options`. |
+| `READER_OPTIONS` | a `BaseInputData` reader | Enforces it at reader selection: presence, `required_when` and strict values are checked before a candidate probes, and a failure vetoes that reader, recording per the ownership rule above. Defaults are never materialized; only the reader's own code applies them. |
+
+Both surfaces run the same per-key validator, and the reader's MRO merge goes through the shared
+helper module (`mloda/core/abstract_plugins/components/declaration_surface.py`).
+
+A reader consumes its option keys during reader **selection** (`match_subclass_data_access`, reached
+through `BaseInputData.matches` from the matcher), before the framework materializes anything. Two
+consequences keep the shared type honest on this surface:
+
+- **`default` stays a runtime fallback.** A `FeatureGroup` default enters `Options` (hashing, twin
+  canonicalization, downstream visibility); a reader default is only returned by
+  `reader_option(key, options)` and never enters `Options`. Presence follows the
+  [#768 matrix](#applying-declared-defaults); a `NO_DEFAULT` key is required at selection, and
+  `reader_option` raises for it. The declaration is load-bearing: `ReadFile` and `ReadDocument`
+  resolve `document_suffixes` this way (for `ReadDocument` only in its `DataAccessCollection`
+  branch; the bare str/Path branch passes no `document_suffixes`).
+- **Fields with no reader meaning are rejected where they are written.** `match_guard`,
+  `deferred_binding=True` and `context=False` describe name matching and value placement, which a
+  reader does not have, so `BaseInputData.__init_subclass__` rejects them instead of leaving them
+  silently inert (#865). `framework_set=True` marks the one framework-written key, the reserved
+  `"BaseInputData"` pair written by `add_base_input_data_to_options` and read by `init_reader`.
+  Such keys are exempt from enforcement, so enforcement fields on them are rejected too, as is
+  `allow_explicit_none`, which the admit path never reads on a framework-written key; on
+  `PROPERTY_MAPPING` the field is rejected outright. The reserved key is checked as the MRO merge
+  resolves it: its **winning** declaration must keep `framework_set=True`, so neither a subclass nor a
+  plain mixin can turn the framework-written key into a user-enforced one.
+- **The reverse also holds: a reader-only field has no `PROPERTY_MAPPING` meaning.** `scalar_only` (#1154)
+  rejects a collection value outright instead of unpacking it element-wise, so `FeatureChainParser` rejects
+  it on `PROPERTY_MAPPING` at class definition, the same way `match_guard`/`deferred_binding`/`context=False`
+  are rejected on the reader surface.
+
+`READER_OPTIONS` merges across the MRO (`reader_option_specs()`, most-derived declaration winning),
+so a concrete reader inherits its family's keys and redeclares nothing, and
+`declared_reader_option_keys()` is the merged key set. Both `reader_option()` and
+`reader_option_default()` raise for a key no declaration carries, so a typo in *reader* code is loud
+instead of a silent `None`.
+
+What a plugin author may rely on:
+
+| Guarantee | on a `FeatureGroup` | on a reader |
+| --- | --- | --- |
+| The declared value space is enforced against user values | yes, under `strict_validation` | yes, under `strict_validation`, at reader selection |
+| The declared default is applied by the framework | yes (see [Applying declared defaults](#applying-declared-defaults)) | no, only the reader's own code applies it, via `reader_option` |
+| Presence and `required_when` are checked | yes | yes, at selection; addressing the reader makes a failure attributable, a global probe declines silently on absence |
+| A user's mistyped key surfaces | for a required key, yes: absence is a non-match, with a warning on the string-named path | for a required key, yes: absence is an attributable non-match; an optional key's typo still falls back to the declared default |
+
+The surfaces used to be two types: reader selection had no rejection channel, so enforcement
+fields on a reader would have been silently inert (#865). The shared channel (#727) made declines
+attributable and collapsed the types back into one (#949). Migration edge: a bare
+`PropertySpec("...")` is required at selection; the old bare `ReaderOptionSpec("...")` is
+`PropertySpec("...", default=None)`.
+
+### A pattern-less feature group sits in between
+
+A `FeatureGroup` that declares no `PREFIX_PATTERN` or `SUFFIX_PATTERN` (`ConcatenatedFileContent` is
+the in-repo example) carries a real `PROPERTY_MAPPING`, but only part of the enforced surface reaches
+it:
+
+- `required_when` **is** enforced, for absence. Its guard is installed from
+  `FeatureGroup.__init_subclass__` and wraps the class's resolved `match_feature_group_criteria`
+  instead of living inside the chain-parser matcher, so an **absent** required key is a non-match at
+  match time, not a late `ValueError` inside `input_features`. Requiredness reads presence
+  (`options.get(key) is not None`), so a present-but-falsy value (`target_folder=[]`,
+  `document_reader_class=""`) satisfies the requirement and matches; the hand-rolled `ValueError`
+  backstops inside `input_features` are what catch that, which is why they stay.
+- `strict_validation` is never reached: value validation lives inside the chain-parser matcher, and a
+  pattern-less group keeps the default class-name matcher, which does not call the parser. The
+  name-path presence rule is unavailable too, because it needs a parsed name and its guard installs
+  only for a class that declares a pattern.
+- Declared defaults stay metadata until the group materializes them itself by calling
+  `options_with_defaults` at its own read site. That call is what makes a declared default real at an
+  `input_features` read site (see [Applying declared defaults](#applying-declared-defaults)).
 
 ## Choosing a mechanism
 
@@ -107,6 +207,33 @@ matcher therefore keeps the contract, whether the override delegates or not.
 | "Each value must satisfy a rule I cannot enumerate" (positive int, float in range) | `element_validator` (requires strict) |
 | "The value as a whole must have this shape" (a dict, a list of exactly 3, an ordering) | `match_guard` |
 | "This option is required only when another option says so" | `required_when` |
+
+### Positive-integer options: use the shared predicate
+
+Do not hand-roll a positive-integer check. Python bools satisfy `isinstance(value, int)`, so
+the obvious predicate accepts `horizon=True`; and `str.isdigit()` accepts `"²"`, which then
+raises in `int()`. `mloda.provider` exports one predicate that gets both right, and accepts
+numpy integers and decimal strings:
+
+```python
+from mloda.provider import PropertySpec, is_positive_int
+
+WINDOW_SIZE: PropertySpec(
+    "Size of the time window (must be positive integer)",
+    context=True,
+    strict_validation=True,
+    element_validator=is_positive_int,
+)
+```
+
+It accepts positive Python ints, numpy integers and decimal strings, and rejects `bool`,
+zero, negatives, and non-integers. Shipped plugins (`window_size`, `horizon`, `k_value`,
+`dimension`) all use it, so the value space stays consistent across feature groups. If a key
+allows an extra sentinel, compose rather than fork it, as clustering does for `"auto"`:
+
+```python
+element_validator=lambda value: value == "auto" or is_positive_int(value),
+```
 
 The two callables differ on both axes, which is what their names say:
 
@@ -131,7 +258,9 @@ candidate feature group).
 Container syntax is not part of the contract. For membership and `element_validator`, every
 sequence unpacks element-wise and identically:
 
-``` python
+```python
+from mloda.user import Options
+
 # All four hand the element_validator exactly "a" and then "b".
 Options(context={"ops": ["a", "b"]})
 Options(context={"ops": ("a", "b")})
@@ -186,7 +315,7 @@ Under `strict_validation=True`, a declared non-`None` `default` must be a value 
 accepts, either by membership or through the `element_validator`. This closes the gap where
 omitting the key would apply an unrevalidated default.
 
-``` python
+```py
 # ValueError at construction: "mul" is not accepted.
 PropertySpec(
     "Arithmetic operation",
@@ -214,7 +343,7 @@ Optionality is the `default` field, and the three states are distinct:
 | `default=None` | The key is **optional**; no value is applied when it is absent. |
 | `default=<value>` | The key is **optional**; the value is materialized when it is absent (see [Applying declared defaults](#applying-declared-defaults)), and is checked under strict. |
 
-``` python
+```python
 from mloda.provider import PropertySpec
 
 PROPERTY_MAPPING = {
@@ -230,30 +359,88 @@ every field is always present, so a plain `None` cannot say both "no default dec
 "optional with no value". The retired dict form drew the same line with a *present*
 `default: None` entry. `SklearnPipelineFeatureGroup` is the in-repo example.
 
+To ask whether a spec declares a default, use `is_no_default`, also exported from
+`mloda.provider`:
+
+```py
+from mloda.provider import is_no_default
+
+if is_no_default(spec.default):
+    ...  # the key declares no default, so it is required
+```
+
+Do **not** write `spec.default is NO_DEFAULT`. `is_no_default` is a type test rather than an
+identity test on purpose: a second imported copy of the module (an editable install alongside
+site-packages, or an `importlib.reload`) carries its own sentinel object, and an identity
+check would read that copy's sentinel as a *declared* default.
+
 `required_when` is for a *conditional* requirement, not for optionality: never write a
 predicate that always returns `False` to make a key optional.
+
+`deferred_binding` is not optionality either: the key stays required on the configuration path,
+and the flag only defers its string-named path presence check (see
+[Required presence on the string-named path](#required-presence-on-the-string-named-path)).
 
 ## Applying declared defaults
 
 A declared default is metadata until the resolved feature group materializes it.
 `FeatureGroup.options_with_defaults(options)` returns an `Options` view where every absent key
-with a concrete declared default is filled from its spec (into context or group per the spec),
-so compute reads see it. A present value is never overridden, even a falsy `0`/`False`/`""`.
-`NO_DEFAULT` and `default=None` fill nothing. A strict default is already validated at
-construction, so the materialized value is not re-checked. The view is applied *after*
-resolution, so it never changes matching or FeatureSet splitting.
+with a concrete declared default is filled from its spec (into context or group per the spec).
+A present value is never overridden, even a falsy `0`/`False`/`""`. `NO_DEFAULT` and
+`default=None` fill nothing. A strict default is already validated at construction, so the
+materialized value is not re-checked.
 
-``` python
-opts = MyFeatureGroup.options_with_defaults(feature.options)
-graph_type = opts.get("graph_type")  # the declared default when the caller omitted it
+The framework applies this at two sites. At feature **intake**
+(`Engine.add_feature_to_collection`) a feature's options are rebound through
+`options_with_defaults` as it enters the collection. At the **compute boundary**
+`run_calculate_feature` materializes the declared defaults into the `FeatureSet` before
+`calculate_feature` and any calculate-feature extender run, so a plugin reads `feature.options`
+directly. `options_with_defaults` remains for pre-materialization contexts (e.g. `resolve_subtype`
+internals) and for read sites the framework hands pre-default options, `input_features` above all.
+
+For an engine-driven request intake has already run, so the compute-boundary call is an idempotent
+no-op. It carries the work only for direct `FeatureSet` use that bypasses the engine, and there the
+collapsing twins raise instead of merging.
+
+Both sites run *after* resolution, so materialization never changes **resolution matching** (filter
+matching runs after intake and does observe materialized values, see below). It does change
+how features **group**: intake materialization deliberately canonicalizes default-equivalent twins,
+so a feature that passes a declared default explicitly and one that omits it become equal and merge
+into a single feature (with a warning naming the duplicated request) instead of computing twice.
+
+One consequence for authors: `input_features` is called with the DECLARED, pre-default options (the
+engine stashes them before intake rebinds, and a child inherits the same pre-default options), so a
+declared default does NOT reach an `input_features` read site. A group that wants it there calls
+`options_with_defaults` itself, as `ConcatenatedFileContent` does (see
+[A pattern-less feature group sits in between](#a-pattern-less-feature-group-sits-in-between)).
+
+Which stage sees which view of the options:
+
+| Stage | Options view |
+| --- | --- |
+| Parse, bind, resolution match, resolve (subtype resolution applies defaults internally) | declared (pre-default) |
+| `input_features()` and child option inheritance | declared (pre-default) |
+| Splitting, planning, filter matching, `validate_input_features`, compute | effective (post-default) |
+
+The last row assumes intake has run, which is every engine-driven request. On the direct `FeatureSet`
+path the safety net materializes inside `run_calculate_feature`, which is after
+`validate_input_features`, not before it.
+
+Filter matching is the one place the same classmethod sees both views: `GlobalFilter` calls
+`match_feature_group_criteria` again after intake, passing the filter feature's own options
+enriched from the resolved feature's effective ones (`unify_options`), so a key the filter feature
+omits arrives materialized where feature resolution saw it declared.
+
+```py
+graph_type = feature.options.get("graph_type")  # the declared default when the caller omitted it
 ```
 
 `Options.get(key, default)` reads dict-style: a present key returns its stored value (even a falsy
 `0`/`False`/`""`), and the call-site `default` is returned only when the key is absent from both
-group and context. Because `options_with_defaults` has already materialized any declared default
-into the view, reading it back gives a three-level precedence, an explicit caller value first, then
-the declared spec default, then the call-site `default`. (Subtlety: `options_with_defaults` fills any
-key whose value `is None`, so an explicit `None` is replaced by a concrete spec default, while the
+group and context. Because the framework has already materialized any declared default before
+`calculate_feature` runs, reading it back gives a three-level precedence, an explicit caller value
+first, then the declared spec default, then the call-site `default`. (Subtlety: materialization fills
+any key whose value `is None`, so an explicit `None` is replaced by a concrete spec default, while the
 other falsy values `0`/`False`/`""` are kept. That "None means absent" rule is the default; a spec
 opts a single key out with `allow_explicit_none=True`, after which an explicit `None` overrides even a
 concrete default and is honored across the match-time value mechanisms: it counts as present for the
@@ -261,16 +448,15 @@ required-presence and `required_when` checks and is seen by membership, `element
 `match_guard`, while every flagless spec is unchanged. The flag defaults to `False`, so the existing
 `is not None` presence tests keep working.)
 
-``` python
-opts = MyFeatureGroup.options_with_defaults(feature.options)
-graph_type = opts.get("graph_type", "spring")  # explicit value; else the spec default; else "spring"
+```py
+graph_type = feature.options.get("graph_type", "spring")  # explicit value; else the spec default; else "spring"
 ```
 
 ## Parameter classification
 
 There is no `group` field: a group parameter is `context=False`.
 
-``` python
+```python
 PROPERTY_MAPPING = {
     # Context parameter (the default): does not affect feature group splitting
     "aggregation_type": PropertySpec(
@@ -291,6 +477,46 @@ PROPERTY_MAPPING = {
 A caller who places the key explicitly in `Options(group=...)` or `Options(context=...)`
 overrides the spec's classification.
 
+## How a name-parsed value binds to a key
+
+A value captured from the feature name binds to a PROPERTY_MAPPING key by name: a named capture
+group `(?P<key>...)` binds to the key of the same name, so a secondary capture and an
+`element_validator`-only spec (one with no `allowed_values`) both receive their value. When a
+pattern declares any named group, binding is exclusively by name. A pattern with only positional
+groups falls back to the legacy rule of binding the first capture to the single key whose
+`allowed_values` already contain it. That fallback is transitional (retired by #772); a positional
+pattern whose keys share a reachable value is rejected at class-definition time, so migrate such a
+pattern to named capture groups.
+
+## Required presence on the string-named path
+
+Required presence is checked when a feature matches by its name, not on the configuration path
+alone. A key is flagged when it declares no `default`, no `required_when`, and
+`deferred_binding=False`, and is still absent after declared defaults and name captures are
+resolved. Exempt from the check: a declared default, a `required_when` key, a
+`deferred_binding=True` key, and the source key (`in_features`), whose presence the name prefix
+supplies and whose count `MIN/MAX_IN_FEATURES` enforces.
+
+A flagged missing key makes the match a **non-match**: a warning names the group, the feature,
+and the missing key(s), and the resolution-failure report names the missing key(s) too.
+
+Two migrations remove the warning for a flagged key. Give the pattern a named capture
+`(?P<key>...)` so the framework binds the key from the name; or, for a key bound outside
+match-time name capture (parsed by the plugin from the name, or supplied downstream), set
+`deferred_binding=True`, which exempts it from this check only and leaves it required on the
+config path. `ClusteringFeatureGroup` marks its name-parsed `k_value` key this way:
+
+```python
+from mloda.provider import PropertySpec
+
+PROPERTY_MAPPING = {
+    "k_value": PropertySpec(
+        "Cluster count parsed from the feature name by the plugin",
+        deferred_binding=True,  # exempt from the string-named presence check only
+    ),
+}
+```
+
 ## What the end user sees on a rejection
 
 A direct `FeatureChainParser` call raises `ValueError` immediately. Going through
@@ -300,12 +526,12 @@ candidate's "no match" must not abort the search for another candidate that migh
 the feature. This holds on both paths: a bad option value on a string-named feature is the same
 non-match as on a configuration-based one.
 
-If every candidate rejects the feature, the final "No feature groups found" error collects the
-discarded reasons and appends them:
+If every candidate rejects the feature, the final "No feature groups found" error names each
+discarded candidate and why it dropped:
 
 ```
-Feature group(s) rejected an option value while matching 'window_size_windowed':
-  - WindowedFeatureGroup: Property value '14' failed validation for 'window_size'
+Feature group(s) eliminated while matching 'window_size_windowed':
+  - WindowedFeatureGroup (option value): Property value '14' failed validation for 'window_size'
 ```
 
 This is diagnostic only. It does not change the `True`/`False` contract, so a value rejected by
@@ -319,7 +545,7 @@ effective `Options` and returns `True` when the option is required. This works f
 config-based and string-based features alike (for the latter, the operation parsed from the
 feature name is merged in first, so predicates see values from both sources).
 
-``` python
+```python
 _ORDER_DEPENDENT = {"first", "last"}
 
 def _needs_order_by(options: Options) -> bool:
@@ -340,9 +566,11 @@ PROPERTY_MAPPING = {
 }
 ```
 
-When the predicate returns `True` and the option is absent, the match fails; entries with
-`required_when` are otherwise optional. The predicate must be pure and must not raise. It is
-callable by construction, and a non-bool truthy return counts as `True`.
+When the predicate returns `True` and the option is absent, the match fails and the non-match records
+a rejection reason naming the owning class and the missing key, so the resolution-failure report
+carries a near-miss line for it; entries with `required_when` are otherwise optional. The predicate
+must be pure and must not raise. It is callable by construction, and a non-bool truthy return counts
+as `True`.
 
 The enforcement is installed on the class, not on one matcher, so overriding
 `match_feature_group_criteria` does not lose it: the predicates still run after the override
@@ -353,6 +581,28 @@ The matcher must be a `classmethod`; a `staticmethod` matcher on a class that de
 
 The guard is installed at class definition, so mutating `PROPERTY_MAPPING` or replacing
 `match_feature_group_criteria` after the class body escapes it.
+
+This guard, the name-path presence guard, and the class-definition diagnostics below live in
+`feature_chain_author_guards.py`, which imports `feature_chain_parser` and never the reverse.
+
+## Guarding against a universal configuration matcher
+
+A key is unconditionally required only when it declares no `default` and no `required_when`. A
+`PROPERTY_MAPPING` with only declared-default keys (and, as the degenerate case, an empty mapping)
+has no such key, so on the configuration path it matches any feature name with empty options. A
+feature group that inherits the mixin's `match_feature_group_criteria` and declares such a mapping
+is a universal matcher: it claims features it was never meant to.
+
+At class definition the mixin warns about this, naming the class and the escape hatch. A key that is
+unconditionally required, or conditionally required via `required_when`, gates the match, so the
+mapping is not warned. For the remaining all-default mappings, universality is confirmed by calling
+the resolved matcher with an unrelated, separator-free name and empty options: a genuinely
+discriminating `match_feature_group_criteria` is not warned, while a pass-through override that only
+delegates to the base still is.
+
+Set `ALLOW_UNIVERSAL_MATCHER = True` on the class to declare the universal match intentional and
+silence the warning. Otherwise give one key no `default` (making it unconditionally required), or a
+`required_when` predicate that fires when the option is absent.
 
 ## Migrating from the dict form
 
@@ -388,12 +638,23 @@ if it really is a whole-value check.
 | Shape rules, relocated from class definition to construction | `tests/.../feature_chainer/test_property_mapping_spec_shape.py` |
 | Declared-default invariant | `tests/test_core/test_abstract_plugins/test_property_mapping_default_invariant.py` |
 | Declared defaults materialized into runtime options | `tests/test_core/test_abstract_plugins/test_options_with_defaults.py` |
+| Declared defaults materialized at the compute boundary | `tests/test_core/test_abstract_plugins/test_materialize_defaults_boundary.py` |
+| Declared defaults materialized at intake, canonicalizing default-equivalent twins | `tests/test_core/test_abstract_plugins/test_intake_default_canonicalization.py` |
+| Filter criteria matching observes effective options | `tests/test_core/test_filter/test_filter_criteria_effective_options.py` |
+| The shared declaration mechanics: the per-key validator on both surfaces, the reader merge and its per-class cache, the plain-mixin walk | `tests/.../test_components/test_declaration_surface.py` |
+| The reader surface: the single spec type and its surface guards, the reserved framework key, the MRO merge, the loud undeclared key, the presence rule of `reader_option()` | `tests/.../test_components/test_reader_option_declarations.py` |
+| Reader selection enforcement: strict values, requiredness, the `framework_set` exemption, the attributable `input_data` rejection | `tests/.../test_components/test_reader_option_enforcement.py` |
+| Per-reader declarations, the declared `default` that is load-bearing at selection, and the bare-path branch it does not reach | `tests/.../input_data/test_reader_option_declarations.py` |
+| A pattern-less group: enforced `required_when`, and defaults it applies itself | `tests/.../input_data/test_read_context_files_option_declarations.py` |
 | Container invariance, no stringification, str-as-scalar, dict-as-composite, empty containers | `tests/.../feature_chainer/test_property_mapping_sequence_unpacking.py` |
-| Present option values validated on the string-named path too; required presence stays config-only | `tests/.../feature_chainer/test_name_path_validates_option_values.py` |
+| Present option values validated on the string-named path too | `tests/.../feature_chainer/test_name_path_validates_option_values.py` |
+| Required presence on the string-named path: the mandatory non-match, the retired env var stays ignored, and the `deferred_binding` / `in_features` exemptions | `tests/.../feature_chainer/test_name_path_required_presence.py` |
 | `required_when` survives an overridden matcher, runs exactly once, and demands a classmethod | `tests/.../feature_chainer/test_required_when_enforced_on_override.py` |
+| A `required_when` non-match records its reason, so the failure report names the key and its owner | `tests/test_core/test_prepare/test_required_when_rejection_recording.py` |
 | Plugin specs behave identically across containers | `tests/test_plugins/feature_group/experimental/test_property_mapping_container_invariance.py` |
 | `property_spec` builder surface | `tests/.../feature_chainer/test_property_spec_builder.py` |
 | Rejection reasons surfaced to the end user | `tests/test_core/test_prepare/test_identify_feature_group_error_message.py` |
+| The all-optional universal-matcher diagnostic and its `ALLOW_UNIVERSAL_MATCHER` escape hatch | `tests/.../feature_chainer/test_universal_optional_matcher.py` |
 
 ## Context propagation
 
@@ -401,7 +662,7 @@ By default context parameters are local: they do not flow through dependency cha
 which is correct for feature-specific config. For cross-cutting metadata (session
 IDs, environment flags), use `propagate_context_keys`:
 
-``` python
+```python
 Options(
     context={"session_id": "abc", "window_function": "sum"},
     propagate_context_keys=frozenset({"session_id"}),  # only session_id flows on
@@ -435,7 +696,7 @@ consumer and its input feature, default forwarding is group-to-group only: a con
 `context` key is not compared against a same-named child `group` key, so the two are
 independent roles, not a conflict:
 
-``` python
+```python
 consumer = Options(context={"algo": "sum"})
 child = Options(group={"algo": "mean"})
 

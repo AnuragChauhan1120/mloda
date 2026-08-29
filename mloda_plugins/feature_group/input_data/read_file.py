@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from mloda.user import DataAccessCollection
 from mloda.provider import FeatureSet
-from mloda.provider import BaseInputData
+from mloda.provider import BaseInputData, PropertySpec, record_match_rejection
+from mloda.core.abstract_plugins.components.match_rejection import INPUT_DATA_STAGE
 from mloda.user import Options
 
 
@@ -38,6 +39,20 @@ class ReadFile(BaseInputData):
     """
 
     _auto_load_group: str = "feature_group/input_data/read_files"
+
+    READER_OPTIONS: ClassVar[dict[str, PropertySpec]] = {
+        "document_suffixes": PropertySpec(
+            "Suffixes handed over to document readers; ReadFile auto-excludes them from its own matching.",
+            default=frozenset(),
+        ),
+        "data_access_handle": PropertySpec(
+            "Hint naming which DataAccessCollection file handle to prefer while matching.",
+            default=None,
+            element_validator=lambda value: isinstance(value, str),
+            strict_validation=True,
+            scalar_only=True,
+        ),
+    }
 
     _structured_suffixes: "frozenset[str]" = frozenset(
         {
@@ -78,7 +93,7 @@ class ReadFile(BaseInputData):
 
     @classmethod
     def match_subclass_data_access(cls, data_access: Any, feature_names: list[str], options: Options) -> Any:
-        document_suffixes: "frozenset[str]" = options.get("document_suffixes") or frozenset()
+        document_suffixes: "frozenset[str]" = cls.reader_option("document_suffixes", options)
 
         if isinstance(data_access, DataAccessCollection):
             if data_access.column_to_file is not None:
@@ -93,7 +108,7 @@ class ReadFile(BaseInputData):
                 elif handle_kind == "file" and not cls._file_matches(
                     data_access.files[hint], feature_names, document_suffixes
                 ):
-                    hint = None
+                    return None
             file_match = data_access.resolve(
                 "file",
                 predicate=lambda p: cls._file_matches(p, feature_names, document_suffixes),
@@ -151,12 +166,20 @@ class ReadFile(BaseInputData):
 
     @classmethod
     def validate_columns(cls, file_name: str, feature_names: list[str]) -> bool:
+        """A suffix-owned file lacking a requested column records an attributable decline before returning False."""
         try:
             columns = cls.get_column_names(file_name)
         except NotImplementedError:
             return True
 
-        for feature in feature_names:
-            if feature not in columns:
-                return False
+        missing = [feature for feature in feature_names if feature not in columns]
+        if missing:
+            # Attributable decline: ownership established, content failed; plain non-matches stay silent.
+            record_match_rejection(
+                cls.get_class_name(),
+                f"{cls.get_class_name()} matched the suffix of {file_name} but it lacks the column(s): "
+                f"{', '.join(missing)}",
+                stage=INPUT_DATA_STAGE,
+            )
+            return False
         return True

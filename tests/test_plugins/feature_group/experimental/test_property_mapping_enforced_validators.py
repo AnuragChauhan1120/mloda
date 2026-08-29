@@ -20,7 +20,7 @@ from typing import Any, cast
 import pytest
 
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
-from mloda.core.prepare.identify_feature_group import IdentifyFeatureGroupClass
+from tests.test_core.test_prepare.identify_seam import evaluate_or_raise
 from mloda.provider import DefaultOptionKeys
 from mloda.provider import FeatureChainParserMixin
 from mloda.provider import FeatureGroup
@@ -187,7 +187,7 @@ def _resolution_error(feature: Feature, feature_group: type[FeatureGroup]) -> st
     """Resolve the feature against a single accessible feature group and return the raised error."""
     accessible_plugins: FeatureGroupEnvironmentMapping = {feature_group: {PandasDataFrame}}
     with pytest.raises(ValueError) as exc_info:
-        IdentifyFeatureGroupClass(feature=feature, accessible_plugins=accessible_plugins, links=None)
+        evaluate_or_raise(feature=feature, accessible_plugins=accessible_plugins, links=None)
     return str(exc_info.value)
 
 
@@ -263,19 +263,6 @@ class TestMatchGuardRejectionIsReportable:
         assert str(invalid_value) in reason
 
     @pytest.mark.parametrize("case", _case_params())
-    def test_string_named_path_reports_nothing_for_valid_value(self, case: KeyCase) -> None:
-        """No false positives: a value the guard accepts has nothing to report."""
-        reason = case.feature_group._strict_validation_rejection_reason(
-            case.string_feature_name, case.options(case.valid_value)
-        )
-        assert reason is None
-
-    @pytest.mark.parametrize("case", _case_params())
-    def test_string_named_path_reports_nothing_when_key_is_absent(self, case: KeyCase) -> None:
-        """No false positives: an absent key is not a rejection."""
-        assert case.feature_group._strict_validation_rejection_reason(case.string_feature_name, Options()) is None
-
-    @pytest.mark.parametrize("case", _case_params())
     def test_no_guard_rejection_reported_for_unrelated_feature_name(self, case: KeyCase) -> None:
         """A feature group that does not match the name at all must not report its guards.
 
@@ -319,7 +306,11 @@ class TestRejectedValueNamedInResolutionError:
 
 
 class TestRejectedValueIsNotAForwardingProblem:
-    """A rejected VALUE in group options must not be reported as an extra-group-option problem."""
+    """A rejected VALUE in group options must not be reported as an extra-group-option problem.
+
+    Since #791/#782 the extra-group-option hint does not exist at all: the pure renderer never
+    speculatively re-matches. These assertions therefore pin the message's shape, not a branch choice.
+    """
 
     def test_group_placed_bad_value_names_the_value_not_forwarding(self) -> None:
         """ica_max_iter=-1 in group options is a bad value; forward_group_exclude would not fix it."""

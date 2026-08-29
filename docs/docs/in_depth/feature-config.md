@@ -13,7 +13,7 @@ Use cases:
 
 ## Basic Usage
 
-``` python
+```python
 from mloda.user import load_features_from_config, mloda
 
 config = '''
@@ -24,8 +24,14 @@ config = '''
 '''
 
 features = load_features_from_config(config)
-result = mloda.run_all(features, compute_frameworks=["PandasDataFrame"])
+result = mloda.run_all(
+    features,
+    compute_frameworks=["PandasDataFrame"],
+    api_data={"SampleData": {"simple_feature": [1, 2], "configured_feature": [3, 4]}},
+)
 ```
+
+The config only builds the `Feature` objects; every name in it still needs a source, here `api_data`.
 
 ## JSON Format
 
@@ -74,7 +80,7 @@ Combine strings and objects:
 | `context_options` | object | No | Context parameters (metadata, doesn't affect resolution) |
 | `propagate_context_keys` | array | No | Context keys that propagate to dependent features |
 | `column_index` | integer | No | Index for multi-output features (adds `~N` suffix) |
-| `feature_group` | string | No | Feature Group class name the feature resolves to (resolution-only scope) |
+| `feature_group` | string | No | Feature Group class name the feature resolves to (scope read by feature resolution and filter matching) |
 
 ## Configuration Approaches
 
@@ -132,7 +138,7 @@ The string matches the named class and its subclasses, preferring the most speci
 
 The scope narrows candidates but does not break ties between them. If the run enables two compute frameworks whose concrete subclasses both match, the family base stays ambiguous and raises, exactly as the bare name does; enable one framework for the run. Two classes with the same name in different modules likewise both match and stay ambiguous, and the root `FeatureGroup` base is rejected.
 
-The scope is resolution-only and excluded from feature identity, so requesting the same name scoped to two different sources in one list raises `ValueError: Duplicate feature setup: <name>` rather than silently dropping one; see [Feature Group resolution errors](troubleshooting/feature-group-resolution-errors.md).
+The scope is read by feature resolution and by filter matching, and stays excluded from feature identity, so requesting the same name scoped to two different sources in one list raises `ValueError: Duplicate feature setup: <name>` rather than silently dropping one; see [Feature Group resolution errors](troubleshooting/feature-group-resolution-errors.md).
 
 `feature_group` is a top-level field next to `name`: writing it inside `options`, `group_options`, or `context_options` is rejected with a validation error.
 
@@ -243,7 +249,7 @@ This produces a feature named `pca_result~0`.
 
 By default, context parameters are local to each feature and do not propagate through feature chains. Use `propagate_context_keys` to specify which context keys should flow to dependent features:
 
-``` json
+```json
 [
     {
         "name": "my_feature",
@@ -260,24 +266,18 @@ In this example, `session_id` propagates to any features that depend on `my_feat
 
 ## Complete Example
 
-``` python
+```python
 from mloda.user import load_features_from_config, mloda
 
 config = '''
 [
     "customer_id",
     {
-        "name": "sales_aggregated",
-        "in_features": ["daily_sales"],
+        "name": "sales__sum_aggr",
+        "in_features": ["sales"],
         "context_options": {
-            "aggregation_type": "sum",
-            "window_days": 7
+            "report": "weekly"
         }
-    },
-    {
-        "name": "encoded_category",
-        "in_features": ["category"],
-        "column_index": 0
     }
 ]
 '''
@@ -287,6 +287,9 @@ features = load_features_from_config(config)
 result = mloda.run_all(
     features,
     compute_frameworks=["PandasDataFrame"],
-    api_data={"customer_data": {"customer_id": [1, 2, 3]}}
+    api_data={"customer_data": {"customer_id": [1, 2, 3], "sales": [10.0, 20.0, 30.0]}}
 )
 ```
+
+`sales__sum_aggr` resolves to the aggregation Feature Group, which reads its source from the name.
+`in_features` states the same source explicitly, and `context_options` rides along as metadata.
