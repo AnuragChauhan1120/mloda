@@ -1,6 +1,6 @@
 from mloda.user import Features
 import pytest
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import Mock
 
 from mloda.provider import FeatureGroup
@@ -16,8 +16,11 @@ from mloda.provider import ComputeFramework
 from mloda.user import mloda
 from mloda.user import ParallelizationMode
 from mloda.user import DataAccessCollection
+from mloda.user import GlobalFilter
 from mloda_plugins.compute_framework.base_implementations.iceberg.iceberg_framework import IcebergFramework
 from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from tests.test_core.test_filter.test_feature_group_final_filters import RegularFeatureGroupForFilterTest
+from tests.test_core.test_tooling import PARALLELIZATION_MODES_SYNC_THREADING
 
 import logging
 
@@ -28,12 +31,19 @@ try:
     import pyarrow as pa
     from pyiceberg.table import Table as IcebergTable
     from pyiceberg.catalog import Catalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import LongType, NestedField, StringType, StructType
 except ImportError:
     logger.warning("PyIceberg or PyArrow is not installed. Some tests will be skipped.")
     pyiceberg = None  # type: ignore
     pa = None  # type: ignore[assignment, unused-ignore]
     IcebergTable = None  # type: ignore
     Catalog = None  # type: ignore
+    Schema = None  # type: ignore
+    LongType = None  # type: ignore
+    NestedField = None  # type: ignore
+    StringType = None  # type: ignore
+    StructType = None  # type: ignore
 
 
 @pytest.fixture
@@ -82,7 +92,7 @@ class IcebergTestDataCreator(FeatureGroup):
     """Test data creator for Iceberg integration tests."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         """Return a DataCreator with the supported feature names."""
         return DataCreator(set(iceberg_test_dict.keys()))
 
@@ -118,8 +128,8 @@ class ATestIcebergFeatureGroup(FeatureGroup, MatchData):
         cls,
         feature_name: str,
         options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        framework_connection_object: Optional[Any] = None,
+        data_access_collection: DataAccessCollection | None = None,
+        framework_connection_object: Any | None = None,
     ) -> Any:
         """Check for data access collection if any child classes match the data access."""
 
@@ -150,7 +160,7 @@ class ATestIcebergFeatureGroup(FeatureGroup, MatchData):
 class IcebergSimpleTransformFeatureGroup(FeatureGroup):
     """Simple feature group for testing Iceberg transformations."""
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         """Require base features for transformation."""
         feature_name_str = str(feature_name) if isinstance(feature_name, FeatureName) else str(feature_name)
 
@@ -203,7 +213,7 @@ class IcebergSimpleTransformFeatureGroup(FeatureGroup):
 class IcebergToArrowFeatureGroup(FeatureGroup):
     """Feature group that converts Iceberg data to PyArrow format."""
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature("doubled_value")}
 
     @classmethod
@@ -236,11 +246,120 @@ class IcebergToArrowFeatureGroup(FeatureGroup):
         return {PyArrowTable}
 
 
+class IcebergPyArrowRegularFeatureGroupForFilterTest(RegularFeatureGroupForFilterTest):
+    """Same data as RegularFeatureGroupForFilterTest, run on IcebergFramework via a pa.Table result."""
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {IcebergFramework}
+
+
+class IcebergTableRegularFeatureGroupForFilterTest(RegularFeatureGroupForFilterTest):
+    """Same data as RegularFeatureGroupForFilterTest, in a Mock Iceberg Table whose schema() returns a real Schema."""
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {IcebergFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        arrow_data = super().calculate_feature(data, features)
+
+        mock_table = Mock(spec=IcebergTable)
+        mock_scan = Mock()
+        mock_scan.to_arrow.return_value = arrow_data
+        mock_table.scan.return_value = mock_scan
+        mock_table.schema.return_value = Schema(
+            NestedField(1, cls.get_class_name(), LongType()),
+            NestedField(2, "status", StringType()),
+        )
+        return mock_table
+
+
+class IcebergTableStructFieldFilterTest(FeatureGroup):
+    """Requests the nested field 'b.c', which the plain scan drops from the arrow result."""
+
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({"b.c", "status"})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {IcebergFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        b = pa.array([{"c": 10}, {"c": 20}, {"c": 30}, {"c": 40}], type=pa.struct([("c", pa.int64())]))
+        status = pa.array(["active", "inactive", "active", "inactive"])
+        arrow_data = pa.table({"b": b, "status": status})
+
+        mock_table = Mock(spec=IcebergTable)
+        mock_scan = Mock()
+        mock_scan.to_arrow.return_value = arrow_data
+        mock_table.scan.return_value = mock_scan
+        mock_table.schema.return_value = Schema(
+            NestedField(1, "b", StructType(NestedField(2, "c", LongType(), required=False)), required=False),
+            NestedField(3, "status", StringType(), required=False),
+        )
+        return mock_table
+
+
 @pytest.mark.skipif(
     pyiceberg is None or pa is None, reason="PyIceberg or PyArrow is not installed. Skipping this test."
 )
 class TestIcebergIntegrationWithMlodaAPI:
     """Integration tests for IcebergFramework with mloda."""
+
+    @pytest.mark.parametrize(
+        "feature_group",
+        [
+            pytest.param(IcebergPyArrowRegularFeatureGroupForFilterTest, id="pa_table"),
+            pytest.param(IcebergTableRegularFeatureGroupForFilterTest, id="iceberg_table"),
+        ],
+    )
+    @PARALLELIZATION_MODES_SYNC_THREADING
+    def test_default_feature_group_final_filter_applied(
+        self, feature_group: type[FeatureGroup], modes: set[ParallelizationMode], flight_server: Any
+    ) -> None:
+        """A default FeatureGroup (final_filters() -> None) still gets its rows filtered on Iceberg."""
+        feature_name = feature_group.get_class_name()
+
+        plugin_collector = PluginCollector.enabled_feature_groups({feature_group})
+
+        global_filter = GlobalFilter()
+        global_filter.add_filter("status", "equal", {"value": "active"})
+
+        result = mloda.run_all(
+            [Feature(name=feature_name, initial_requested_data=True)],
+            flight_server=flight_server,
+            parallelization_modes=modes,
+            plugin_collector=plugin_collector,
+            compute_frameworks={IcebergFramework},
+            global_filter=global_filter,
+        )
+
+        for final_data in result:
+            assert final_data[feature_name].to_pylist() == [10, 30]
+            assert final_data.column_names == [feature_name]
+
+    def test_nested_struct_field_survives_final_filter_iceberg(self, flight_server: Any) -> None:
+        """A default FeatureGroup requesting 'b.c' (nested) keeps it after the final filter step."""
+        plugin_collector = PluginCollector.enabled_feature_groups({IcebergTableStructFieldFilterTest})
+
+        global_filter = GlobalFilter()
+        global_filter.add_filter("status", "equal", {"value": "active"})
+
+        result = mloda.run_all(
+            [Feature(name="b.c", initial_requested_data=True)],
+            flight_server=flight_server,
+            parallelization_modes={ParallelizationMode.SYNC},
+            plugin_collector=plugin_collector,
+            compute_frameworks={IcebergFramework},
+            global_filter=global_filter,
+        )
+
+        for final_data in result:
+            assert final_data["b.c"].to_pylist() == [10, 30]
 
     @pytest.mark.parametrize(
         "modes",
@@ -353,4 +472,5 @@ class TestIcebergIntegrationWithMlodaAPI:
 
         # Verify results
         final_data = result[0]
-        assert isinstance(final_data, Mock)  # It's a mock Iceberg table
+        assert isinstance(final_data, pa.Table)
+        assert set(final_data.column_names) == {"id", "value", "category"}

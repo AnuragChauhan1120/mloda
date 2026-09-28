@@ -2,7 +2,7 @@ import inspect
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
-from typing import Optional
+from typing import Any
 
 from mloda.core.prepare.accessible_plugins import FeatureGroupEnvironmentMapping
 
@@ -38,6 +38,7 @@ from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.link import Link
+from mloda.core.abstract_plugins.plugin_loader.plugin_loader import PluginLoader
 
 import logging
 
@@ -110,16 +111,16 @@ class IdentifyFeatureGroupClass:
     _match_rejections: dict[type[FeatureGroup], MatchRejection]
     _matcher_errors: dict[type[FeatureGroup], str]
     _eliminations: dict[type[FeatureGroup], Elimination]
-    _data_access_collection: Optional[DataAccessCollection]
+    _data_access_collection: DataAccessCollection | None
     # Per-evaluation memos of the hooks more than one reader wants. evaluate() builds a fresh instance, so
     # they are scoped to one resolution attempt and never cache across runs.
-    _domain_outcomes: dict[type[FeatureGroup], tuple[Optional[Domain], Optional[Exception]]]
-    _links_outcomes: dict[type[FeatureGroup], tuple[Optional[bool], Optional[Exception]]]
+    _domain_outcomes: dict[type[FeatureGroup], tuple[Domain | None, Exception | None]]
+    _links_outcomes: dict[type[FeatureGroup], tuple[bool | None, Exception | None]]
     _declared_frameworks: dict[type[FeatureGroup], frozenset[type[ComputeFramework]]]
     _supported_names: dict[type[FeatureGroup], frozenset[str]]
     _prefixes: dict[type[FeatureGroup], str]
 
-    def __init__(self, data_access_collection: Optional[DataAccessCollection] = None) -> None:
+    def __init__(self, data_access_collection: DataAccessCollection | None = None) -> None:
         self._criteria_matched_feature_groups = set()
         self._abstract_matched_feature_groups = set()
         self._candidate_frameworks = {}
@@ -140,8 +141,8 @@ class IdentifyFeatureGroupClass:
         cls,
         feature: Feature,
         accessible_plugins: FeatureGroupEnvironmentMapping,
-        links: Optional[set[Link]],
-        data_access_collection: Optional[DataAccessCollection] = None,
+        links: set[Link] | None,
+        data_access_collection: DataAccessCollection | None = None,
     ) -> EvaluationResult:
         """Run the matching/filter logic without raising, returning a structured result."""
         # Pre-matching guard: a >1 pin fires regardless of whether any candidate matches (the old check
@@ -174,11 +175,11 @@ class IdentifyFeatureGroupClass:
         result: EvaluationResult,
         accessible_plugins: FeatureGroupEnvironmentMapping,
         feature: Feature,
-        links: Optional[set[Link]],
+        links: set[Link] | None,
     ) -> RenderFacts:
         """Capture the non-elimination facts the messages still need. Only reached when the pass has no winner.
 
-        The renderer alone owns which message wins, so this does not mirror its branch order: the four cheap
+        The renderer alone owns which message wins, so this does not mirror its branch order: the five cheap
         facts are captured whatever the failure kind is. domains feeds the multiple message, concrete_frameworks
         the abstract_only message, and known_names, eliminated_hints and dead_only_names the none message.
         dead_only_names is the one exception, gated on its own kind: its sweep retests the links gate over every
@@ -196,6 +197,7 @@ class IdentifyFeatureGroupClass:
                 if result.failure_kind == "none"
                 else frozenset()
             ),
+            skipped_plugins=tuple(sorted(PluginLoader.skipped_plugins().items())),
         )
 
     def _capture_eliminated_hints(self, result: EvaluationResult) -> frozenset[str]:
@@ -210,7 +212,7 @@ class IdentifyFeatureGroupClass:
                 hints.add(prefix)
         return frozenset(hints)
 
-    def _domain_outcome(self, feature_group: type[FeatureGroup]) -> tuple[Optional[Domain], Optional[Exception]]:
+    def _domain_outcome(self, feature_group: type[FeatureGroup]) -> tuple[Domain | None, Exception | None]:
         """Memoized get_domain() OUTCOME, value or raise, so one candidate's hook runs once per evaluation.
 
         The outcome rather than the value, because the two readers disagree on error semantics: the decision
@@ -331,7 +333,7 @@ class IdentifyFeatureGroupClass:
         return tuple(known_names)
 
     def _fails_name_blind_gate(
-        self, feature_group: type[FeatureGroup], feature: Feature, links: Optional[set[Link]]
+        self, feature_group: type[FeatureGroup], feature: Feature, links: set[Link] | None
     ) -> bool:
         """Capture-side retest of the three name-blind gates, scope then domain then links, that never raises.
 
@@ -377,7 +379,7 @@ class IdentifyFeatureGroupClass:
         feature_group: type[FeatureGroup],
         compute_frameworks: set[type[ComputeFramework]],
         feature: Feature,
-        links: Optional[set[Link]],
+        links: set[Link] | None,
     ) -> bool:
         """No name at all can resolve to this candidate: it has no framework left, or it lost at a name-blind gate.
 
@@ -403,7 +405,7 @@ class IdentifyFeatureGroupClass:
         result: EvaluationResult,
         accessible_plugins: FeatureGroupEnvironmentMapping,
         feature: Feature,
-        links: Optional[set[Link]],
+        links: set[Link] | None,
     ) -> frozenset[str]:
         """Catalog names of dead candidates that no live candidate owns and no live candidate's prefix covers.
 
@@ -432,12 +434,18 @@ class IdentifyFeatureGroupClass:
         self,
         feature: Feature,
         accessible_plugins: FeatureGroupEnvironmentMapping,
-        links: Optional[set[Link]],
-        data_access_collection: Optional[DataAccessCollection] = None,
+        links: set[Link] | None,
+        data_access_collection: DataAccessCollection | None = None,
     ) -> FeatureGroupEnvironmentMapping:
         _identified_feature_groups: FeatureGroupEnvironmentMapping = {}
 
         for feature_group, compute_frameworks in accessible_plugins.items():
+            # Snapshot ahead of the criteria call: a later gate (domain, scope, ...) rejecting a candidate
+            # whose criteria match SUCCEEDED must undo that candidate's write too, not just a failing probe's.
+            group_before = dict(feature.options.group)
+            context_before = dict(feature.options.context)
+            non_forwarded_before = feature.options.non_forwarded_group_keys
+
             # A criteria non-match records a value_rejection only when the first pass recorded a reason for it:
             # a plain name mismatch is not a near-miss, but a value the candidate declined (with a reportable
             # reason) is. The criteria call above just recorded any rejection under this candidate's window, so
@@ -460,16 +468,19 @@ class IdentifyFeatureGroupClass:
 
             if not self._filter_feature_group_by_domain(feature_group, feature):
                 self._record_elimination(feature_group, "domain", self._domain_reason(feature_group, feature))
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             if not self._filter_feature_group_by_scope(feature_group, feature):
                 self._record_elimination(feature_group, "scope", "outside the requested feature group scope")
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             # Abstract bases can match name+domain+scope but cannot be instantiated; never let one win, and
             # never record one as a near-miss: the abstract_only message owns them.
             if inspect.isabstract(feature_group):
                 self._abstract_matched_feature_groups.add(feature_group)
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             self._criteria_matched_feature_groups.add(feature_group)
@@ -502,6 +513,7 @@ class IdentifyFeatureGroupClass:
                         "frameworks_not_enabled",
                         "none of its compute frameworks are enabled for this run",
                     )
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             if not self._filter_feature_group_by_framework(supported_frameworks, feature):
@@ -512,10 +524,12 @@ class IdentifyFeatureGroupClass:
                     "framework_pin",
                     f"pinned compute framework '{pin_name}' is not among its supported {supported_names}",
                 )
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             if not self._filter_feature_group_by_links(feature_group, links):
                 self._record_elimination(feature_group, "links", "no index column matches the run's links")
+                self._restore_options(feature, group_before, context_before, non_forwarded_before)
                 continue
 
             _identified_feature_groups[feature_group] = supported_frameworks
@@ -527,7 +541,7 @@ class IdentifyFeatureGroupClass:
         """Record the first gate a non-winning name-matching candidate failed; one entry per candidate."""
         self._eliminations.setdefault(feature_group, Elimination(stage=stage, reason=reason))
 
-    def _value_rejection(self, feature_group: type[FeatureGroup]) -> Optional[MatchRejection]:
+    def _value_rejection(self, feature_group: type[FeatureGroup]) -> MatchRejection | None:
         """The MatchRejection the first match pass recorded for this candidate class, if any.
 
         The candidate's criteria match records its own rejection under a per-candidate window; this
@@ -544,7 +558,7 @@ class IdentifyFeatureGroupClass:
             return f"does not declare the requested domain '{requested}'"
         return f"declares domain '{candidate_domain}', but the run requested '{requested}'"
 
-    def _filter_feature_group_by_links(self, feature_group: type[FeatureGroup], links: Optional[set[Link]]) -> bool:
+    def _filter_feature_group_by_links(self, feature_group: type[FeatureGroup], links: set[Link] | None) -> bool:
         """Decision-side links gate: unguarded, so a raising index hook still fails the engine loudly."""
         supported, error = self._links_outcome(feature_group, links)
         if error is not None:
@@ -554,8 +568,8 @@ class IdentifyFeatureGroupClass:
         return supported
 
     def _links_outcome(
-        self, feature_group: type[FeatureGroup], links: Optional[set[Link]]
-    ) -> tuple[Optional[bool], Optional[Exception]]:
+        self, feature_group: type[FeatureGroup], links: set[Link] | None
+    ) -> tuple[bool | None, Exception | None]:
         """Memoized links-gate OUTCOME, verdict or raise, so one candidate's index hooks run once per evaluation.
 
         The outcome rather than the verdict, for the reason _domain_outcome caches one: the decision filter
@@ -573,7 +587,7 @@ class IdentifyFeatureGroupClass:
         return self._links_outcomes[feature_group]
 
     @staticmethod
-    def _links_gate(feature_group: type[FeatureGroup], links: Optional[set[Link]]) -> bool:
+    def _links_gate(feature_group: type[FeatureGroup], links: set[Link] | None) -> bool:
         # Case index columns not given, so no validation possible
         if feature_group.index_columns() is None:
             return True
@@ -592,11 +606,25 @@ class IdentifyFeatureGroupClass:
 
         return False
 
+    @staticmethod
+    def _restore_options(
+        feature: Feature,
+        group_before: dict[str, Any],
+        context_before: dict[str, Any],
+        non_forwarded_before: frozenset[str],
+    ) -> None:
+        """Roll ``feature.options`` back to a snapshot taken before a candidate's own write."""
+        feature.options.group.clear()
+        feature.options.group.update(group_before)
+        feature.options.context.clear()
+        feature.options.context.update(context_before)
+        feature.options.non_forwarded_group_keys = non_forwarded_before
+
     def _filter_feature_group_by_criteria(
         self,
         feature_group: type[FeatureGroup],
         feature: Feature,
-        data_access_collection: Optional[DataAccessCollection],
+        data_access_collection: DataAccessCollection | None,
     ) -> bool:
         """A raise out of the match hook is a non-match for that candidate only, not a run-wide abort (#845).
 
@@ -609,14 +637,12 @@ class IdentifyFeatureGroupClass:
         # Shallow copies, taken per candidate so an earlier match's write survives a later candidate's raise.
         group_before = dict(feature.options.group)
         context_before = dict(feature.options.context)
+        non_forwarded_before = feature.options.non_forwarded_group_keys
         probe = probe_match_criteria(feature_group, feature.name, feature.options, data_access_collection)
         if probe.matcher_error is not None or probe.value_rejection is not None:
             # Only the contained branch rolls back: a matcher that returns True keeps its write,
             # which is how a matched reader is linked through mloda.
-            feature.options.group.clear()
-            feature.options.group.update(group_before)
-            feature.options.context.clear()
-            feature.options.context.update(context_before)
+            self._restore_options(feature, group_before, context_before, non_forwarded_before)
         if probe.value_rejection is not None:
             exc = probe.value_rejection
             # Text, not exc: a retained record must not pin the traceback, its frames and the plugin class.
@@ -695,8 +721,8 @@ class IdentifyFeatureGroupClass:
 def evaluate_and_render(
     feature: Feature,
     accessible_plugins: FeatureGroupEnvironmentMapping,
-    links: Optional[set[Link]] = None,
-    data_access_collection: Optional[DataAccessCollection] = None,
+    links: set[Link] | None = None,
+    data_access_collection: DataAccessCollection | None = None,
 ) -> tuple[EvaluationResult, str | None]:
     """One resolution pass plus its failure message; the message is None iff the feature resolved."""
     # Unguarded: ComputeFrameworkPinError is a misuse validated before matching, so it escapes unconverted.
@@ -707,8 +733,8 @@ def evaluate_and_render(
 def resolve_or_raise(
     feature: Feature,
     accessible_plugins: FeatureGroupEnvironmentMapping,
-    links: Optional[set[Link]] = None,
-    data_access_collection: Optional[DataAccessCollection] = None,
+    links: set[Link] | None = None,
+    data_access_collection: DataAccessCollection | None = None,
     partial_records: Sequence[ResolutionRecord] = (),
 ) -> EvaluationResult:
     """Evaluate one feature and raise the typed FeatureResolutionError on failure."""

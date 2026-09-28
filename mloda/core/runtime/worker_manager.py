@@ -6,10 +6,10 @@ import threading
 import time
 import logging
 from multiprocessing.process import BaseProcess
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from uuid import UUID
 
-from mloda.core.runtime.mp_context import mp_spawn_context
+from mloda.core.runtime.mp_context import mp_spawn_context, spawn_daemon_process
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +36,18 @@ class WorkerManager:
     def create_worker_process(
         self, cfw_uuid: UUID, target: Callable[..., None], args: tuple[Any, ...]
     ) -> tuple[Any, Any, Any]:
-        """Create worker process with command and result queues."""
+        """Create worker process with command and result queues.
+
+        Appends a zero-based worker_index as a trailing positional arg to the target.
+        """
         ctx = mp_spawn_context()
         command_queue: multiprocessing.Queue[Any] = ctx.Queue()
         result_queue: multiprocessing.Queue[Any] = ctx.Queue()
 
-        process = ctx.Process(target=target, args=(command_queue, result_queue, *args))
+        worker_index = len(self.process_register)
+        # As a side effect of daemon=True, code running inside a worker cannot itself
+        # spawn multiprocessing children (Python raises on that).
+        process = spawn_daemon_process(ctx, target, (command_queue, result_queue, *args, worker_index))
 
         self.process_register[cfw_uuid] = (process, command_queue, result_queue)
         self.result_queues_collection.add(result_queue)
@@ -50,7 +56,7 @@ class WorkerManager:
 
         return process, command_queue, result_queue
 
-    def get_process_queues(self, cfw_uuid: UUID) -> Optional[tuple[Any, Any, Any]]:
+    def get_process_queues(self, cfw_uuid: UUID) -> tuple[Any, Any, Any] | None:
         """Return registered tuple or None."""
         return self.process_register.get(cfw_uuid)
 
@@ -63,17 +69,18 @@ class WorkerManager:
         command_queue.put(command)
 
     def poll_result_queues(self) -> None:
-        """Non-blocking poll all result queues, collect step-UUID strings.
-
-        The result queue also carries ("DROP_COMPLETE", cfw_uuid) control tuples;
-        skip non-str messages rather than pass them to UUID().
-        """
+        """Non-blocking poll of all result queues; collects step-UUID strings. Drains each queue to
+        empty per call; a message still in flight through the queue's feeder thread may not appear
+        until a later poll."""
         for r_queue in self.result_queues_collection:
-            try:
-                msg = r_queue.get(block=False)
-            except queue.Empty:
-                continue
-            if isinstance(msg, str):
+            # Safe to drain unbounded: a worker puts at most one step-uuid per step command it
+            # processes, so a queue's backlog is bounded by commands already dispatched to that
+            # worker, never unbounded.
+            while True:
+                try:
+                    msg = r_queue.get(block=False)
+                except queue.Empty:
+                    break
                 self.result_uuids_collection.add(UUID(msg))
 
     def record_assignment(self, cfw_uuid: UUID, step_uuids: set[UUID]) -> None:
@@ -116,21 +123,24 @@ class WorkerManager:
         """Return step_uuid in result_uuids_collection."""
         return step_uuid in self.result_uuids_collection
 
-    def wait_for_drop_completion(self, result_queue: Any, cfw_uuid: UUID, timeout: float = 5.0) -> None:
-        """Poll queue until ("DROP_COMPLETE", cfw_uuid) received or timeout."""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+    def join_all(self, graceful_timeout: float = 2.0) -> None:
+        """Sends STOP to alive workers and waits up to graceful_timeout for them to exit
+        (running their close() teardown) before terminating any that remain. Raises an
+        Exception if any task fails to join or terminate."""
+        for process, command_queue, _ in self.process_register.values():
             try:
-                msg = result_queue.get(block=False)
-                if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "DROP_COMPLETE" and msg[1] == cfw_uuid:
-                    return
-                result_queue.put(msg, block=False)
-            except queue.Empty:
-                time.sleep(0.001)
-        logger.warning(f"Drop operation for CFW {cfw_uuid} timed out after {timeout}s")
+                if process.is_alive():
+                    command_queue.put("STOP", block=False)
+            except Exception as e:
+                logger.error(f"Error sending graceful STOP: {e}")
 
-    def join_all(self) -> None:
-        """Terminate processes (not threads), join all tasks, raise Exception if any fail."""
+        deadline = time.time() + graceful_timeout
+        for process, _, _ in self.process_register.values():
+            try:
+                process.join(timeout=max(0.0, deadline - time.time()))
+            except Exception as e:
+                logger.error(f"Error joining process during graceful shutdown: {e}")
+
         failures: list[str] = []
         for task in self.tasks:
             try:

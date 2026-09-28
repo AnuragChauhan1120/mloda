@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any
 import pytest
 from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_framework import DuckDBFramework
 from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_relation import DuckdbRelation
@@ -12,6 +13,9 @@ from tests.test_plugins.compute_framework.test_tooling.availability_test_helper 
 )
 from tests.test_plugins.compute_framework.base_implementations.datatype_validator_test_mixin import (
     DataTypeValidatorFrameworkTestMixin,
+)
+from tests.test_plugins.compute_framework.base_implementations.dict_interchange_output_schema_test_mixin import (
+    DictInterchangeOutputSchemaTestMixin,
 )
 from tests.test_plugins.compute_framework.base_implementations.dtype_extraction_test_mixin import (
     DtypeExtractionTestMixin,
@@ -251,7 +255,7 @@ class TestDuckDBFrameworkMerge(DataFrameTestBase):
         arrow_table = pa.Table.from_pydict(data)
         return DuckdbRelation.from_arrow(self.conn, arrow_table)
 
-    def get_connection(self) -> Optional[Any]:
+    def get_connection(self) -> Any | None:
         """Return DuckDB connection object."""
         return self.conn
 
@@ -287,6 +291,20 @@ class TestDuckDBDtypeExtraction(DtypeExtractionTestMixin):
             {"int_col": [1, 2, 3], "str_col": ["a", "b", "c"], "float_col": [1.0, 2.0, 3.0]}
         )
         return DuckdbRelation.from_arrow(connection, arrow_table)
+
+    @pytest.fixture
+    def decimal_sample_data(self, connection: Any) -> Any:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+        return DuckdbRelation.from_arrow(connection, pa.table({"d": pa.array(values, type=pa.decimal128(10, 2))}))
+
+
+@pytest.mark.skipif(duckdb is None, reason="DuckDB is not installed. Skipping this test.")
+class TestDuckDBDictInterchangeOutputSchema(DictInterchangeOutputSchemaTestMixin):
+    """Test DuckDBFramework._output_schema on the dict interchange shape using shared mixin."""
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return DuckDBFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
 
 
 @pytest.mark.skipif(duckdb is None, reason="DuckDB is not installed. Skipping this test.")

@@ -4,10 +4,12 @@ from dataclasses import FrozenInstanceError, dataclass
 from datetime import timedelta
 from enum import Enum
 from uuid import uuid4
-from typing import Any, ClassVar, Literal, Optional
+from typing import Any, ClassVar, Literal
 
 
+from mloda.core.abstract_plugins.components.hashable_dict import _deep_hashable
 from mloda.core.abstract_plugins.components.index.index import Index
+from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.components.validators.link_validator import LinkValidator
 
 
@@ -247,9 +249,9 @@ class Link:
         jointype: JoinType | str,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
-        asof_config: Optional[AsOfJoinConfig] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
+        asof_config: AsOfJoinConfig | None = None,
     ) -> None:
         self.jointype = JoinType(jointype) if isinstance(jointype, str) else jointype
         self.left_feature_group = left.feature_group
@@ -271,8 +273,8 @@ class Link:
         jointype: JoinType,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]],
-        right_discriminator: Optional[dict[str, Any]],
+        left_discriminator: dict[str, Any] | None,
+        right_discriminator: dict[str, Any] | None,
     ) -> "Link":
         return cls(
             jointype, left, right, left_discriminator=left_discriminator, right_discriminator=right_discriminator
@@ -286,8 +288,8 @@ class Link:
         right: type[Any],
         left_index: int,
         right_index: int,
-        left_discriminator: Optional[dict[str, Any]],
-        right_discriminator: Optional[dict[str, Any]],
+        left_discriminator: dict[str, Any] | None,
+        right_discriminator: dict[str, Any] | None,
     ) -> "Link":
         left_idx = _get_index_from_feature_group(left, left_index, "left")
         right_idx = _get_index_from_feature_group(right, right_index, "right")
@@ -304,8 +306,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.INNER, left, right, left_discriminator, right_discriminator)
 
@@ -314,8 +316,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.LEFT, left, right, left_discriminator, right_discriminator)
 
@@ -324,8 +326,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.RIGHT, left, right, left_discriminator, right_discriminator)
 
@@ -334,8 +336,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.OUTER, left, right, left_discriminator, right_discriminator)
 
@@ -344,8 +346,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.APPEND, left, right, left_discriminator, right_discriminator)
 
@@ -354,8 +356,8 @@ class Link:
         cls,
         left: JoinSpec,
         right: JoinSpec,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         return cls._from_specs(JoinType.UNION, left, right, left_discriminator, right_discriminator)
 
@@ -366,8 +368,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create INNER join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -421,8 +423,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create LEFT join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -436,8 +438,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create RIGHT join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -451,8 +453,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create OUTER join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -466,8 +468,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create APPEND join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -481,8 +483,8 @@ class Link:
         right: type[Any],
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create UNION join using feature groups' index_columns()."""
         return cls._from_feature_groups(
@@ -501,8 +503,8 @@ class Link:
         tolerance: float | int | timedelta | None = None,
         allow_exact_matches: bool = True,
         coerce_time_columns: bool = False,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create an ASOF (point-in-time) join from explicit JoinSpecs."""
         config = AsOfJoinConfig(
@@ -536,8 +538,8 @@ class Link:
         coerce_time_columns: bool = False,
         left_index: int = 0,
         right_index: int = 0,
-        left_discriminator: Optional[dict[str, Any]] = None,
-        right_discriminator: Optional[dict[str, Any]] = None,
+        left_discriminator: dict[str, Any] | None = None,
+        right_discriminator: dict[str, Any] | None = None,
     ) -> "Link":
         """Create an ASOF join, deriving the by-key Index from index_columns()."""
         left_idx = _get_index_from_feature_group(left, left_index, "left")
@@ -589,6 +591,14 @@ class Link:
             other_left_feature_group, other_right_feature_group
         )
 
+    @staticmethod
+    def matches_discriminator(discriminator: dict[str, Any], options: Options) -> bool:
+        """Whether every discriminator key-value pair is present and equal in options."""
+        for dk, dv in discriminator.items():
+            if dk not in options or options.get(dk) != dv:
+                return False
+        return True
+
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Link):
             return False
@@ -599,6 +609,8 @@ class Link:
             and self.left_index == other.left_index
             and self.right_index == other.right_index
             and self.asof_config == other.asof_config
+            and self.left_discriminator == other.left_discriminator
+            and self.right_discriminator == other.right_discriminator
         )
 
     def __hash__(self) -> int:
@@ -610,5 +622,7 @@ class Link:
                 self.left_index,
                 self.right_index,
                 self.asof_config,
+                _deep_hashable(self.left_discriminator),
+                _deep_hashable(self.right_discriminator),
             )
         )

@@ -1,0 +1,341 @@
+"""Proves ExecutionOrchestrator keeps the caller's function_extender objects, not independent
+unpickled copies, across ComputeFrameworks built in the parent process, but only for frameworks
+that themselves resolve to a non-MULTIPROCESSING mode. A framework resolved to MULTIPROCESSING is
+dispatched to a spawned worker via Process(args=(cfw_register, cfw, from_cfw)), which pickles it;
+it must keep a pending, still-pickled snapshot taken once at run entry, materialized only once the
+worker actually unpickles it (ComputeFramework.__setstate__), so an in-parent mutation of the
+shared object (e.g. an extender lazily building an unpicklable handle) can never poison it.
+
+Drives ExecutionOrchestrator.__enter__ and ComputeFrameworkExecutor.init_compute_framework directly
+(real machinery, no mocks), for precise control over which mode each individual framework resolves
+to. test_extender_handle_survives_multiprocessing_run_e2e.py covers the same guarantee through a
+real mlodaAPI run, where an ExtenderHook's __call__ does fire in-parent for a step whose compute
+framework resolves to a non-MULTIPROCESSING mode. The run-complete cases at the end check that the
+caller's own object, not a worker's copy, is notified in the parent."""
+
+from __future__ import annotations
+
+import os
+import pickle  # nosec B403
+import threading
+import time
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+
+from mloda.core.abstract_plugins.function_extender import Extender, ExtenderHook
+from mloda.core.prepare.execution_plan import ExecutionPlan
+from mloda.core.runtime.run import ExecutionOrchestrator
+from mloda.provider import BaseInputData, ComputeFramework, DataCreator, FeatureGroup, FeatureSet
+from mloda.user import Feature, ParallelizationMode, PluginCollector, mloda
+from mloda_plugins.compute_framework.base_implementations.python_dict.python_dict_framework import PythonDictFramework
+
+
+class _CountingExtender(Extender):
+    """Plain instance state (a counter), incremented directly in the test, not via __call__:
+    proves shared identity through mutation-visibility, not merely two objects that started equal."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+class _HandleHoldingExtender(Extender):
+    """Simulates the documented pattern of lazily building a runtime handle inside __call__:
+    `handle` starts None (picklable) and is later set to something pickle cannot handle."""
+
+    def __init__(self) -> None:
+        self.handle: Any = None
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+class _HandleStrippingExtender(Extender):
+    """A live, unpicklable handle held from construction, stripped in __getstate__, so pickling
+    this instance always succeeds regardless of when it runs."""
+
+    def __init__(self) -> None:
+        self.handle: Any = threading.Lock()
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["handle"] = None
+        return state
+
+
+def _empty_plan() -> ExecutionPlan:
+    plan = ExecutionPlan()
+    plan.execution_plan = []
+    return plan
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING])
+class TestExtenderIdentityAcrossFrameworksBuiltInTheParent:
+    def test_same_extender_object_is_used_to_construct_every_framework(self, mode: ParallelizationMode) -> None:
+        extender = _CountingExtender()
+        caller_function_extender: set[Extender] = {extender}
+
+        orchestrator = ExecutionOrchestrator(_empty_plan())
+        orchestrator.__enter__({mode}, caller_function_extender)
+        try:
+            orchestrator._init_run()
+
+            uuid_one = orchestrator.executor.init_compute_framework(PythonDictFramework, mode, set(), uuid4())
+            uuid_two = orchestrator.executor.init_compute_framework(PythonDictFramework, mode, set(), uuid4())
+
+            cfw_one = orchestrator.executor.cfw_collection[uuid_one]
+            cfw_two = orchestrator.executor.cfw_collection[uuid_two]
+
+            extender_on_one = next(iter(cfw_one.function_extender))
+            extender_on_two = next(iter(cfw_two.function_extender))
+
+            # Identity, not equality: two independently-unpickled copies are never `is` each
+            # other nor `is` the object the caller passed in, even though both start empty.
+            assert extender_on_one is extender, "framework one must be built with the caller's own extender object"
+            assert extender_on_two is extender, "framework two must be built with the caller's own extender object"
+            assert extender_on_one is extender_on_two, "both frameworks must share the identical extender object"
+
+            # Mutation-visibility: only possible if it is the same object, not copies that
+            # merely started from the same initial state.
+            extender_on_one.calls += 1
+            assert extender_on_two.calls == 1, "a mutation via one framework's extender must be visible via the other's"
+        finally:
+            orchestrator.__exit__(None, None, None)
+
+
+@pytest.mark.timeout(30)
+class TestExtenderIdentityNotSharedWithMultiprocessingResolvedFramework:
+    """A mixed run (overall MULTIPROCESSING-enabled, real manager/register) must still give
+    in-parent-resident frameworks the caller's shared extender, while a framework resolved to
+    MULTIPROCESSING (worker-bound) only carries a still-pickled snapshot (_pending_extender_payload),
+    never a copy already unpickled in the parent, so it cannot be poisoned by another framework's
+    later in-parent mutation of the shared object."""
+
+    def test_parent_resident_shares_identity_worker_bound_defers_the_pending_payload(self) -> None:
+        extender = _HandleHoldingExtender()
+        caller_function_extender: set[Extender] = {extender}
+
+        orchestrator = ExecutionOrchestrator(_empty_plan())
+        # A real manager/proxy is constructed here because MULTIPROCESSING is in the register modes.
+        orchestrator.__enter__({ParallelizationMode.MULTIPROCESSING}, caller_function_extender)
+        try:
+            orchestrator._init_run()
+
+            parent_resident_uuid = orchestrator.executor.init_compute_framework(
+                PythonDictFramework, ParallelizationMode.SYNC, set(), uuid4()
+            )
+            worker_bound_uuid = orchestrator.executor.init_compute_framework(
+                PythonDictFramework, ParallelizationMode.MULTIPROCESSING, set(), uuid4()
+            )
+
+            parent_resident_cfw = orchestrator.executor.cfw_collection[parent_resident_uuid]
+            worker_bound_cfw = orchestrator.executor.cfw_collection[worker_bound_uuid]
+
+            parent_resident_extender = next(iter(parent_resident_cfw.function_extender))
+
+            assert parent_resident_extender is extender, (
+                "a framework resolved to a non-MULTIPROCESSING mode must still share the caller's "
+                "real extender object, even inside a MULTIPROCESSING-enabled run"
+            )
+            assert worker_bound_cfw.function_extender == set(), (
+                "a framework resolved to MULTIPROCESSING must not have its extender materialized "
+                "in the parent; it must stay an empty set until the worker unpickles it"
+            )
+            assert worker_bound_cfw._pending_extender_payload is not None, (
+                "the worker-bound framework must carry the still-pickled snapshot, materialized "
+                "only by ComputeFramework.__setstate__ once the worker actually unpickles it"
+            )
+
+            # Simulate a hook that lazily built an unpicklable handle on the shared object, mutating
+            # it only after both frameworks were already constructed.
+            extender.handle = threading.Lock()
+
+            # This is what Process(args=...) would pickle to dispatch the worker-bound framework.
+            # It must succeed: the pending payload was snapshotted before the later mutation of the
+            # caller's shared object, and is never touched here in the parent.
+            pickle.dumps(worker_bound_cfw)
+        finally:
+            orchestrator.__exit__(None, None, None)
+
+
+@pytest.mark.timeout(30)
+class TestHandleStrippingExtenderNeverLosesStateToTheRegisterProxy:
+    """Parent-resident construction keeps the caller's own extender and its live handle;
+    MULTIPROCESSING-resolved construction only attaches the still-pickled snapshot as
+    _pending_extender_payload, never a fetch through the register/proxy."""
+
+    def test_parent_resident_keeps_live_handle_and_multiprocessing_never_asks_the_register_proxy(self) -> None:
+        extender = _HandleStrippingExtender()
+        live_handle = extender.handle
+        caller_function_extender: set[Extender] = {extender}
+
+        orchestrator = ExecutionOrchestrator(_empty_plan())
+        orchestrator.__enter__({ParallelizationMode.MULTIPROCESSING}, caller_function_extender)
+        try:
+            orchestrator._init_run()
+
+            parent_resident_uuid = orchestrator.executor.init_compute_framework(
+                PythonDictFramework, ParallelizationMode.SYNC, set(), uuid4()
+            )
+            parent_resident_cfw = orchestrator.executor.cfw_collection[parent_resident_uuid]
+            parent_resident_extender = next(iter(parent_resident_cfw.function_extender))
+
+            assert parent_resident_extender is extender, "must be the caller's own extender object"
+            assert parent_resident_extender.handle is live_handle, (
+                "a parent-resident framework must never receive a proxy-fetched copy of the "
+                "caller's own extender: that round trip would silently strip the live handle"
+            )
+
+            # Builds successfully without reaching for cfw_register.get_function_extender(), a
+            # method the register no longer has: attaching worker_extender_payload as the pending
+            # payload is the only path, materialized later in the worker, never here.
+            orchestrator.executor.init_compute_framework(
+                PythonDictFramework, ParallelizationMode.MULTIPROCESSING, set(), uuid4()
+            )
+        finally:
+            orchestrator.__exit__(None, None, None)
+
+
+_RUN_COMPLETE_COLUMN = "run_complete_notification_e2e_col"
+
+
+class _RunCompleteFeatureGroup(FeatureGroup):
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({_RUN_COMPLETE_COLUMN})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PythonDictFramework}
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        return {_RUN_COMPLETE_COLUMN: [1, 2, 3]}
+
+
+_RUN_COMPLETE_ENABLED = PluginCollector.enabled_feature_groups({_RunCompleteFeatureGroup})
+
+
+class _RunCompleteProbeExtender(Extender):
+    """Records (run_id, pid, sentinel_exists) in the caller's own object; close() runs only in a worker's copy."""
+
+    def __init__(self, sentinel_path: Path, close_delay: float = 0.0) -> None:
+        self._sentinel_path = sentinel_path
+        self._close_delay = close_delay
+        self.completions: list[tuple[str | None, int, bool]] = []
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    def close(self) -> None:
+        time.sleep(self._close_delay)
+        self._sentinel_path.write_text("closed")
+
+    def on_run_complete(self, run_id: str | None) -> None:
+        self.completions.append((run_id, os.getpid(), self._sentinel_path.exists()))
+
+
+def _prepare_run_complete_session(mode: ParallelizationMode) -> mloda:
+    return mloda.prepare(
+        [Feature(name=_RUN_COMPLETE_COLUMN)],
+        compute_frameworks=["PythonDictFramework"],
+        plugin_collector=_RUN_COMPLETE_ENABLED,
+        parallelization_modes={mode},
+    )
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING, ParallelizationMode.MULTIPROCESSING]
+)
+class TestRunCompleteNotifiesTheCallersOwnExtenderInTheParent:
+    def test_notified_once_in_the_parent_with_the_session_run_id(
+        self, mode: ParallelizationMode, tmp_path: Path, flight_server: Any
+    ) -> None:
+        probe = _RunCompleteProbeExtender(tmp_path / "closed.txt")
+        session = _prepare_run_complete_session(mode)
+
+        session.run(parallelization_modes={mode}, function_extender={probe}, flight_server=flight_server)
+
+        assert [(run_id, pid) for run_id, pid, _ in probe.completions] == [(session.run_id, os.getpid())]
+
+    def test_running_the_session_twice_notifies_twice_with_the_same_run_id(
+        self, mode: ParallelizationMode, tmp_path: Path, flight_server: Any
+    ) -> None:
+        probe = _RunCompleteProbeExtender(tmp_path / "closed.txt")
+        session = _prepare_run_complete_session(mode)
+
+        session.run(parallelization_modes={mode}, function_extender={probe}, flight_server=flight_server)
+        session.run(parallelization_modes={mode}, function_extender={probe}, flight_server=flight_server)
+
+        assert [run_id for run_id, _, _ in probe.completions] == [session.run_id, session.run_id]
+
+
+@pytest.mark.timeout(30)
+class TestRunCompleteFiresAfterAMultiprocessingWorkerClosedItsExtender:
+    def test_worker_close_sentinel_already_exists_when_the_parent_is_notified(
+        self, tmp_path: Path, flight_server: Any
+    ) -> None:
+        probe = _RunCompleteProbeExtender(tmp_path / "closed.txt", close_delay=0.5)
+        session = _prepare_run_complete_session(ParallelizationMode.MULTIPROCESSING)
+
+        session.run(
+            parallelization_modes={ParallelizationMode.MULTIPROCESSING},
+            function_extender={probe},
+            flight_server=flight_server,
+            graceful_shutdown_timeout=5.0,
+        )
+
+        assert [sentinel_seen for _, _, sentinel_seen in probe.completions] == [True]
+
+
+class _UnpicklableExtender(Extender):
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+
+    def wraps(self) -> set[ExtenderHook]:
+        return set()
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+
+@pytest.mark.timeout(30)
+class TestRunCompleteFiresWhenSetupFails:
+    @pytest.mark.parametrize("call_site", ["run", "stream_run"])
+    def test_multiprocessing_preflight_rejection_notifies_the_probe_once_in_the_parent(
+        self, call_site: str, tmp_path: Path
+    ) -> None:
+        probe = _RunCompleteProbeExtender(tmp_path / "closed.txt")
+        session = _prepare_run_complete_session(ParallelizationMode.MULTIPROCESSING)
+
+        with pytest.raises(ValueError, match="cannot be pickled"):
+            list(
+                getattr(session, call_site)(
+                    parallelization_modes={ParallelizationMode.MULTIPROCESSING},
+                    function_extender={probe, _UnpicklableExtender()},
+                )
+            )
+
+        assert [(run_id, pid) for run_id, pid, _ in probe.completions] == [(session.run_id, os.getpid())]

@@ -20,12 +20,14 @@ VOCABULARY_HINT = (
 )
 
 # Repo-relative doc path -> permitted number of ```py blocks. An absent file permits zero.
+# Adding a ```py block to a docs/docs page means raising its entry here (see CONTRIBUTING.md).
 ILLUSTRATIVE_BLOCK_ALLOWLIST: dict[str, int] = {
     "docs/docs/chapter1/api-request.md": 1,
     "docs/docs/chapter1/compute-frameworks.md": 4,
+    "docs/docs/chapter1/extender.md": 1,
     "docs/docs/in_depth/access-feature-data.md": 5,
     "docs/docs/in_depth/artifacts.md": 1,
-    "docs/docs/in_depth/compute-framework-integration.md": 12,
+    "docs/docs/in_depth/compute-framework-integration.md": 8,
     "docs/docs/in_depth/data-access-patterns.md": 7,
     "docs/docs/in_depth/discover-plugins.md": 1,
     "docs/docs/in_depth/feature-chain-parser.md": 16,
@@ -36,7 +38,7 @@ ILLUSTRATIVE_BLOCK_ALLOWLIST: dict[str, int] = {
     "docs/docs/in_depth/join_data.md": 4,
     "docs/docs/in_depth/multiple_result_columns.md": 5,
     "docs/docs/in_depth/named-data-access-handles.md": 4,
-    "docs/docs/in_depth/plugin-loader.md": 1,
+    "docs/docs/in_depth/plugin-loader.md": 2,
     "docs/docs/in_depth/plugin_registry.md": 1,
     "docs/docs/in_depth/property-mapping.md": 4,
     "docs/docs/in_depth/troubleshooting/feature-group-resolution-errors.md": 3,

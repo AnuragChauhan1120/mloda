@@ -1,14 +1,17 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Optional, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 from uuid import UUID
 
 from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
+from mloda.core.abstract_plugins.components.input_data.base_input_data import RESERVED_READER_OPTION_KEY
+from mloda.core.abstract_plugins.components.options import Options, _safe_deepcopy
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
 from mloda.core.core.step.join_step import JoinStep
 from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
 
 if TYPE_CHECKING:
+    from mloda.core.abstract_plugins.components.input_data.base_input_data import BaseInputData
     from mloda.core.abstract_plugins.compute_framework import ComputeFramework
     from mloda.core.abstract_plugins.feature_group import FeatureGroup
     from mloda.core.prepare.resolved_join import ResolvedJoin, ResolvedJoinPlan
@@ -26,6 +29,10 @@ class PlanStep:
     engine-injected/dependency remainder; both are empty for join and transform steps.
     The split is name-based, so a name that is both user-requested and engine-injected within
     one step counts as requested only.
+    ``input_feature_names`` holds the sorted, deduplicated names the feature group declares as
+    input; it is empty for a root step and for join and transform steps. It is the prepare-time twin
+    of the run-time ``HookContext.input_features``, which ``ComputeFramework._build_hook_context``
+    fills from the same FeatureSet attribute.
     ``source_*`` and ``join_type`` are None.
 
     transform: ``feature_group``/``compute_framework`` are the destination, ``source_*`` the origin.
@@ -46,40 +53,52 @@ class PlanStep:
     ``declared_right_frameworks`` are the classes each declared side's parent features declared as
     candidates, sorted by class name; ``()`` when no resolved join plan is given, or when the plan
     recorded no candidates for that side. APPEND/UNION sides carry only the index-bearing parent.
+
+    ``feature_set_options`` is a compute step's group-only, deep-copied snapshot of ``FeatureSet.options``,
+    and ``step_uuid`` its ``FeatureGroupStep.uuid``, the key ``RunResult.frames()`` pairs frames by; both
+    are None for join/transform steps and, like ``join_token``, excluded from equality.
+    ``input_feature_edges`` maps each output feature name to its declared inputs (injected features absent);
+    it participates in equality but is excluded from hashing.
+
+    ``reader_data_access`` is a derived property reading the (reader class, data access) pair from group options.
     """
 
     step_kind: Literal["compute", "join", "transform"]
     feature_names: tuple[str, ...]
-    feature_group: Optional[type["FeatureGroup"]]
-    compute_framework: Optional[type["ComputeFramework"]]
-    source_feature_group: Optional[type["FeatureGroup"]]
-    source_compute_framework: Optional[type["ComputeFramework"]]
-    join_type: Optional[str] = None
+    feature_group: type["FeatureGroup"] | None
+    compute_framework: type["ComputeFramework"] | None
+    source_feature_group: type["FeatureGroup"] | None
+    source_compute_framework: type["ComputeFramework"] | None
+    join_type: str | None = None
     requested_feature_names: tuple[str, ...] = ()
     injected_feature_names: tuple[str, ...] = ()
-    join_destination_side: Optional[Literal["left", "right"]] = None
-    join_token: Optional[UUID] = field(default=None, compare=False)
+    input_feature_names: tuple[str, ...] = ()
+    join_destination_side: Literal["left", "right"] | None = None
+    join_token: UUID | None = field(default=None, compare=False)
     declared_left_frameworks: tuple[type["ComputeFramework"], ...] = ()
     declared_right_frameworks: tuple[type["ComputeFramework"], ...] = ()
+    feature_set_options: Options | None = field(default=None, compare=False)
+    step_uuid: UUID | None = field(default=None, compare=False)
+    input_feature_edges: Mapping[str, tuple[str, ...]] = field(default_factory=dict, hash=False)
 
     @property
-    def feature_group_name(self) -> Optional[str]:
+    def feature_group_name(self) -> str | None:
         return None if self.feature_group is None else self.feature_group.get_class_name()
 
     @property
-    def compute_framework_name(self) -> Optional[str]:
+    def compute_framework_name(self) -> str | None:
         return None if self.compute_framework is None else self.compute_framework.get_class_name()
 
     @property
-    def source_feature_group_name(self) -> Optional[str]:
+    def source_feature_group_name(self) -> str | None:
         return None if self.source_feature_group is None else self.source_feature_group.get_class_name()
 
     @property
-    def source_compute_framework_name(self) -> Optional[str]:
+    def source_compute_framework_name(self) -> str | None:
         return None if self.source_compute_framework is None else self.source_compute_framework.get_class_name()
 
     @property
-    def join_inverted(self) -> Optional[bool]:
+    def join_inverted(self) -> bool | None:
         return None if self.join_destination_side is None else self.join_destination_side == "right"
 
     @property
@@ -90,10 +109,16 @@ class PlanStep:
     def declared_right_framework_names(self) -> tuple[str, ...]:
         return tuple(framework.get_class_name() for framework in self.declared_right_frameworks)
 
+    @property
+    def reader_data_access(self) -> tuple[type["BaseInputData"], Any] | None:
+        return (
+            None if self.feature_set_options is None else self.feature_set_options.group.get(RESERVED_READER_OPTION_KEY)
+        )
+
 
 def build_plan_steps(
     execution_plan: Iterable[TransformFrameworkStep | JoinStep | FeatureGroupStep],
-    resolved_join_plan: Optional["ResolvedJoinPlan"] = None,
+    resolved_join_plan: "ResolvedJoinPlan | None" = None,
 ) -> list[PlanStep]:
     """Map the steps of an ExecutionPlan onto PlanStep records, in execution-plan order.
 
@@ -112,6 +137,8 @@ def build_plan_steps(
             feature_names = tuple(str(name) for name in step.features.get_all_names())
             requested = tuple(sorted(str(name) for name in step.features.get_initial_requested_features()))
             injected = tuple(sorted(set(feature_names) - set(requested)))
+            declared = step.features.declared_input_feature_names
+            input_feature_names = tuple(sorted(declared)) if declared else ()
             plan.append(
                 PlanStep(
                     step_kind="compute",
@@ -122,6 +149,19 @@ def build_plan_steps(
                     source_compute_framework=None,
                     requested_feature_names=requested,
                     injected_feature_names=injected,
+                    input_feature_names=input_feature_names,
+                    feature_set_options=(
+                        Options(
+                            group={key: _safe_deepcopy(value, {}) for key, value in step.features.options.group.items()}
+                        )
+                        if step.features.options is not None
+                        else None
+                    ),
+                    step_uuid=step.uuid,
+                    input_feature_edges={
+                        name: tuple(sorted(inputs))
+                        for name, inputs in (step.features.declared_input_feature_edges or {}).items()
+                    },
                 )
             )
         elif isinstance(step, TransformFrameworkStep):

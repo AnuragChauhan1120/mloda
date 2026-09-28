@@ -13,7 +13,7 @@ for result in mloda.stream_all(
     print(result)
 ```
 
-`stream_all` returns a `ResultStream`: it iterates exactly like the old generator and additionally exposes a `.plan` property with the resolved execution plan. Planning happens eagerly, so an unresolvable request raises at the `stream_all` call, not at first iteration.
+`stream_all` returns a `ResultStream`: it iterates exactly like the old generator and additionally exposes a `.plan` property with the resolved execution plan. Planning happens eagerly, so an unresolvable request raises at the `stream_all` call, not at first iteration. `ResultStream.frames()` yields `(PlanStep, frame)` pairs from the same stream instead, pairing each frame with the compute step that produced it.
 
 ## Comparison with `run_all`
 
@@ -46,7 +46,7 @@ for result in mloda.stream_all(
     process(result)
 ```
 
-Both produce the same data: `list(mloda.stream_all(...))` is equivalent to `mloda.run_all(...)`.
+Both produce the same elements, but `stream_all` yields in completion order while `run_all`'s list follows plan order (positions can differ under THREADING/MULTIPROCESSING).
 
 ## What "streaming" means here
 

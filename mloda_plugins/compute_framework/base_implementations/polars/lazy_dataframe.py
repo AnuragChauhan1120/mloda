@@ -1,6 +1,7 @@
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 from mloda.core.abstract_plugins.components.data_types import DataType
+from mloda.core.abstract_plugins.hook_context import OutputSchema
 from mloda.user import FeatureName
 from mloda_plugins.compute_framework.base_implementations.polars.dataframe import PolarsDataFrame
 from mloda.provider import BaseMergeEngine, BaseMaskEngine
@@ -39,8 +40,8 @@ class PolarsLazyDataFrame(PolarsDataFrame):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         column_names = set(data.collect_schema().names())
         _selected_feature_names = self.identify_naming_convention(
@@ -59,11 +60,24 @@ class PolarsLazyDataFrame(PolarsDataFrame):
             return str(schema[column_name])
         return None
 
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         schema = data.collect_schema()
         if column_name not in schema.names():
             return None
         return PolarsDataFrame._polars_type_to_data_type(schema[column_name])
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read collect_schema() once and build the sorted (name, dtype) pairs from it directly.
+
+        The dict interchange shape reaches this method before transform() normalizes it, so it
+        must be handled before collect_schema() is called.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        schema = data.collect_schema()
+        if not schema:
+            return None
+        return tuple((name, str(dtype)) for name, dtype in sorted(schema.items(), key=lambda pair: pair[0]))
 
     @classmethod
     def pl_lazy_frame(cls) -> Any:

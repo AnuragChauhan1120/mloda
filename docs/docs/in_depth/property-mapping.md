@@ -37,6 +37,7 @@ PROPERTY_MAPPING = {
 | `strict_validation` | `bool` | `False` | Enforce the value space at match time. |
 | `element_validator` | `Callable \| None` | `None` | Per-element predicate. Requires `strict_validation=True`. |
 | `match_guard` | `Callable \| None` | `None` | Whole-value predicate. A falsy return is a non-match. |
+| `expected` | `str \| None` | `None` | What the `match_guard` accepts, as a phrase completing "must be ...". Makes a guard rejection a reported reason on a non-strict spec. Requires `match_guard`. |
 | `required_when` | `Callable \| None` | `None` | `(Options) -> bool`: the key is required only when it returns truthy. |
 | `allow_explicit_none` | `bool` | `False` | Opt-in so an explicit `None` is honored (not treated as absent) and flows through validation. |
 | `deferred_binding` | `bool` | `False` | Exempts a required key from the string-named path presence check only; its value is bound outside match-time name capture. Not optionality: the key stays required on the config path. See [Required presence on the string-named path](#required-presence-on-the-string-named-path). |
@@ -46,7 +47,8 @@ same fields, its keyword is `strict=` (which sets `strict_validation`), and it k
 declaration readable. `PropertySpec` is the lower-level form: it is the type the builder
 returns and the type the schema is validated against, so reach for it directly when you need
 the class itself (subclassing, `isinstance` checks, or constructing a spec programmatically).
-Both are exported from `mloda.provider`.
+The builder does not accept `framework_set` or `scalar_only`; a spec needing those must be
+constructed as `PropertySpec(...)` directly. Both are exported from `mloda.provider`.
 
 ```python
 from mloda.provider import property_spec
@@ -71,16 +73,17 @@ does not understand can be absorbed silently.
 | Moment | Mechanism | Checks | Receives | On failure |
 | --- | --- | --- | --- | --- |
 | Author time | `mypy --strict` | The field exists and its declared type fits: `strict_validaton=True` (typo), `strict_validation=1`, `allowed_values=5` | The constructor call | mypy error at the spec literal. Without mypy: an unknown field is a `TypeError`; a wrong type falls through to the row below |
-| Construction (`PropertySpec(...)`) | `__post_init__` | `allowed_values` is not a str/bytes and is a Mapping or an iterable; `strict_validation` is a real bool; the validators are callable; `element_validator` implies strict; strict has a non-empty value space or an `element_validator`; a strict, non-`None` `default` is accepted by the key's own rules | The spec being built | `ValueError` at import, prefixed `PropertySpec('<explanation>')` |
+| Construction (`PropertySpec(...)`) | `__post_init__` | `allowed_values` is not a str/bytes and is a Mapping or an iterable; `strict_validation`, `framework_set` and `scalar_only` are real bools; the validators are callable; `element_validator` and `scalar_only` each imply strict; strict has a non-empty value space or an `element_validator`; a strict, non-`None` `default` is accepted by the key's own rules; `expected` is a non-empty str and needs a `match_guard` | The spec being built | `ValueError` at import, prefixed `PropertySpec('<explanation>')` |
 | Class definition (`FeatureGroup.__init_subclass__`) | Spec type | Every spec IS a `PropertySpec` | Every value in the mapping | `ValueError` naming the class and the key |
 | Match time (parser) | `allowed_values` membership | Each element of a **present** option is in the accepted set | One element | `ValueError`, surfaced to the end user |
 | Match time (parser) | `element_validator` | Each element of a **present** option satisfies a predicate | One element | `ValueError`, surfaced to the end user |
 | Match time (parser) | Required presence (config path) | A key that declares no `default` and no `required_when` was provided | The options | Non-match (`False`) |
 | Match time (parser) | Required presence (string-named path) | Same, after declared defaults and name bindings resolve; `deferred_binding=True` and the source (`in_features`) key are exempt | The name-bound options | Non-match (`False`), with a warning naming the missing key(s) |
-| Match time (mixin) | `match_guard` | The whole value has an acceptable shape | The raw value | Non-match (`False`) |
+| Match time (mixin) | `match_guard` | The whole value has an acceptable shape | The raw value | Non-match (`False`), reported when the spec is strict or declares `expected` |
 | Match time (mixin) | `MIN/MAX_IN_FEATURES` | In-feature count is within bounds | The in-features | Non-match (`False`) |
 | Match time (guard installed at class definition) | `required_when` | A conditionally required option is present | `Options` | Non-match (`False`) |
-| Class definition (mixin) | Universal-matcher diagnostic | An all-optional `PROPERTY_MAPPING` inherits the configuration matcher, so it matches any name with empty options | The class | `logger.warning`, unless `ALLOW_UNIVERSAL_MATCHER = True` |
+| Class definition (mixin) | Universal-matcher diagnostic | An all-optional `PROPERTY_MAPPING` inherits the configuration matcher, so it matches any name once `in_features` supplies a source | The class | `logger.warning`, unless `ALLOW_UNIVERSAL_MATCHER = True` |
+| Class definition (mixin) | Missing-`in_features` diagnostic | A dict `PROPERTY_MAPPING` declares no `in_features` key while `MIN_IN_FEATURES >= 1`, and the group inherits `input_features` and the matcher | The class | `logger.warning`, silenced by `MIN_IN_FEATURES = 0` or an `in_features` key |
 | Author time (reader surface) | `mypy --strict` | `READER_OPTIONS` holds `PropertySpec` values | The constructor call | mypy error at the declaration |
 | Class definition (`BaseInputData.__init_subclass__`) | Spec type + surface guard | Every value IS a `PropertySpec` and declares nothing inert on a reader (`match_guard`, `deferred_binding`, `context=False`, enforcement fields on a `framework_set` key); the reserved key's **winning** declaration across the MRO keeps `framework_set=True` | Every value in that class's declaration, plus the reserved key as the MRO merge resolves it | `ValueError` naming class, key and field |
 | Match time (reader selection) | Presence + strict validation | Required keys are present and present strict values pass, element-wise unless `scalar_only` rejects a collection outright; `framework_set` keys exempt | The candidate's merged specs and the options | Reader non-match. Addressed-reader and supplied-value failures record a `stage="input_data"` rejection; unaddressed absence and an unjudgeable predicate decline silently |
@@ -244,7 +247,8 @@ The two callables differ on both axes, which is what their names say:
   is a plain **non-match**. The group is saying "not mine", so resolution moves on and
   another feature group may still take the feature. On a spec that also sets
   `strict_validation=True` the guard means "this value is wrong", so its rejection is reported to
-  the user instead of failing silently.
+  the user instead of failing silently. Declaring `expected` reports the rejection too, even on a
+  non-strict spec, with a message naming what the guard accepts instead of the generic strict text.
 
 Both run on both match paths, so declaring both on one spec is about **what** is judged, not
 about where: `element_validator` judges each element and produces the message, while
@@ -495,7 +499,7 @@ alone. A key is flagged when it declares no `default`, no `required_when`, and
 `deferred_binding=False`, and is still absent after declared defaults and name captures are
 resolved. Exempt from the check: a declared default, a `required_when` key, a
 `deferred_binding=True` key, and the source key (`in_features`), whose presence the name prefix
-supplies and whose count `MIN/MAX_IN_FEATURES` enforces.
+supplies and whose count `MIN/MAX_IN_FEATURES` enforces (an absent `in_features` counts as zero on the configuration path).
 
 A flagged missing key makes the match a **non-match**: a warning names the group, the feature,
 and the missing key(s), and the resolution-failure report names the missing key(s) too.
@@ -538,6 +542,36 @@ This is diagnostic only. It does not change the `True`/`False` contract, so a va
 one feature group can still match another, and multi-group fallback resolution keeps working.
 Authors get this for free.
 
+### Naming what a guard expects
+
+A `match_guard` rejection is silent by default unless the spec is strict. Declare `expected`
+to report it anyway, with a message naming what the guard accepts:
+
+```python
+from mloda.provider import property_spec
+
+
+def _is_concurrency(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+PROPERTY_MAPPING = {
+    "concurrency": property_spec(
+        "Parallel workers", match_guard=_is_concurrency, expected="a whole number of 1 or more"
+    ),
+}
+```
+
+```text
+  - WorkerPoolFeatureGroup (option value): option 'concurrency' must be a whole number of 1 or more, got str '4'
+```
+
+The rejected value is echoed only when its type is exactly `str`, `int`, `float` or `bool`, with
+its text cut to about 30 characters, or when it is `None`. Any other value, a `str` subclass or a
+numpy scalar included, is named by its type only. The reason reaches the "No feature groups
+found" error and the filter near-miss warnings, like a strict rejection does, so do not declare
+`expected` on a key that can carry a secret such as a token or a connection string.
+
 ## Conditional requirements with `required_when`
 
 Attach a predicate to declare an option required only under certain conditions. It receives an
@@ -577,7 +611,9 @@ The enforcement is installed on the class, not on one matcher, so overriding
 returns `True`. Nested guards (an override that delegates into an already guarded parent) do
 not stack: only the outermost one evaluates, so the predicates run exactly once per match call.
 The matcher must be a `classmethod`; a `staticmethod` matcher on a class that declares
-`required_when` is rejected at class definition.
+`required_when` is rejected at class definition. A plain function, callable instance, or
+`functools.partial` (no `classmethod` or `staticmethod` descriptor) is rejected on any class that
+carries this guard or the name-path presence guard.
 
 The guard is installed at class definition, so mutating `PROPERTY_MAPPING` or replacing
 `match_feature_group_criteria` after the class body escapes it.
@@ -589,20 +625,33 @@ This guard, the name-path presence guard, and the class-definition diagnostics b
 
 A key is unconditionally required only when it declares no `default` and no `required_when`. A
 `PROPERTY_MAPPING` with only declared-default keys (and, as the degenerate case, an empty mapping)
-has no such key, so on the configuration path it matches any feature name with empty options. A
-feature group that inherits the mixin's `match_feature_group_criteria` and declares such a mapping
-is a universal matcher: it claims features it was never meant to.
+has no such key, so on the configuration path it matches any feature name once `in_features` supplies a
+source. A feature group that inherits the mixin's `match_feature_group_criteria` and declares such a
+mapping is a universal matcher: it claims features it was never meant to.
 
 At class definition the mixin warns about this, naming the class and the escape hatch. A key that is
 unconditionally required, or conditionally required via `required_when`, gates the match, so the
 mapping is not warned. For the remaining all-default mappings, universality is confirmed by calling
-the resolved matcher with an unrelated, separator-free name and empty options: a genuinely
+the resolved matcher with an unrelated, separator-free name and a synthetic `in_features` source: a genuinely
 discriminating `match_feature_group_criteria` is not warned, while a pass-through override that only
 delegates to the base still is.
 
 Set `ALLOW_UNIVERSAL_MATCHER = True` on the class to declare the universal match intentional and
 silence the warning. Otherwise give one key no `default` (making it unconditionally required), or a
 `required_when` predicate that fires when the option is absent.
+
+## Declaring the source contract
+
+A mixin group whose `PROPERTY_MAPPING` has no `in_features` key and whose `MIN_IN_FEATURES` is 1 or more
+counts an absent `in_features` as zero sources, so it matches by options only when the caller passes
+`in_features`. At class definition the mixin warns, naming the class, unless the group overrides
+`input_features` or `match_feature_group_criteria` (a pass-through matcher override that delegates to the
+mixin is exempt too), or has a `PREFIX_PATTERN`/`SUFFIX_PATTERN` (the source can come from the name). It warns
+once per hierarchy: a subclass of a class that already warned stays silent. The option path records no rejection reason for this case,
+so the resolution failure report does not name it; the warning is the diagnostic.
+
+Fix it with `MIN_IN_FEATURES = 0` if the group is source-less, or declare an `in_features` key in
+`PROPERTY_MAPPING` (with a `default` if the group should match without one).
 
 ## Migrating from the dict form
 
@@ -655,6 +704,8 @@ if it really is a whole-value check.
 | `property_spec` builder surface | `tests/.../feature_chainer/test_property_spec_builder.py` |
 | Rejection reasons surfaced to the end user | `tests/test_core/test_prepare/test_identify_feature_group_error_message.py` |
 | The all-optional universal-matcher diagnostic and its `ALLOW_UNIVERSAL_MATCHER` escape hatch | `tests/.../feature_chainer/test_universal_optional_matcher.py` |
+| The missing-`in_features` definition-time diagnostic and its zero-source rejection | `tests/.../feature_chainer/test_missing_in_features_declaration.py` (the diagnostic), `tests/.../feature_chainer/test_in_feature_count_gate_name_sources.py` (the option-path zero-source non-match records no rejection) |
+| `expected` reports a `match_guard` rejection on a non-strict spec, with the capped value echo | `tests/test_core/test_prepare/test_first_pass_rejection_recording.py` |
 
 ## Context propagation
 

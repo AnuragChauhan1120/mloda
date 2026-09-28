@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 import functools
 import inspect
 import logging
@@ -19,6 +19,9 @@ class ExtenderHook(Enum):
     FEATURE_GROUP_CALCULATE_FEATURE = "feature_group_calculate_feature"
     VALIDATE_INPUT_FEATURE = "validate_input_feature"
     VALIDATE_OUTPUT_FEATURE = "validate_output_feature"
+    FEATURE_GROUP_MATCHED = "feature_group_matched"
+    INPUT_DATA_LOAD = "input_data_load"
+    JOIN = "join"
 
 
 class Extender(ABC):
@@ -35,6 +38,10 @@ class Extender(ABC):
     - metrics on feature calculation
     - visibility / observability
     - Performance
+
+    Once __call__ invokes the wrapped call, its own return value is discarded in favor of
+    the wrapped result (mutating shared args in place still works). If it calls the wrapped
+    function more than once, only the first successful call's result is used.
     """
 
     @property
@@ -54,13 +61,16 @@ class Extender(ABC):
 
         True (default) means a failure in this extender propagates and breaks the
         calculation; False means the failure is logged as a warning and the wrapped
-        function is called instead.
+        function is called instead. Ignored when never_fall_back is True.
         """
         return getattr(self, "_raise_on_error", True)
 
     @raise_on_error.setter
     def raise_on_error(self, value: bool) -> None:
         self._raise_on_error = value
+
+    # For gates: True makes a failure always propagate, never falling back to the wrapped call.
+    never_fall_back: bool = False
 
     @abstractmethod
     def wraps(self) -> set[ExtenderHook]:
@@ -69,6 +79,25 @@ class Extender(ABC):
     @abstractmethod
     def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         pass
+
+    def close(self) -> None:
+        """Called once per worker-side copy on graceful MULTIPROCESSING worker exit, to flush a
+        buffering sink. Never called in SYNC or THREADING mode. Exceptions raised here are caught
+        and logged, never propagated. On the parent-death watchdog's ``os._exit(0)`` path this is
+        best-effort and racy: it may not run at all, since that path skips Python cleanup. It must
+        return within the run's ``graceful_shutdown_timeout`` (default 2.0s), a budget shared across
+        every extender closing in that worker, or the worker may be terminated mid-close."""
+
+    def on_run_complete(self, run_id: str | None) -> None:
+        """Called once per run in the PARENT on the caller's own extender objects, after all workers
+        were joined, in every mode (close() is MULTIPROCESSING worker only). Fires once per run(),
+        run_all(), stream_run() or stream_all() call that got as far as setting up execution (a stream
+        does on its first iteration; one closed early fires after its workers are joined). Fires when
+        setup (e.g. the MULTIPROCESSING picklability preflight) or execution raised, so it is not a
+        success signal. Does not fire for prepare, explain, a never-iterated stream, a failure while
+        planning before setup, or when finalizing raised (collecting artifacts, joining or terminating
+        the workers). A session re-run fires again with the same run_id. raise_on_error and
+        never_fall_back do not apply: an Exception raised here is always logged, never propagated."""
 
     @staticmethod
     def feature_group_name(func: Any) -> str:
@@ -121,10 +150,24 @@ class Extender(ABC):
         return feature_set.options
 
 
-class _CompositeExtender(Extender):
-    """Internal class that chains multiple Extenders in priority order."""
+def get_function_extender(function_extender: set[Extender], hook: ExtenderHook) -> Extender | None:
+    """Select the Extender(s) wrapping hook: None, the sole match, or a priority-sorted CompositeExtender."""
+    matching_extenders = [ext for ext in function_extender if hook in ext.wraps()]
+    if len(matching_extenders) == 0:
+        return None
+    if len(matching_extenders) == 1:
+        return matching_extenders[0]
+    sorted_extenders = sorted(matching_extenders, key=lambda e: e.priority)
+    return CompositeExtender(sorted_extenders, hook)
 
-    def __init__(self, extenders: list[Extender], function_type: Optional[ExtenderHook] = None):
+
+class CompositeExtender(Extender):
+    """Chains multiple Extenders together, running them in priority order.
+
+    Constructed internally by get_function_extender(); not meant to be subclassed or instantiated directly.
+    """
+
+    def __init__(self, extenders: list[Extender], function_type: ExtenderHook | None = None):
         self.extenders = sorted(extenders, key=lambda e: e.priority)
         self.function_type = function_type
 
@@ -153,13 +196,8 @@ class _CompositeExtender(Extender):
 def _invoke_extender(ext: Extender, inner_func: Any, *args: Any, **kwargs: Any) -> Any:
     """Invoke an extender around inner_func, scoping any warning-only fallback to the
     extender's OWN code so inner-function failures propagate and inner never re-runs."""
-    # Breaking (default): call directly, everything propagates.
-    if ext.raise_on_error:
-        return ext.__call__(inner_func, *args, **kwargs)
-
-    # Warning-only: guard ONLY the extender's own code. Wrap inner_func so we can tell
-    # whether a raised exception came from inner_func (must propagate, never swallow,
-    # never re-run) versus the extender's own instrumentation (log + fall back).
+    # Guard inner_func so its result wins over ext.__call__'s return, and (warning-only
+    # branch) so an inner exception can be told apart from the extender's own failure.
     sentinel = object()
     state: dict[str, Any] = {"result": sentinel, "inner_raised": False}
 
@@ -170,11 +208,20 @@ def _invoke_extender(ext: Extender, inner_func: Any, *args: Any, **kwargs: Any) 
         except BaseException:
             state["inner_raised"] = True
             raise
-        state["result"] = result
+        if state["result"] is sentinel:
+            state["result"] = result
         return result
 
+    def _settle(ext_return: Any) -> Any:
+        return state["result"] if state["result"] is not sentinel else ext_return
+
+    # Breaking (default) or never_fall_back: call directly, everything propagates.
+    if ext.raise_on_error or ext.never_fall_back:
+        return _settle(ext.__call__(guarded_inner, *args, **kwargs))
+
+    # Warning-only: guard ONLY the extender's own code.
     try:
-        return ext.__call__(guarded_inner, *args, **kwargs)
+        return _settle(ext.__call__(guarded_inner, *args, **kwargs))
     except Exception as e:
         if state["inner_raised"]:
             # The failure came from the wrapped function / downstream chain, not this

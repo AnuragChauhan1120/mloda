@@ -4,12 +4,14 @@ import multiprocessing  # noqa: F401
 import threading
 import traceback
 import logging
-from typing import Any, Callable, Optional
+from dataclasses import replace
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.function_extender import Extender
 from mloda.core.core.cfw_manager import CfwManager
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
 from mloda.core.core.step.join_step import JoinStep
@@ -32,7 +34,9 @@ class ComputeFrameworkExecutor:
         self,
         cfw_register: CfwManager,
         worker_manager: WorkerManager,
-        tfs_connection_map: Optional[dict[type[ComputeFramework], Any]] = None,
+        tfs_connection_map: dict[type[ComputeFramework], Any] | None = None,
+        function_extender: set[Extender] | None = None,
+        worker_extender_payload: bytes | None = None,
     ) -> None:
         """
         Initialize the executor with dependencies.
@@ -44,11 +48,19 @@ class ComputeFrameworkExecutor:
                 framework connection (e.g. duckdb.DuckDBPyConnection, sqlite3.Connection).
                 Engine builds this once from the DataAccessCollection at setup; the
                 executor only does a dict lookup per TFS step on the run path.
+            function_extender: The caller's own extenders, used for a framework staying resident
+                in this process.
+            worker_extender_payload: Pickled snapshot of the extenders for a framework dispatched
+                to a spawned worker. Never unpickled here; attached to the new instance as
+                `_pending_extender_payload` and materialized by `ComputeFramework.__setstate__`
+                only once the instance is actually unpickled in the worker.
         """
         self.cfw_collection: dict[UUID, ComputeFramework] = {}
         self.cfw_register = cfw_register
         self.worker_manager = worker_manager
         self.tfs_connection_map: dict[type[ComputeFramework], Any] = tfs_connection_map or {}
+        self.function_extender = function_extender
+        self.worker_extender_payload = worker_extender_payload
         self._cfw_lock = threading.Lock()
 
     def init_compute_framework(
@@ -56,7 +68,7 @@ class ComputeFrameworkExecutor:
         cf_class: type[ComputeFramework],
         parallelization_mode: ParallelizationMode,
         children_if_root: set[UUID],
-        uuid: Optional[UUID] = None,
+        uuid: UUID | None = None,
     ) -> UUID:
         """
         Initializes a compute framework.
@@ -64,8 +76,22 @@ class ComputeFrameworkExecutor:
         Returns:
             The UUID of the compute framework.
         """
-        # get function_extender
-        function_extender = self.cfw_register.get_function_extender()
+        # Re-checking cf_class.supported_parallelization_modes() here is defensive: no current
+        # call path can pass MULTIPROCESSING for a class that does not support it.
+        # The worker-bound payload is deferred, never unpickled here: materializing it in this
+        # (parent) process would run any extender's own __setstate__ (e.g. building a live handle)
+        # under the wrong pid, and a second unpickle in the worker would then silently skip it.
+        dispatched_to_worker = (
+            parallelization_mode is ParallelizationMode.MULTIPROCESSING
+            and ParallelizationMode.MULTIPROCESSING in cf_class.supported_parallelization_modes()
+        )
+        if dispatched_to_worker:
+            # Never the caller's own extender objects here; a payload (if any) is attached
+            # below, after construction, as the still-pickled _pending_extender_payload.
+            function_extender = None
+        else:
+            # Framework stays resident in this process: use the caller's own extenders directly.
+            function_extender = self.function_extender
 
         # init framework
         new_cfw = cf_class(
@@ -74,6 +100,12 @@ class ComputeFrameworkExecutor:
             uuid or uuid4(),
             function_extender=function_extender,
         )
+        if dispatched_to_worker and self.worker_extender_payload is not None:
+            # Materialization happens only in ComputeFramework.__setstate__, once this instance is
+            # actually unpickled in the worker; never here in the parent that dispatches it.
+            new_cfw._pending_extender_payload = self.worker_extender_payload
+        # replace() re-runs __post_init__, so each framework owns its carrier copy.
+        new_cfw.run_context = replace(self.cfw_register.get_run_context())
 
         # add to register
         self.cfw_register.add_cfw_to_compute_frameworks(new_cfw.get_uuid(), cf_class.get_class_name(), children_if_root)
@@ -104,17 +136,32 @@ class ComputeFrameworkExecutor:
 
             return cfw_uuid
 
-    def get_cfw(self, compute_framework: type[ComputeFramework], feature_uuid: UUID) -> ComputeFramework:
+    def get_cfw(
+        self, compute_framework: type[ComputeFramework], feature_uuid: UUID, tfs_ids: set[UUID] | None = None
+    ) -> ComputeFramework:
         """
         Retrieves a compute framework based on its type and a feature UUID.
+
+        tfs_ids, when given, is tried first via get_unique_cfw_uuid: a bare feature_uuid lookup
+        cannot tell apart two same-class cfws with identical children_if_root (e.g. a root and a
+        back-hop into that same root's own framework), while tfs_ids carries the step's own-key
+        signal that can.
 
         Args:
             compute_framework: The type of compute framework to retrieve.
             feature_uuid: The UUID of the feature associated with the compute framework.
+            tfs_ids: The step's own tfs_ids, tried first when given.
         """
-        cfw_uuid = self.cfw_register.get_initialized_compute_framework_uuid(
-            compute_framework, feature_uuid=feature_uuid
-        )
+        cfw_uuid: UUID | None = None
+        if tfs_ids:
+            cls_name = compute_framework.get_class_name()
+            # See CfwManager.resolve_cfw_uuid_by_tfs_ids for the shared fallback chain.
+            cfw_uuid = self.cfw_register.resolve_cfw_uuid_by_tfs_ids(cls_name, tfs_ids, feature_uuid)
+
+        if cfw_uuid is None:
+            cfw_uuid = self.cfw_register.get_initialized_compute_framework_uuid(
+                compute_framework, feature_uuid=feature_uuid
+            )
         if cfw_uuid is None:
             raise ValueError(f"cfw_uuid should not be none: {compute_framework}.")
         return self.cfw_collection[cfw_uuid]
@@ -140,10 +187,18 @@ class ComputeFrameworkExecutor:
         """
         Prepares a step for execution by initializing or retrieving the associated CFW.
         """
-        cfw_uuid: Optional[UUID] = None
+        cfw_uuid: UUID | None = None
 
         if isinstance(step, FeatureGroupStep):
-            resolved_uuid = self.cfw_register.get_unique_cfw_uuid(step.compute_framework.get_class_name(), step.tfs_ids)
+            cls_name = step.compute_framework.get_class_name()
+            # See CfwManager.resolve_cfw_uuid_by_tfs_ids for the shared fallback chain: an
+            # already-established cfw the step's own output uuid already belongs to (e.g. a chained
+            # join's final destination) wins over creating a brand new, empty cfw for a step that
+            # really has an existing home.
+            resolved_uuid = self.cfw_register.resolve_cfw_uuid_by_tfs_ids(
+                cls_name, step.tfs_ids, step.features.any_uuid
+            )
+
             if resolved_uuid is not None:
                 return resolved_uuid
 
@@ -166,12 +221,11 @@ class ComputeFrameworkExecutor:
                     f"from_feature_uuid or from_cfw_uuid should not be none. {step, from_feature_uuid, from_cfw_uuid}"
                 )
 
-            from_cfw = self.cfw_collection[from_cfw_uuid]
-            childrens = set(from_cfw.children_if_root)
-
             if step.link_id:
-                from_feature_uuid = step.link_id
-                childrens.add(from_feature_uuid)
+                childrens = {step.link_id}
+            else:
+                from_cfw = self.cfw_collection[from_cfw_uuid]
+                childrens = set(from_cfw.children_if_root)
 
             with self._cfw_lock:
                 cfw_uuid = self.init_compute_framework(step.to_framework, parallelization_mode, childrens, step.uuid)
@@ -197,27 +251,38 @@ class ComputeFrameworkExecutor:
         """
         Prepares the right CFW for a TransformFrameworkStep.
         """
-        uuid = step.source_framework_uuid if step.source_framework_uuid else next(iter(step.required_uuids))
-
-        cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), uuid)
+        if step.source_framework_uuid:
+            cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), step.source_framework_uuid)
+        else:
+            # A subclass-clustered hop's required_uuids can name parents owned by different
+            # sibling steps/frameworks (see execution_plan.py), so try each until one resolves
+            # instead of picking an arbitrary, possibly-wrong member.
+            cfw_uuid = None
+            for candidate_uuid in step.required_uuids:
+                cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), candidate_uuid)
+                if cfw_uuid is not None:
+                    break
 
         if cfw_uuid is None or isinstance(cfw_uuid, UUID) is False:
             raise ValueError(
-                f"cfw_uuid should not be none in prepare_tfs: {step.from_framework.get_class_name()}, {uuid}"
+                f"cfw_uuid should not be none in prepare_tfs: {step.from_framework.get_class_name()}, "
+                f"{step.source_framework_uuid or step.required_uuids}"
             )
 
         return cfw_uuid
 
-    def prepare_tfs_and_joinstep(self, step: Any) -> Any:
-        """
-        Prepares CFWs required for TransformFrameworkStep or JoinStep.
-        """
-        from_cfw: Optional[Any] = None
+    def prepare_tfs_and_joinstep(self, step: Any) -> ComputeFramework | UUID | None:
+        """Resolve the source cfw for a transform or join step; a UUID when a worker owns the transform source."""
+        from_cfw: ComputeFramework | None = None
         if isinstance(step, TransformFrameworkStep):
-            from_cfw = self.prepare_tfs_right_cfw(step)
-            from_cfw = self.cfw_collection[from_cfw]
+            source_uuid = self.prepare_tfs_right_cfw(step)
+            if self.worker_manager.get_process_queues(source_uuid) is not None:
+                # A worker owns this source cfw; its data lives on the flight server, not here.
+                return source_uuid
+            from_cfw = self.cfw_collection[source_uuid]
         elif isinstance(step, JoinStep):
-            # Destination framework here, because it is already transformed beforehand
+            # Both join sides are destination-framework cfws, whose modes kept this join in the
+            # parent, so neither can be worker-owned.
             from_cfw_uuid = self.cfw_register.get_cfw_uuid(step.destination_framework.get_class_name(), step.link.uuid)
 
             if from_cfw_uuid is None:
@@ -256,13 +321,13 @@ class ComputeFrameworkExecutor:
 
         try:
             from_cfw = self.prepare_tfs_and_joinstep(step) or None
-            step.execute(self.cfw_register, self.cfw_collection[cfw_uuid], from_cfw=from_cfw)
+            cfw = self.cfw_collection[cfw_uuid]
+            step.execute(self.cfw_register, cfw, from_cfw=from_cfw)
             step.step_is_done = True
 
         except Exception as e:
             error_message = f"An error occurred: {e}"
             msg = f"{error_message}\nFull traceback:\n{traceback.format_exc()}"
-            logging.error(msg)
             exc_info = traceback.format_exc()
             self.cfw_register.set_error(msg, exc_info, exception=e)
 
@@ -305,6 +370,7 @@ class ComputeFrameworkExecutor:
             process, command_queue, result_queue = existing
 
         self.worker_manager.send_command(cfw_uuid, step)
-        # Record the assignment so a worker that exits still owing these results is
-        # detectable, including the clean exit the data-drop path produces.
-        self.worker_manager.record_assignment(cfw_uuid, set(step.get_uuids()))
+        # Track by step.get_result_uuid() (== step.uuid), the id a worker reports back via
+        # result_queue. get_uuids() returns feature uuids instead, a different namespace that
+        # made find_orphaned_steps flag every finished worker as still owing a result.
+        self.worker_manager.record_assignment(cfw_uuid, {step.get_result_uuid()})

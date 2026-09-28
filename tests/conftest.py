@@ -3,24 +3,32 @@ import os
 from typing import Any
 import pytest
 
+from mloda.core.abstract_plugins.components.framework_transformer.base_transformer import BaseTransformer
+from mloda.core.abstract_plugins.components import utils
 from mloda.core.abstract_plugins.components.utils import get_all_subclasses
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
 from mloda.core.abstract_plugins.plugin_registry.plugin_registry import PluginRegistry
 from mloda.core.prepare import accessible_plugins
 from mloda.core.runtime.flight.runner_flight_server import ParallelRunnerFlightServer
 
-from tests.registry_isolation import reclaim_leaked_feature_groups
+from tests.registry_isolation import reclaim_leaked_feature_groups, reclaim_leaked_transformers
 
 
 # Defined first on purpose: autouse fixtures tear down in reverse, so this runs after the registry reset.
 @pytest.fixture(autouse=True)
 def _no_feature_group_registry_pollution(request: pytest.FixtureRequest) -> Any:
-    """Fail a test that leaves one of its own FeatureGroup subclasses registered (#845)."""
-    before = get_all_subclasses(FeatureGroup)
+    """Fail a test that leaves one of its own FeatureGroup or BaseTransformer subclasses registered (#845)."""
+    before_feature_groups = get_all_subclasses(FeatureGroup)
+    before_transformers = get_all_subclasses(BaseTransformer)
     yield
     module_name = request.module.__name__
-    leaked = reclaim_leaked_feature_groups(before, module_name)
-    assert not leaked, f"Leaked FeatureGroup subclasses from {module_name}: {[c.__name__ for c in leaked]}"
+    leaked = [
+        *reclaim_leaked_feature_groups(before_feature_groups, module_name),
+        *reclaim_leaked_transformers(before_transformers, module_name),
+    ]
+    assert not leaked, (
+        f"Leaked FeatureGroup/BaseTransformer subclasses from {module_name}: {[c.__name__ for c in leaked]}"
+    )
 
 
 def _clear_warned_unregistered() -> None:
@@ -30,18 +38,31 @@ def _clear_warned_unregistered() -> None:
         warned.clear()
 
 
+def _clear_warn_once_for_registries() -> None:
+    """Clear safe_field's warn_once_for dedup registries if the implementation provides them."""
+    weak_registry = getattr(utils, "_warn_once_for_weak", None)
+    if weak_registry is not None:
+        weak_registry.clear()
+    strong_registry = getattr(utils, "_warn_once_for_strong", None)
+    if strong_registry is not None:
+        strong_registry.clear()
+
+
 @pytest.fixture(autouse=True)
 def restore_default_plugin_registry() -> Any:
     """Snapshot and restore the default plugin registry around every test.
 
-    Also clears the warn-mode dedup set so warn-mode tests stay independent.
+    Also clears the warn-mode dedup set and safe_field's warn_once_for registries so
+    warn-mode tests and once-per-process WARNING dedup tests stay independent.
     """
     registry = PluginRegistry.default()
     snapshot = registry.snapshot()
     _clear_warned_unregistered()
+    _clear_warn_once_for_registries()
     yield
     registry.restore(snapshot)
     _clear_warned_unregistered()
+    _clear_warn_once_for_registries()
 
 
 @pytest.fixture(autouse=True)

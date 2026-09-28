@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 from mloda.provider import BaseTransformer
 
@@ -11,6 +11,13 @@ try:
     import pyarrow as pa
 except ImportError:
     pa = None  # type: ignore[assignment, unused-ignore]
+
+
+def _decimal_types_mapper(arrow_type: Any) -> Any | None:
+    """Keep decimal columns Arrow-backed to preserve precision and scale; numpy dtypes otherwise."""
+    if pa.types.is_decimal(arrow_type):
+        return pd.ArrowDtype(arrow_type)
+    return None
 
 
 class PandasPyArrowTransformer(BaseTransformer):
@@ -59,5 +66,5 @@ class PandasPyArrowTransformer(BaseTransformer):
         return pa.Table.from_arrays(pyarrow_table.columns, schema=new_schema)
 
     @classmethod
-    def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Optional[Any] = None) -> Any:
-        return pa.Table.to_pandas(data)
+    def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Any | None = None) -> Any:
+        return pa.Table.to_pandas(data, types_mapper=_decimal_types_mapper)

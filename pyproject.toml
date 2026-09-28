@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mloda"
-version = "0.11.1"
+version = "0.14.0"
 description = "mloda.ai: Open Data Access for ML and AI"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
@@ -31,6 +31,7 @@ test = [
     "pyarrow",
     "ipykernel",
     "bandit",
+    "pyyaml",
     "types-PyYAML",
     "types-requests",
     "types-toml",
@@ -41,18 +42,13 @@ test = [
 ]
 pyarrow = ["pyarrow"]
 pandas = ["pandas"]
-polars = ["polars"]
+polars = ["polars>=1.21"]
+numpy = ["numpy"]
+yaml = ["pyyaml"]
 duckdb = ["duckdb", "pyarrow"]
 sqlite = ["pyarrow"]
 iceberg = ["pyiceberg", "pyarrow"]
 spark = ["pyspark", "pyarrow"]
-otel = [
-    "opentelemetry-api",
-    "opentelemetry-sdk",
-    "opentelemetry-instrumentation",
-    "opentelemetry-instrumentation-logging",
-    "opentelemetry-instrumentation-requests",
-]
 sklearn = [
     "scikit-learn>=1.0.0",
     "joblib>=1.0.0",
@@ -82,10 +78,11 @@ all = [
     "mloda[pyarrow]",
     "mloda[pandas]",
     "mloda[polars]",
+    "mloda[numpy]",
+    "mloda[yaml]",
     "mloda[duckdb]",
     "mloda[sqlite]",
     "mloda[iceberg]",
-    "mloda[otel]",
     "mloda[sklearn]",
     "mloda[text_cleaning]",
     "mloda[docs]",
@@ -147,6 +144,10 @@ module = "mloda_plugins.compute_framework.base_implementations.iceberg.iceberg_f
 disable_error_code = ["misc", "call-arg", "arg-type"]
 
 [[tool.mypy.overrides]]
+module = "tests.test_plugins.compute_framework.base_implementations.iceberg.test_iceberg_filter_engine"
+disable_error_code = ["misc", "call-arg", "arg-type"]
+
+[[tool.mypy.overrides]]
 module = [
     "pyarrow.compute",
     "pyarrow.csv",
@@ -163,7 +164,7 @@ follow_imports = "skip"
 line-length = 120
 
 [tool.ruff.lint]
-extend-select = ["UP006", "UP007"]
+extend-select = ["UP006", "UP007", "UP045"]
 
 [tool.ruff.lint.per-file-ignores]
 # marimo notebook idioms static linting can't follow (cell imports, re-exports, cross-cell names).
@@ -177,15 +178,20 @@ exclude-newer-package = { decorator = "2099-01-01T00:00:00Z" }
 # Constraints applied only to transitive dependencies to remediate Dependabot security alerts.
 # - urllib3 >= 2.7.0: GHSA decompression-bomb bypass + sensitive headers across origins
 # - idna   >= 3.15:   idna.encode() bypass of CVE-2024-3651 fix
-# - mistune >= 3.3.0: quadratic-time parsing DoS in parse_link_text. Also covers the earlier heading ID injection XSS (CVE-2026-33079).
-# - soupsieve >= 2.8.4: memory exhaustion via large comma-separated selector lists; ReDoS in the selector parser
+# - mistune >= 3.3.3: RecursionError DoS via excessive emphasis markers. Also covers the earlier
+#   quadratic-time parsing DoS in parse_link_text and heading ID injection XSS (CVE-2026-33079).
+# - soupsieve >= 2.9.0: memory exhaustion via large comma-separated selector lists; ReDoS in the selector
+#   parser, including the IDENTIFIER/VALUE sub-patterns and the RE_WS_END whitespace/comment trimming regex
 # - nbconvert >= 7.17.1: arbitrary file read/write via path traversal; uncontrolled search path on Windows
+# - anyio >= 4.14.2: TLSStream IDNA 2003 host name encoding allows TLS certificate spoofing; process-pool
+#   workers can block indefinitely on undrained stderr
 constraint-dependencies = [
     "urllib3>=2.7.0",
     "idna>=3.15",
-    "mistune>=3.3.0",
-    "soupsieve>=2.8.4",
+    "mistune>=3.3.3",
+    "soupsieve>=2.9.0",
     "nbconvert>=7.17.1",
+    "anyio>=4.14.2",
 ]
 # Overrides, not constraints: marimo pins `pymdown-extensions<11`, and the fix for the
 # b64 path-traversal advisory only ships in 11.0. A constraint cannot beat that upper

@@ -17,9 +17,13 @@ from mloda_plugins.feature_group.experimental.data_quality.missing_value.python_
     PythonDictMissingValueFeatureGroup,
 )
 
+from tests.test_plugins.feature_group.experimental.test_missing_value_feature_group.missing_value_zero_row_test_mixin import (
+    MissingValueZeroRowTestMixin,
+)
 from tests.test_plugins.feature_group.experimental.test_missing_value_feature_group.test_missing_value_utils import (
     validate_missing_value_features,
 )
+from tests.test_plugins.feature_group.experimental.zero_row_result_type_test_mixin import PythonDictZeroRowAdapter
 from tests.test_plugins.integration_plugins.test_data_creator import ATestDataCreator
 
 
@@ -339,6 +343,10 @@ class TestPythonDictMissingValueFeatureGroup:
             PythonDictMissingValueFeatureGroup.calculate_feature(data_copy, feature_set)
 
 
+class TestPythonDictMissingValueZeroRow(PythonDictZeroRowAdapter, MissingValueZeroRowTestMixin):
+    feature_group_class = PythonDictMissingValueFeatureGroup
+
+
 class TestMissingValuePythonDictIntegration:
     """Integration tests for the missing value feature group using PythonDict framework."""
 
@@ -364,6 +372,7 @@ class TestMissingValuePythonDictIntegration:
             "category__mode_imputed",  # Mode imputation
             "category__constant_imputed",  # Constant imputation
             "temperature__ffill_imputed",  # Forward fill imputation
+            "temperature__bfill_imputed",  # Backward fill imputation
         ]
 
         feature_list = [Feature(name=feature, options=options) for feature in feature_str]

@@ -9,6 +9,7 @@ That however means that a data project typically contains multiple filters. For 
 -    filter_feature: It can be a Feature or a feature name as string.
 -    parameter: A dictionary of parameters to filter. Example: {"min": 2, "max": 3}
     Parameter values must be hashable (scalars, or lists, sets or tuples of hashables); anything else raises `ValueError`.
+    The `values` key must be a list, tuple, set or frozenset; anything else (a string, a range, a generator) raises `TypeError`.
 -    filter_type: It can be a str or a FilterType.
 
 #### FilterType
@@ -24,6 +25,9 @@ class FilterType(Enum):
     REGEX = "regex"
     CATEGORICAL_INCLUSION = "categorical_inclusion"
 ```
+
+A null or NaN row never passes a range, min, max or equal filter, and categorical inclusion keeps null and
+NaN rows only when its `values` contain `None` (a NaN value counts as `None`).
 
 #### GlobalFilter
 
@@ -51,8 +55,8 @@ Parameters:
 
 -   event_from (datetime): Start of the time range (with timezone).
 -   event_to (datetime): End of the time range (with timezone).
--   valid_from (Optional[datetime]): Start of the validity period (optional, with timezone).
--   valid_to (Optional[datetime]): End of the validity period (optional, with timezone).
+-   valid_from (datetime | None): Start of the validity period (optional, with timezone).
+-   valid_to (datetime | None): End of the validity period (optional, with timezone).
 -   max_exclusive (bool): If True, the upper bounds (event_to, valid_to) are treated as exclusive.
 -   event_time_column: The column name containing event timestamps. Default is "reference_time".
 -   validity_time_column: The column name containing validity timestamps. Default is "time_travel".
@@ -115,12 +119,12 @@ Further, the feature is a data creator, so we create the data here itself.
 ```python
 from mloda.user import mloda
 from mloda.provider import FeatureGroup, FeatureSet, ComputeFramework, BaseInputData, DataCreator
-from typing import Any, Union, Set, Type, Optional
+from typing import Any
 from mloda.user.pyarrow import PyArrowTable
 
 class ExampleOrderFilter(FeatureGroup):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator({cls.get_class_name(), "example_order_id"})
 
     @classmethod
@@ -319,7 +323,7 @@ def final_filters(cls) -> bool | None:
 
 | Return value | Meaning |
 |:------------:|---------|
-| `None` | Defer to the FilterEngine tied to the ComputeFramework. Most engines (Pandas, PyArrow, Polars, Spark) default to `True` (eliminate rows). Iceberg defaults to `False` (predicate pushdown handles it). |
+| `None` | Defer to the FilterEngine tied to the ComputeFramework. Every built-in engine defaults to `True` (eliminate rows). |
 | `False` | Skip row elimination. Use this when your FeatureGroup fully handles the filter itself. |
 | `True` | Force row elimination, even if the FilterEngine would skip it. |
 
@@ -334,7 +338,7 @@ filter is applied, not *where* the computation runs physically:
 | Eager | Pandas, PyArrow | Post-hoc filter in memory after full materialization |
 | Lazy (SQL) | DuckDB, SQLite | `.filter()` adds WHERE to query plan; optimizer may push to scan time |
 | Lazy (dataframe) | Polars, Spark | `.filter()` adds node to lazy plan; optimizer decides physical order |
-| Scan-time | Iceberg | Predicates pushed into scan expressions (`final_filters()=False`) |
+| Scan-time, then eager | Iceberg | For a `Table` result, range, min, max, equal and categorical inclusion push into the scan when the value's type converts exactly to the column type; every filter then reruns on the scan result, returning a `pa.Table`; a `pa.Table` result is filtered as PyArrow |
 
 All frameworks that return `True` produce the same logical result (non-matching rows
 absent from output), but the physical execution path differs.
@@ -361,15 +365,16 @@ For patterns that use `features.mask_engine` to build boolean masks inside
 
 #### Pattern 4: Force elimination on a non-eliminating engine
 
-Some engines skip row elimination by default (e.g. Iceberg, which uses predicate pushdown
-at scan time). If your FeatureGroup computes derived columns that the scan could not
-filter, override `final_filters()` to force elimination:
+A custom FilterEngine can skip row elimination by returning `False` from
+`final_filters()` (e.g. an engine that applies filters at scan time). If your
+FeatureGroup computes derived columns that the scan could not filter, override
+`final_filters()` to force elimination:
 
 ```
-class DerivedIcebergFeature(FeatureGroup):
+class DerivedFeature(FeatureGroup):
     @classmethod
     def final_filters(cls) -> bool:
-        return True  # override Iceberg's default of False
+        return True  # override the engine's default of False
 ```
 
 ### The overlap contract

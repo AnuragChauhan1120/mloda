@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
@@ -134,8 +134,10 @@ class FeatureChainParser:
     ) -> tuple[str | None, str | None]:
         """Legacy adapter over ``parse_name``: returns ``(operation_config, source_feature)``.
 
-        Public API (mloda_plugins call sites and documented examples), so the tuple stays
-        byte-for-byte identical to today, including the captureless fabrication and the ValueError.
+        Public API, so the tuple stays byte-for-byte identical to today: ``(None, None)`` on no
+        match; otherwise ``source_feature`` is always populated, and ``operation_config`` is
+        ``None`` for a captureless or non-participating-capture pattern (a match with nothing
+        before the separator still raises, as before).
         """
         parsed = cls.parse_name(feature_name, prefix_patterns, pattern)
         if not parsed.matched:
@@ -445,8 +447,8 @@ class FeatureChainParser:
         cls,
         feature_name: str | FeatureName,
         options: Options,
-        property_mapping: Optional[dict[str, PropertySpec]] = None,
-        prefix_patterns: Optional[list[Any]] = None,
+        property_mapping: dict[str, PropertySpec] | None = None,
+        prefix_patterns: list[Any] | None = None,
         pattern: str = CHAIN_SEPARATOR,
         owner_name: str | None = None,
     ) -> bool:
@@ -603,15 +605,7 @@ class FeatureChainParser:
         if not changed:
             return options
 
-        effective = Options(
-            group=merged_group,
-            context=merged_context,
-            propagate_context_keys=options.propagate_context_keys,
-        )
-        effective.inherited_group_keys = options.inherited_group_keys
-        effective.inherited_context_keys = options.inherited_context_keys
-        effective.last_forwarded_group_keys = options.last_forwarded_group_keys
-        return effective
+        return options.rebuild(group=merged_group, context=merged_context)
 
     @classmethod
     def build_effective_options(

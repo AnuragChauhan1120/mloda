@@ -56,7 +56,7 @@ Use the `resolve_multi_column_feature()` utility to automatically discover all c
 
 ```py
 class MultiColumnConsumer(FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature.not_typed("MultiColumnFeature")}
 
     @classmethod
@@ -86,7 +86,7 @@ For backwards compatibility, you can still access columns manually:
 
 ```py
 class MultiColumnConsumer(FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature.not_typed("MultiColumnFeature")}
 
     @classmethod
@@ -108,7 +108,7 @@ You can declare a dependency on a specific sub-column directly, without needing 
 
 ```py
 class SpecificSubColumnConsumer(FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         # Depend on ONLY base_feature~1, not all columns
         return {Feature("base_feature~1")}
 
@@ -143,26 +143,16 @@ The mloda framework automatically handles the selection of columns that follow t
 2. This is implemented in the `identify_naming_convention` method in the `ComputeFramework` class:
 
 ```py
-def identify_naming_convention(self, selected_feature_names: Set[FeatureName], column_names: Set[str]) -> Set[str]:
-    feature_name_strings = {f.name for f in selected_feature_names}
-    _selected_feature_names: Set[str] = set()
-
-    for col in column_names:
-        for feature_name in feature_name_strings:
-            if col == feature_name:
-                _selected_feature_names.add(col)
-                continue
-
-            if col.startswith(f"{feature_name}~"):
-                _selected_feature_names.add(col)
-
-    if not _selected_feature_names:
-        raise ValueError(
-            f"No columns found that match feature names {feature_name_strings} or follow the naming convention 'feature_name~column_name'"
-        )
-
-    return _selected_feature_names
+def identify_naming_convention(
+    self,
+    selected_feature_names: Sequence[FeatureName],
+    column_names: set[str],
+    ordering: str | None = None,
+    request_feature_order: list[str] | None = None,
+) -> set[str] | list[str]: ...
 ```
+
+It collects every column that equals a requested feature name or starts with `feature_name~`, and raises a `ValueError` if no column matches. By default it returns a set; with `ordering="alphabetical"` it returns a sorted list, and with `ordering="request_order"` it returns a list ordered by `request_feature_order` (falling back to `selected_feature_names`). Any other `ordering` value raises a `ValueError`.
 
 ## Best Practices
 
@@ -183,6 +173,6 @@ mloda provides several utilities for working with multi-column features:
 | `apply_naming_convention(result, feature_name)` | Create multi-column outputs | Producer: Generate `~N` suffixed columns from arrays |
 | `resolve_multi_column_feature(feature_name, columns)` | Discover multi-column inputs | Consumer: Auto-find all `~N` columns |
 | `expand_feature_columns(feature_name, num_columns)` | Generate column name list | Producer: Pre-generate expected column names |
-| `get_column_base_feature(column_name)` | Strip suffix from column | Both: Extract base feature from `feature~N` |
+| `get_column_base_feature(column_name)` | Strip trailing `~N` suffix from column | Both: Extract base feature from `feature~N` (last `~` wins) |
 
-**Note**: When declaring dependencies with `Feature("base_feature~N")`, the framework automatically resolves to the parent FeatureGroup that produces `base_feature` and extracts only the specified sub-column.
+**Note**: When declaring dependencies with `Feature("base_feature~N")`, the framework automatically resolves to the parent FeatureGroup that produces `base_feature` and extracts only the specified sub-column. Only a numeric suffix is recognized this way: `get_column_base_feature` does not strip a non-digit suffix such as `~mean` or `~dim1` back to its base, so a feature name like `Feature("base_feature~mean")` will NOT resolve to the producing FeatureGroup as a formal sub-column dependency.

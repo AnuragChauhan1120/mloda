@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-import multiprocessing
+import pickle  # nosec B403
 import threading
 import time
 from collections.abc import Sequence
-from typing import Any, Generator, Optional
+from typing import Any, Generator
 from uuid import UUID
 import logging
 
 from mloda.core.abstract_plugins.function_extender import Extender
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.run_context import RunContext
 from mloda.core.prepare.execution_plan import ExecutionPlan
 from mloda.core.runtime.worker_manager import WorkerManager
 from mloda.core.runtime.data_lifecycle_manager import DataLifecycleManager
 from mloda.core.runtime.compute_framework_executor import ComputeFrameworkExecutor
 from mloda.core.core.cfw_manager import CfwManager, MyManager
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.runtime.flight.flight_server import FlightServer
 from mloda.core.runtime.flight.runner_flight_server import ParallelRunnerFlightServer
 from mloda.core.runtime.mp_context import mp_spawn_context
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
@@ -24,8 +26,12 @@ from mloda.core.core.step.join_step import JoinStep
 from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
 from mloda.core.abstract_plugins.components.feature_set import FeatureSet
 from mloda.core.abstract_plugins.components.error_utils import MlodaRunError, internal_invariant_error
+from mloda.core.abstract_plugins.components.utils import contained_raise_reason
 from mloda.core.abstract_plugins.feature_group import format_feature_group_class
 from mloda.core.runtime.validate_multiprocessing_link import (
+    raise_on_multiprocessing_connection_conflict,
+    raise_on_unpicklable_child_bootstrap,
+    raise_on_unpicklable_extender,
     raise_on_unpicklable_join_link,
     raise_on_unpicklable_step_feature_group,
 )
@@ -84,10 +90,10 @@ class ExecutionOrchestrator:
     def __init__(
         self,
         execution_planner: ExecutionPlan,
-        flight_server: Optional[ParallelRunnerFlightServer] = None,
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
-        tfs_connection_map: Optional[dict[type[ComputeFramework], Any]] = None,
+        flight_server: ParallelRunnerFlightServer | None = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
+        tfs_connection_map: dict[type[ComputeFramework], Any] | None = None,
     ) -> None:
         """
         Initializes the ExecutionOrchestrator with an execution plan and optional flight server.
@@ -100,9 +106,14 @@ class ExecutionOrchestrator:
 
         self.cfw_register: CfwManager
         self.manager: Any = None
+        self.function_extender: set[Extender] | None = None
+        self._run_id: str | None = None
+        self._workers_joined: bool = True
+        self.worker_extender_payload: bytes | None = None
+        self._graceful_shutdown_timeout: float = RunContext().graceful_shutdown_timeout
 
         # multiprocessing - delegate to WorkerManager
-        self.location: Optional[str] = None
+        self.location: str | None = None
         self.worker_manager = WorkerManager()
 
         # Data lifecycle - delegate to DataLifecycleManager
@@ -131,8 +142,21 @@ class ExecutionOrchestrator:
         Handles the dropping of intermediate data based on finished steps.
         """
         self.data_lifecycle_manager.drop_data_for_finished_cfws(
-            finished_ids, self.executor.cfw_collection, self.location
+            finished_ids, self.executor.cfw_collection, self.location, self._drop_cfw_data_routed
         )
+
+    def _drop_cfw_data_routed(self, cfw_uuid: UUID, cfw: ComputeFramework) -> None:
+        """Drop a cfw's uploaded data, routed through its worker if still alive: `cfw_collection`
+        here only ever holds the pre-dispatch snapshot, whose `object_ids` stays empty."""
+        process, command_queue, _ = self.worker_manager.process_register.get(cfw_uuid, (None, None, None))
+        if command_queue is None or process is None or not process.is_alive():
+            # No worker left to ask (never dispatched, or it already exited after resolving its
+            # own drop earlier): cfw_collection's entry is then either the live in-process instance
+            # or a pre-dispatch snapshot whose object_ids are empty, so this is a harmless no-op.
+            cfw.drop_last_data(self.location)
+            return
+
+        command_queue.put(set(cfw.children_if_root))
 
     def _init_run(self) -> tuple[set[UUID], set[UUID], set[UUID]]:
         """Validate state, construct the executor, and return fresh id-tracking sets."""
@@ -142,7 +166,11 @@ class ExecutionOrchestrator:
             )
 
         self.executor = ComputeFrameworkExecutor(
-            self.cfw_register, self.worker_manager, tfs_connection_map=self.tfs_connection_map
+            self.cfw_register,
+            self.worker_manager,
+            tfs_connection_map=self.tfs_connection_map,
+            function_extender=self.function_extender,
+            worker_extender_payload=self.worker_extender_payload,
         )
         self._register_modes = self.cfw_register.get_parallelization_modes()
 
@@ -174,7 +202,7 @@ class ExecutionOrchestrator:
                 continue
 
             if not self._can_run_step(
-                step.required_uuids, step.get_uuids(), finished_ids, currently_running_steps, step
+                step.required_uuids, step.get_uuids(), finished_ids, currently_running_steps, step, made_progress
             ):
                 continue
             self._execute_step(step)
@@ -222,8 +250,34 @@ class ExecutionOrchestrator:
         )
 
     def _finalize(self) -> None:
+        self._workers_joined = False
         self.data_lifecycle_manager.set_artifacts(self.cfw_register.get_artifacts())
         self.join()
+        self._workers_joined = True
+        self._drop_all_uploaded_flight_tables()
+
+    def _notify_run_complete(self) -> None:
+        """A raising extender's on_run_complete() must not stop the others from running."""
+        for extender in sorted(self.function_extender or (), key=lambda e: e.priority):
+            try:
+                extender.on_run_complete(self._run_id)
+            except Exception as e:
+                logger.error("Extender %s.on_run_complete() %s", extender.__class__.__name__, contained_raise_reason(e))
+
+    def _drop_all_uploaded_flight_tables(self) -> None:
+        """Final sweep of every cfw's flight table by uuid key, including worker-dispatched cfws."""
+        if not self.location:
+            return
+        table_keys = {str(uuid) for uuid in self.executor.cfw_collection}
+        table_keys.update(oid for cfw in self.executor.cfw_collection.values() for oid in cfw.get_object_ids())
+        if not table_keys:
+            return
+        try:
+            FlightServer.drop_tables(self.location, table_keys)
+        except Exception as e:
+            # Best-effort cleanup runs inside a finally: raising here would replace whatever
+            # real exception is propagating (e.g. a dead flight server) with this one.
+            logger.warning(f"Failed to drop uploaded flight tables during finalize: {e}")
 
     def _check_for_error(self) -> bool:
         """Return True if the run loop should stop (compute framework manager gone).
@@ -240,6 +294,9 @@ class ExecutionOrchestrator:
                 if isinstance(original, BaseException):
                     raise original
                 raise MlodaRunError(self.cfw_register.get_error_msg())
+            # Drain queues first: a fast worker can exit before its queue is ever polled,
+            # which would otherwise false-positive as orphaned below.
+            self.worker_manager.poll_result_queues()
             dead = self.worker_manager.find_dead_workers()
             if dead:
                 raise MlodaRunError(f"Worker process(es) died unexpectedly: {dead}")
@@ -279,6 +336,10 @@ class ExecutionOrchestrator:
                 if ParallelizationMode.MULTIPROCESSING in self.cfw_register.get_parallelization_modes():
                     time.sleep(0.01)
 
+            # A cfw's last dependent can finish in the same pass that visited its own
+            # drop-check with a stale finished_ids (see _run_planner_pass), so nothing
+            # guarantees another FeatureGroupStep is iterated afterwards to flush it.
+            self._drop_data_for_finished_cfws(finished_ids)
         finally:
             self._finalize()
 
@@ -307,6 +368,9 @@ class ExecutionOrchestrator:
 
                 time.sleep(0.01)
 
+            # See compute(): flush anything left in track_data_to_drop once finished_ids
+            # is fully up to date, since no further FeatureGroupStep iteration is guaranteed.
+            self._drop_data_for_finished_cfws(finished_ids)
         finally:
             self._finalize()
 
@@ -325,14 +389,19 @@ class ExecutionOrchestrator:
         if not step.step_is_done:
             return False
 
-        if isinstance(step, (TransformFrameworkStep, JoinStep)):
+        if isinstance(step, TransformFrameworkStep):
+            self._drop_tfs_source_if_possible(step)
+            return True
+
+        if isinstance(step, JoinStep):
+            self._drop_join_source_if_possible(step)
             return True
 
         if isinstance(step, FeatureGroupStep):
             if step.features.any_uuid is None:
                 raise ValueError(f"from_feature_uuid should not be none. {step}")
 
-            cfw = self.executor.get_cfw(step.compute_framework, step.features.any_uuid)
+            cfw = self.executor.get_cfw(step.compute_framework, step.features.any_uuid, step.tfs_ids)
             self.add_to_result_data_collection(cfw, step.features, step.uuid)
             self._drop_data_if_possible(cfw, step)
 
@@ -345,38 +414,65 @@ class ExecutionOrchestrator:
         This method checks if data can be dropped based on the CFW's dependencies
         and either drops the data directly or sends a command to a worker process to do so.
         """
-        process, command_queue, result_queue = self.worker_manager.process_register.get(cfw.uuid, (None, None, None))
-
         feature_uuids_to_possible_drop = {f.uuid for f in step.features.features}
+        self._mark_children_and_track(cfw, feature_uuids_to_possible_drop)
+
+    def _drop_join_source_if_possible(self, step: JoinStep) -> None:
+        """Marks the join's destination-registered cfw with the link's own uuid; applies to both
+        same- and cross-framework joins, since only the join's own completion can supply it."""
+        link_cfw_uuid = self.cfw_register.get_cfw_uuid_as_registered(
+            step.destination_framework.get_class_name(), step.link.uuid
+        )
+        if link_cfw_uuid is None:
+            return
+
+        link_cfw = self.executor.cfw_collection[link_cfw_uuid]
+        self._mark_children_and_track(link_cfw, {step.link.uuid})
+
+    def _drop_tfs_source_if_possible(self, step: TransformFrameworkStep) -> None:
+        """Marks a hop's SOURCE-side cfw with its owed tokens once the hop itself finishes, for both
+        a plain hop and a join-triggered hop; best-effort, so an unresolved cfw is left for later."""
+        if not step.owed_tokens:
+            return
+
+        from_cfw_uuid: UUID | None = None
+        if step.source_framework_uuid:
+            from_cfw_uuid = self.cfw_register.get_cfw_uuid(
+                step.from_framework.get_class_name(), step.source_framework_uuid
+            )
+        else:
+            # A subclass-clustered hop's required_uuids can name parents owned by different
+            # sibling steps/frameworks (see execution_plan.py), so try each until one resolves
+            # instead of picking an arbitrary, possibly-wrong member.
+            for candidate_uuid in step.required_uuids:
+                from_cfw_uuid = self.cfw_register.get_cfw_uuid(step.from_framework.get_class_name(), candidate_uuid)
+                if from_cfw_uuid is not None:
+                    break
+
+        if from_cfw_uuid is None:
+            return
+
+        self._mark_children_and_track(self.executor.cfw_collection[from_cfw_uuid], set(step.owed_tokens))
+
+    def _mark_children_and_track(self, cfw: ComputeFramework, children: set[UUID]) -> None:
+        """
+        Records newly-finished children on a CFW and, if not yet fully satisfied, tracks the
+        remaining wait-condition so a later `_drop_data_for_finished_cfws` pass can flush it. The
+        worker-owned branch always tracks, since that later flush is a safe no-op if the worker
+        already resolved and exited on its own.
+        """
+        _, command_queue, _ = self.worker_manager.process_register.get(cfw.uuid, (None, None, None))
 
         if command_queue is None:
-            data_to_drop = cfw.add_already_calculated_children_and_drop_if_possible(
-                feature_uuids_to_possible_drop, self.location
-            )
+            data_to_drop = cfw.add_already_calculated_children_and_drop_if_possible(children, self.location)
             if isinstance(data_to_drop, frozenset):
                 self.data_lifecycle_manager.track_data_to_drop[cfw.uuid] = set(data_to_drop)
         else:
-            command_queue.put(feature_uuids_to_possible_drop)
+            command_queue.put(children)
 
-            flyway_datasets = self.cfw_register.get_uuid_flyway_datasets(cfw.uuid)
+            flyway_datasets = self.cfw_register.get_uuid_flyway_datasets(cfw.uuid) or set(cfw.children_if_root)
             if flyway_datasets:
                 self.data_lifecycle_manager.track_data_to_drop[cfw.uuid] = flyway_datasets
-
-            if result_queue is not None:
-                self._wait_for_drop_completion(result_queue, cfw.uuid)
-
-    def _wait_for_drop_completion(
-        self, result_queue: multiprocessing.Queue[Any], cfw_uuid: UUID, timeout: float = 5.0
-    ) -> None:
-        """
-        Wait for drop operation to complete from worker process.
-
-        Args:
-            result_queue: The queue to receive completion signals from the worker.
-            cfw_uuid: The UUID of the compute framework being dropped.
-            timeout: Maximum time to wait for completion in seconds.
-        """
-        self.worker_manager.wait_for_drop_completion(result_queue, cfw_uuid, timeout)
 
     def _execute_step(self, step: Any) -> None:
         """
@@ -391,7 +487,7 @@ class ExecutionOrchestrator:
         """
         Joins all tasks (threads or processes) and terminates multiprocessing processes.
         """
-        self.worker_manager.join_all()
+        self.worker_manager.join_all(graceful_timeout=self._graceful_shutdown_timeout)
 
     def add_to_result_data_collection(self, cfw: ComputeFramework, features: FeatureSet, step_uuid: UUID) -> None:
         """
@@ -400,7 +496,7 @@ class ExecutionOrchestrator:
         self.data_lifecycle_manager.add_to_result_data_collection(cfw, features, step_uuid, self.location)
 
     def get_result_data(
-        self, cfw: ComputeFramework, selected_feature_names: Sequence[FeatureName], location: Optional[str] = None
+        self, cfw: ComputeFramework, selected_feature_names: Sequence[FeatureName], location: str | None = None
     ) -> Any:
         """
         Gets result data from the compute framework.
@@ -414,23 +510,38 @@ class ExecutionOrchestrator:
     def __enter__(
         self,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        function_extender: Optional[set[Extender]] = None,
-        api_data: Optional[dict[str, Any]] = None,
-        artifacts: Optional[dict[str, Any]] = None,
+        function_extender: set[Extender] | None = None,
+        api_data: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
     ) -> None:
         """
         Enters the context of the ExecutionOrchestrator.
         """
+        run_context = run_context if run_context is not None else RunContext()
+        self.function_extender = function_extender
+        self._run_id = run_context.run_id
+        self._graceful_shutdown_timeout = run_context.graceful_shutdown_timeout
+
         if ParallelizationMode.MULTIPROCESSING not in parallelization_modes:
-            self.cfw_register = CfwManager(parallelization_modes, function_extender)
+            self.cfw_register = CfwManager(parallelization_modes)
             self.manager = None
+            self.worker_extender_payload = None
         else:
+            raise_on_multiprocessing_connection_conflict(self.tfs_connection_map)
             raise_on_unpicklable_join_link(self.execution_planner)
             raise_on_unpicklable_step_feature_group(self.execution_planner)
+            raise_on_unpicklable_child_bootstrap(run_context.child_bootstrap)
+            raise_on_unpicklable_extender(function_extender)
+            # Snapshot right after the preflight, once, in this process: workers get this exact
+            # bytes payload, never a fetch through the register/proxy.
+            self.worker_extender_payload = pickle.dumps(function_extender) if function_extender is not None else None
 
             MyManager.register("CfwManager", CfwManager)
             self.manager = MyManager(ctx=mp_spawn_context()).__enter__()
-            self.cfw_register = self.manager.CfwManager(parallelization_modes, function_extender)
+            self.cfw_register = self.manager.CfwManager(parallelization_modes)
+
+        self.cfw_register.set_run_context(run_context)
 
         if self.flight_server:
             if self.flight_server.flight_server_process is None:
@@ -452,15 +563,19 @@ class ExecutionOrchestrator:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """
-        Exits the context of the ExecutionOrchestrator.
+        Exits the context of the ExecutionOrchestrator and signals run completion to the extenders.
 
         Args:
             exc_type: The exception type.
             exc_val: The exception value.
             exc_tb: The exception traceback.
         """
-        if self.manager is not None:
-            self.manager.shutdown()
+        try:
+            if self._workers_joined:
+                self._notify_run_complete()
+        finally:
+            if self.manager is not None:
+                self.manager.shutdown()
 
     def get_artifacts(self) -> dict[str, Any]:
         """
@@ -480,13 +595,8 @@ class ExecutionOrchestrator:
 
         class_name = step.compute_framework.get_class_name()
 
-        resolved_uuid = self.cfw_register.get_unique_cfw_uuid(class_name, step.tfs_ids)
-        if resolved_uuid is not None:
-            return resolved_uuid
-
-        if step.features.any_uuid is None:
-            return None
-        return self.cfw_register.get_cfw_uuid(class_name, step.features.any_uuid)
+        # See CfwManager.resolve_cfw_uuid_by_tfs_ids for the shared fallback chain.
+        return self.cfw_register.resolve_cfw_uuid_by_tfs_ids(class_name, step.tfs_ids, step.features.any_uuid)
 
     def _can_run_step(
         self,
@@ -495,6 +605,7 @@ class ExecutionOrchestrator:
         finished_steps: set[UUID],
         currently_running_steps: set[UUID],
         step: Any = None,
+        made_progress: bool = False,
     ) -> bool:
         """
         Checks if a step can be run. If it can, add it to the currently_running_steps set.
@@ -507,6 +618,9 @@ class ExecutionOrchestrator:
             if not required_uuids.issubset(finished_steps) or step_uuid.intersection(currently_running_steps):
                 return False
 
+            if self._defer_ready_step(step, made_progress):
+                return False
+
             cfw_uuid = self._cfw_to_occupy(step)
             if cfw_uuid is not None:
                 if cfw_uuid in self._occupied_cfws:
@@ -515,6 +629,13 @@ class ExecutionOrchestrator:
 
             currently_running_steps.update(step_uuid)
             return True
+
+    def _defer_ready_step(self, step: Any, made_progress: bool) -> bool:
+        """Test seam: return True to refuse an otherwise-runnable step for this pass.
+
+        Always False in production. Tests monkeypatch this to inject scheduling jitter.
+        """
+        return False
 
     def _mark_step_as_finished(
         self, step_uuid: set[UUID], finished_steps: set[UUID], currently_running_steps: set[UUID]
@@ -535,6 +656,15 @@ class ExecutionOrchestrator:
 
     def get_result(self) -> list[Any]:
         """
-        Gets the results.
+        Gets the results, ordered like `get_result_items()`.
         """
-        return self.data_lifecycle_manager.get_results()
+        return [result for _, result in self.get_result_items()]
+
+    def get_result_items(self) -> list[tuple[UUID, Any]]:
+        """
+        Gets the results with their step uuids, ordered by position in the resolved execution
+        plan. A uuid absent from the plan sorts last.
+        """
+        plan_position = {step.uuid: index for index, step in enumerate(self.execution_planner)}
+        items = self.data_lifecycle_manager.get_result_items()
+        return sorted(items, key=lambda item: plan_position.get(item[0], len(plan_position)))

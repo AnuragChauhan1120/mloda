@@ -166,3 +166,99 @@ def test_orc_reader_imports_without_pyarrow() -> None:
     assert "IMPORTED" in result.stdout, (
         f"Expected IMPORTED sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Feather: match still assumes a plain name present, load_data raises ImportError
+# ---------------------------------------------------------------------------
+_BODY_FEATHER_MATCH_AND_LOAD: str = """
+import sys
+
+from mloda.provider import FeatureSet
+from mloda.user import Feature
+from mloda_plugins.feature_group.input_data.read_files.feather import FeatherReader
+
+match_result = FeatherReader.match_read_file_data_access(["/nonexistent/x.feather"], ["a"])
+
+features = FeatureSet()
+features.add(Feature("a"))
+
+try:
+    FeatherReader.load_data("/nonexistent/x.feather", features)
+    load_result = "NO_RAISE"
+except ImportError as e:
+    load_result = "IMPORT_ERROR:" + str(e)
+except Exception as e:
+    load_result = "OTHER:" + type(e).__name__ + ":" + str(e)
+
+print("MATCH:" + str(match_result))
+print("LOAD:" + load_result)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_feather_reader_match_and_load_without_pyarrow() -> None:
+    """Regression guard: real pyarrow absence still matches the plain name and load_data raises ImportError."""
+    result = run_blocked(_BODY_FEATHER_MATCH_AND_LOAD)
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "MATCH:/nonexistent/x.feather" in result.stdout, (
+        f"Expected match sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "LOAD:IMPORT_ERROR:" in result.stdout, (
+        f"Expected import-error sentinel. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "mloda[pyarrow]" in result.stdout, (
+        f"Expected mloda[pyarrow] install hint. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# YAML: the module must import without PyYAML, and only raise once produce_document runs
+# ---------------------------------------------------------------------------
+_BODY_YAML_IMPORT_AND_LOAD: str = """
+import os
+import sys
+import tempfile
+
+try:
+    from mloda_plugins.feature_group.input_data.read_files.yaml_document_reader import YamlDocumentReader
+    print("IMPORTED")
+except ImportError as e:
+    print("IMPORT_ERROR:" + str(e))
+    sys.exit(0)
+except Exception as e:
+    print("IMPORT_OTHER:" + type(e).__name__ + ":" + str(e))
+    sys.exit(0)
+
+fd, path = tempfile.mkstemp(suffix=".yaml")
+os.close(fd)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("key: value\\n")
+
+try:
+    YamlDocumentReader.produce_document(path)
+    load_result = "NO_RAISE"
+except ImportError as e:
+    load_result = "IMPORT_ERROR:" + str(e)
+except Exception as e:
+    load_result = "OTHER:" + type(e).__name__ + ":" + str(e)
+finally:
+    os.remove(path)
+
+print("LOAD:" + load_result)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_yaml_document_reader_imports_without_yaml_and_load_raises() -> None:
+    result = run_blocked(_BODY_YAML_IMPORT_AND_LOAD, module="yaml")
+    assert result.returncode == 0, f"Body crashed.\nstderr:\n{result.stderr}"
+    assert "IMPORTED" in result.stdout, (
+        f"Expected IMPORTED sentinel after blocking yaml. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "LOAD:IMPORT_ERROR:" in result.stdout, (
+        f"Expected import-error sentinel from produce_document. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )
+    assert "mloda[yaml]" in result.stdout, (
+        f"Expected mloda[yaml] install hint. Got stdout: {result.stdout!r}\nstderr: {result.stderr}"
+    )

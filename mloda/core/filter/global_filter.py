@@ -1,7 +1,7 @@
 from copy import copy, deepcopy
 from datetime import datetime, timezone
 from itertools import chain
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID
 
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
@@ -35,6 +35,7 @@ _STAGE_DEPTH: dict[EliminationStage, int] = {
     "matcher_error": 0,
     "input_data": 1,
     "value_rejection": 2,
+    "name": 2,  # same criteria hook as value_rejection
     "domain": 3,
     "scope": 4,
     "capability": 5,
@@ -156,7 +157,7 @@ class GlobalFilter:
         self,
         feature_group: type[FeatureGroup],
         feat: Feature,
-        data_access_collection: Optional[DataAccessCollection] = None,
+        data_access_collection: DataAccessCollection | None = None,
     ) -> set[SingleFilter]:
         """
         We need to figure out if the filter feature is a part of the feature class and thus can be used as filter.
@@ -176,6 +177,8 @@ class GlobalFilter:
         for filter in self.filters:
             # We are making a deepcopy so that, we do not change the original filter.
             _filter = deepcopy(filter)
+            # Host keys imported below are never the filter feature's own declaration.
+            _filter.filter_feature.options.lock_own_keys()
             _filter.filter_feature.options = self.unify_options(feat.options, _filter.filter_feature.options)
 
             # criteria records its own drops: only it can tell a defect from a decline from a plain non-match.
@@ -246,13 +249,15 @@ class GlobalFilter:
         for key, value in feat_options.group.items():
             if key not in filter_options:
                 filter_options.add_to_group(key, _isolate_forwarded_value(value, memo, _copy_feature_leaf))
+                if key in feat_options.non_forwarded_group_keys:
+                    filter_options.mark_non_forwarded(key)
         for key, value in feat_options.context.items():
             if key not in filter_options:
                 filter_options.add_to_context(key, _isolate_forwarded_value(value, memo, _copy_feature_leaf))
         return filter_options
 
     def _warn_on_diverging_options(
-        self, feature_group: Optional[type[FeatureGroup]], feat_options: Options, filter_options: Options
+        self, feature_group: type[FeatureGroup] | None, feat_options: Options, filter_options: Options
     ) -> None:
         """Report keys the filter feature declares differently, unless intake provably erases the difference."""
         for key, value in chain(feat_options.group.items(), feat_options.context.items()):
@@ -277,7 +282,7 @@ class GlobalFilter:
             logger.warning(message)
 
     @staticmethod
-    def _intake_fill(feature_group: Optional[type[FeatureGroup]], key: str, filter_options: Options) -> Any:
+    def _intake_fill(feature_group: type[FeatureGroup] | None, key: str, filter_options: Options) -> Any:
         """The value intake materializes for ``key``, None when it fills nothing.
 
         Mirrors ``FeatureGroup.options_with_defaults``: a concrete spec default fills a key the spec reads
@@ -308,7 +313,7 @@ class GlobalFilter:
         self,
         feature_group: type[FeatureGroup],
         filter: SingleFilter,
-        data_access_collection: Optional[DataAccessCollection] = None,
+        data_access_collection: DataAccessCollection | None = None,
     ) -> bool:
         """A raising match hook is a non-match for this filter only, mirroring the resolution seam (#845).
 
@@ -530,8 +535,8 @@ class GlobalFilter:
         self,
         event_from: datetime,
         event_to: datetime,
-        valid_from: Optional[datetime] = None,
-        valid_to: Optional[datetime] = None,
+        valid_from: datetime | None = None,
+        valid_to: datetime | None = None,
         max_exclusive: bool = True,
         event_time_column: str | Feature = DefaultOptionKeys.reference_time,
         validity_time_column: str | Feature = DefaultOptionKeys.time_travel,
@@ -551,8 +556,8 @@ class GlobalFilter:
         Parameters:
         - event_from (datetime): Start of the time range (with timezone).
         - event_to (datetime): End of the time range (with timezone).
-        - valid_from (Optional[datetime]): Start of the validity period (optional, with timezone).
-        - valid_to (Optional[datetime]): End of the validity period (optional, with timezone).
+        - valid_from (datetime | None): Start of the validity period (optional, with timezone).
+        - valid_to (datetime | None): End of the validity period (optional, with timezone).
         - max_exclusive (bool): If True, the `event_to` and `valid_to` values are treated as exclusive.
         - event_time_column: the column name for the event time filter. Default is DefaultOptionKeys.reference_time.
         - validity_time_column: the column name for the validity time filter. Default is DefaultOptionKeys.time_travel.

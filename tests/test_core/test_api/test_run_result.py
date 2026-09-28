@@ -11,6 +11,8 @@ Contract under test:
   * One planning pass per one-shot call: ``run_all`` constructs exactly one Engine and accessing
     ``plan`` afterwards constructs no further Engine.
   * Both classes are exported from ``mloda.user``.
+  * ``RunResult.frames()`` pairs each frame with the compute ``PlanStep`` that produced it, by
+    ``step_uuid``, not by list position.
 
 The chained ``plan_info_sales__mean_aggr`` request reuses the feature groups registered by
 ``tests/test_core/test_api/test_plan_info.py`` so no new registry-wide DataCreator claim is made.
@@ -19,16 +21,21 @@ The chained ``plan_info_sales__mean_aggr`` request reuses the feature groups reg
 import collections.abc
 import copy
 import pickle  # nosec B403
+import threading
+import time
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
+import pandas as pd
 import pytest
 
 # Aliased: a bare ``import mloda.user`` would bind the name ``mloda`` to the package and collide
 # with the ``mloda`` mlodaAPI alias imported below.
 import mloda.user as mloda_user
 from mloda.core.api.request import Engine
-from mloda.user import Feature, ParallelizationMode, PlanStep, PluginCollector, mloda, mlodaAPI
+from mloda.provider import BaseInputData, ComputeFramework, DataCreator, FeatureGroup, FeatureSet
+from mloda.user import Feature, Options, ParallelizationMode, PlanStep, PluginCollector, mloda, mlodaAPI
 from mloda_plugins.compute_framework.base_implementations.pandas.dataframe import PandasDataFrame
 from mloda_plugins.feature_group.experimental.aggregated_feature_group.pandas import PandasAggregatedFeatureGroup
 from tests.test_core.test_api.test_plan_info import PlanInfoPandasSource
@@ -40,6 +47,83 @@ _CHAINED_FEATURES: list[Feature | str] = ["plan_info_sales__mean_aggr"]
 
 # Two feature groups resolve here, so the stream yields two elements and can be closed early.
 _TWO_GROUP_FEATURES: list[Feature | str] = ["plan_info_sales", "plan_info_sales__mean_aggr"]
+
+_PROBE_VALUES = {"A": [1, 2, 3], "B": [10, 20, 30]}
+
+
+class RunResultProbe(FeatureGroup):
+    """Root source whose column values depend on the ``source_table`` group option."""
+
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({"run_result_probe_value"})
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        assert features.options is not None
+        return pd.DataFrame({"run_result_probe_value": _PROBE_VALUES[features.options.get("source_table")]})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PandasDataFrame}
+
+
+_PROBE_PLUGINS = PluginCollector.enabled_feature_groups({RunResultProbe})
+
+
+class RunResultOrderProbe(FeatureGroup):
+    """The "slow" role blocks on a class-level gate until "fast" signals it, then adds a short
+    delay so a single THREADING poll pass can't hide the fix (a class attribute, since a
+    threading.Event in Options wouldn't survive Engine.compute()'s per-step deepcopy)."""
+
+    _gate: threading.Event = threading.Event()
+
+    @classmethod
+    def input_data(cls) -> BaseInputData | None:
+        return DataCreator({"run_result_order_probe_value"})
+
+    @classmethod
+    def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
+        assert features.options is not None
+        role = features.options.get("role")
+        if role == "slow":
+            assert cls._gate.wait(timeout=5.0), "fast role never signalled the gate"
+            time.sleep(0.25)
+        elif role == "fast":
+            cls._gate.set()
+        return pd.DataFrame({"run_result_order_probe_value": [features.options.get("probe_id")]})
+
+    @classmethod
+    def compute_framework_rule(cls) -> set[type[ComputeFramework]]:
+        return {PandasDataFrame}
+
+
+_ORDER_PROBE_PLUGINS = PluginCollector.enabled_feature_groups({RunResultOrderProbe})
+
+
+def _order_probe_feature(probe_id: str, role: str | None = None) -> Feature:
+    context: dict[str, Any] = {} if role is None else {"role": role}
+    return Feature("run_result_order_probe_value", options=Options(group={"probe_id": probe_id}, context=context))
+
+
+def _order_probe_ids_in_plan(plan: list[PlanStep]) -> list[str]:
+    """The requested probe_id of each order-probe compute step, in plan order."""
+    ids: list[str] = []
+    for step in plan:
+        if step.step_kind != "compute" or "run_result_order_probe_value" not in step.feature_names:
+            continue
+        assert step.feature_set_options is not None
+        ids.append(step.feature_set_options.get("probe_id"))
+    return ids
+
+
+def _run_probe(features: list[Feature | str]) -> Any:
+    return mlodaAPI.run_all(
+        features,
+        compute_frameworks={PandasDataFrame},
+        parallelization_modes={ParallelizationMode.SYNC},
+        plugin_collector=_PROBE_PLUGINS,
+    )
 
 
 # Helpers return Any on purpose: the concrete return types (RunResult/ResultStream) are exactly
@@ -295,3 +379,122 @@ class TestSubclassDispatch:
 
         assert isinstance(results, RunResult)
         assert len(results) == 1
+
+
+class TestRunResultFrames:
+    """frames() pairs each frame with the compute PlanStep that produced it."""
+
+    def test_frames_pair_each_frame_with_the_step_whose_options_produced_it(self) -> None:
+        results = _run_probe([Feature("run_result_probe_value", options={"source_table": t}) for t in ("A", "B")])
+
+        pairs = results.frames()
+
+        assert {step.feature_set_options.get("source_table") for step, _ in pairs} == {"A", "B"}
+        for step, frame in pairs:
+            table = step.feature_set_options.get("source_table")
+            assert frame["run_result_probe_value"].tolist() == _PROBE_VALUES[table]
+
+    def test_frames_pair_by_step_uuid_not_by_position(self) -> None:
+        from mloda.user import RunResult
+
+        uuid_a = uuid4()
+        uuid_b = uuid4()
+        step_a = PlanStep("compute", ("a",), None, None, None, None, step_uuid=uuid_a)
+        step_b = PlanStep("compute", ("b",), None, None, None, None, step_uuid=uuid_b)
+        frame_a, frame_b = object(), object()
+
+        results = RunResult([frame_b, frame_a], [step_a, step_b], [(uuid_b, frame_b), (uuid_a, frame_a)])
+
+        assert results.frames() == [(step_b, frame_b), (step_a, frame_a)]
+
+    def test_unpicklable_options_context_does_not_block_pickling(self) -> None:
+        options = Options(group={"source_table": "A"}, context={"unpicklable": lambda: None})
+        results = _run_probe([Feature("run_result_probe_value", options=options)])
+
+        loaded = pickle.loads(pickle.dumps(results))  # nosec B301
+
+        [(step, frame)] = loaded.frames()
+        assert step.feature_set_options == Options(group={"source_table": "A"})
+        assert frame["run_result_probe_value"].tolist() == _PROBE_VALUES["A"]
+
+
+class TestResultStreamFrames:
+    """ResultStream.frames() pairs each frame with the compute PlanStep that produced it."""
+
+    def test_frames_pair_each_frame_with_the_step_whose_options_produced_it(self) -> None:
+        stream = mlodaAPI.stream_all(
+            [Feature("run_result_probe_value", options={"source_table": t}) for t in ("A", "B")],
+            compute_frameworks={PandasDataFrame},
+            parallelization_modes={ParallelizationMode.SYNC},
+            plugin_collector=_PROBE_PLUGINS,
+        )
+
+        pairs = list(stream.frames())
+
+        tables = set()
+        for step, frame in pairs:
+            assert step.feature_set_options is not None
+            table = step.feature_set_options.get("source_table")
+            tables.add(table)
+            assert frame["run_result_probe_value"].tolist() == _PROBE_VALUES[table]
+        assert tables == {"A", "B"}
+
+    def test_frames_pair_by_step_uuid_not_by_position(self) -> None:
+        from mloda.user import ResultStream
+
+        uuid_a = uuid4()
+        uuid_b = uuid4()
+        step_a = PlanStep("compute", ("a",), None, None, None, None, step_uuid=uuid_a)
+        step_b = PlanStep("compute", ("b",), None, None, None, None, step_uuid=uuid_b)
+        frame_a, frame_b = object(), object()
+
+        stream = ResultStream((item for item in [(uuid_b, frame_b), (uuid_a, frame_a)]), [step_a, step_b])
+
+        assert list(stream.frames()) == [(step_b, frame_b), (step_a, frame_a)]
+
+
+class TestRunAllListOrderMatchesPlanOrder:
+    """run_all's list and frames() follow plan order, not THREADING completion order."""
+
+    def _run_with_plan_first_gated(self) -> Any:
+        session = mloda.prepare(
+            [_order_probe_feature("alpha"), _order_probe_feature("beta")],
+            compute_frameworks={PandasDataFrame},
+            plugin_collector=_ORDER_PROBE_PLUGINS,
+            parallelization_modes={ParallelizationMode.SYNC},
+        )
+        slow_probe_id = _order_probe_ids_in_plan(session.resolved_plan())[0]
+        fast_probe_id = "beta" if slow_probe_id == "alpha" else "alpha"
+        RunResultOrderProbe._gate = threading.Event()
+
+        return mlodaAPI.run_all(
+            [
+                _order_probe_feature(slow_probe_id, role="slow"),
+                _order_probe_feature(fast_probe_id, role="fast"),
+            ],
+            compute_frameworks={PandasDataFrame},
+            plugin_collector=_ORDER_PROBE_PLUGINS,
+            parallelization_modes={ParallelizationMode.THREADING},
+        )
+
+    def test_threading_list_and_frames_match_plan_order(self) -> None:
+        results = self._run_with_plan_first_gated()
+
+        expected_order = _order_probe_ids_in_plan(results.plan)
+        actual_order = [frame["run_result_order_probe_value"].iloc[0] for frame in list(results)]
+        frame_order = [frame["run_result_order_probe_value"].iloc[0] for _, frame in results.frames()]
+        assert actual_order == expected_order
+        assert frame_order == expected_order
+
+    def test_sync_list_order_already_matches_plan_order(self) -> None:
+        """Regression guard: SYNC is single-threaded, so this already passes today."""
+        results = mlodaAPI.run_all(
+            [_order_probe_feature("alpha"), _order_probe_feature("beta")],
+            compute_frameworks={PandasDataFrame},
+            plugin_collector=_ORDER_PROBE_PLUGINS,
+            parallelization_modes={ParallelizationMode.SYNC},
+        )
+
+        expected_order = _order_probe_ids_in_plan(results.plan)
+        actual_order = [frame["run_result_order_probe_value"].iloc[0] for frame in list(results)]
+        assert actual_order == expected_order

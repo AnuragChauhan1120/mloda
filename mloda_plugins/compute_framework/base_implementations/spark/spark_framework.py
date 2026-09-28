@@ -1,12 +1,13 @@
 import logging
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.provider import BaseMergeEngine
 from mloda_plugins.compute_framework.base_implementations.spark.spark_merge_engine import SparkMergeEngine
-from mloda.user import FeatureName
+from mloda.user import FeatureName, ParallelizationMode
 from mloda.provider import ComputeFramework
 from mloda.provider import BaseFilterEngine, BaseMaskEngine
+from mloda.provider import OutputSchema
 from mloda_plugins.compute_framework.base_implementations.spark.spark_filter_engine import SparkFilterEngine
 from mloda_plugins.compute_framework.base_implementations.spark.spark_mask_engine import SparkMaskEngine
 from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import pick_helper_column_name
@@ -36,7 +37,7 @@ class SparkFramework(ComputeFramework):
     It requires a SparkSession to be provided through the framework connection object.
     """
 
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         """Use given SparkSession connection."""
         if SparkSession is None:
             raise ImportError("PySpark is not installed. To be able to use this framework, please install pyspark.")
@@ -71,6 +72,11 @@ class SparkFramework(ComputeFramework):
             return False
 
     @classmethod
+    def supported_parallelization_modes(cls) -> set[ParallelizationMode]:
+        """The live SparkSession cannot cross a process boundary."""
+        return {ParallelizationMode.SYNC, ParallelizationMode.THREADING}
+
+    @classmethod
     def expected_data_framework(cls) -> Any:
         return cls.spark_dataframe()
 
@@ -82,8 +88,8 @@ class SparkFramework(ComputeFramework):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         column_names = set(data.columns)
         _selected_feature_names = self.identify_naming_convention(
@@ -99,7 +105,7 @@ class SparkFramework(ComputeFramework):
             return str(data.schema[column_name].dataType)
         return None
 
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         if column_name not in data.columns:
             return None
         spark_type = data.schema[column_name].dataType
@@ -139,6 +145,20 @@ class SparkFramework(ComputeFramework):
         if isinstance(spark_type, DecimalType):
             return DataType.DECIMAL
         return None
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read schema.fields once, rather than indexing the schema by name per column. Duplicate
+        column names (e.g. an un-aliased join) collapse to the first occurrence.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        fields = data.schema.fields
+        if not fields:
+            return None
+        seen: dict[str, str] = {}
+        for field in fields:
+            seen.setdefault(field.name, str(field.dataType))
+        return tuple((name, seen[name]) for name in sorted(seen, key=str))
 
     @classmethod
     def spark_dataframe(cls) -> Any:

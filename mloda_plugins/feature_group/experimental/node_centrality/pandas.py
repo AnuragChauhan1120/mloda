@@ -4,7 +4,7 @@ Pandas implementation for node centrality feature groups.
 
 from __future__ import annotations
 
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 
 try:
@@ -103,7 +103,7 @@ class PandasNodeCentralityFeatureGroup(NodeCentralityFeatureGroup):
         centrality_type: str,
         node_feature: str,
         graph_type: str = "undirected",
-        weight_column: Optional[str] = None,
+        weight_column: str | None = None,
     ) -> pd.Series:
         """
         Calculate centrality metrics for nodes in a graph.
@@ -165,7 +165,7 @@ class PandasNodeCentralityFeatureGroup(NodeCentralityFeatureGroup):
         nodes: np.ndarray[Any, Any],
         source_col: str,
         target_col: str,
-        weight_column: Optional[str] = None,
+        weight_column: str | None = None,
         graph_type: str = "undirected",
     ) -> pd.DataFrame:
         """
@@ -352,9 +352,10 @@ class PandasNodeCentralityFeatureGroup(NodeCentralityFeatureGroup):
                     # Add the fraction to the betweenness centrality
                     betweenness.iloc[v] += num_paths_through_v / num_paths
 
-        # Normalize by the maximum possible betweenness
+        # The ordered-pair loop double-counts each unordered pair for undirected graphs and
+        # covers each direction separately for directed graphs, so (n-1)(n-2) is correct either way.
         if n > 2:
-            betweenness = betweenness / ((n - 1) * (n - 2) / 2)
+            betweenness = betweenness / ((n - 1) * (n - 2))
 
         return betweenness
 

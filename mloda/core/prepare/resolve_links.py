@@ -1,5 +1,5 @@
 from collections import OrderedDict, defaultdict
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID
 
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
@@ -121,54 +121,39 @@ class LinkTrekker:
                         adjust_order(self.data, k_out, k_in)
 
     def order_ordered_ids_by_relation(self) -> None:
-        """
-        We have currently this:
-        odict_items([(UUID('cad2bdde-3028-47c3-a79b-53110c51a2dd'), {UUID('022d7fe1-2ef6-4d9a-83aa-832738575920')}),
-                    (UUID('022d7fe1-2ef6-4d9a-83aa-832738575920'), {UUID('11b118b5-d714-48ff-87ab-190ecd286f61')})])
-        or
-        odict_items([(UUID('022d7fe1-2ef6-4d9a-83aa-832738575920'), {UUID('11b118b5-d714-48ff-87ab-190ecd286f61')}),
-                    (UUID('cad2bdde-3028-47c3-a79b-53110c51a2dd'), {UUID('022d7fe1-2ef6-4d9a-83aa-832738575920')})])
+        """Stable topological sort (Kahn's algorithm), one id at a time: self.order[k] = {v, ...} means k must
+        precede each v; among all currently-ready ids, the one earliest in the original insertion order is always
+        placed next, a self-edge is a no-op, and any leftover cycle falls back to the original insertion order."""
 
-        The second case is not ok, as this would mean that the first link depends on the second link. This is not the case.
-        Therefore, we reorder this in here.
-        """
+        ids: list[UUID] = list(self.order.keys())
+        id_set: set[UUID] = set(ids)
 
-        new_order: OrderedDict[UUID, set[UUID]] = OrderedDict()
-        pos_marker: dict[int, tuple[UUID, set[UUID]]] = {}
+        edges: dict[UUID, set[UUID]] = {
+            node: {v for v in self.order[node] if v in id_set and v != node} for node in ids
+        }
 
-        for o_pos, (o_uuid, o_set) in enumerate(self.order.items()):
-            latest_position = None
+        in_degree: dict[UUID, int] = dict.fromkeys(ids, 0)
+        for node in ids:
+            for v in edges[node]:
+                in_degree[v] += 1
 
-            for i_pos, (i_uuid, i_set) in enumerate(self.order.items()):
-                if o_pos >= i_pos:
+        placed: set[UUID] = set()
+        result: list[UUID] = []
+
+        while len(placed) < len(ids):
+            for node in ids:
+                if node in placed or in_degree[node] > 0:
                     continue
-
-                if o_uuid not in i_set:
-                    continue
-
-                latest_position = i_pos
-
-            if latest_position is None:
-                new_order[o_uuid] = o_set
+                result.append(node)
+                placed.add(node)
+                for v in edges[node]:
+                    in_degree[v] -= 1
+                break
             else:
-                # remembering latest position
-                if latest_position in pos_marker:
-                    for i in range(latest_position, len(pos_marker)):
-                        if i not in pos_marker:
-                            latest_position = i + latest_position
-                            break
-                pos_marker[latest_position] = (o_uuid, o_set)
+                result.extend(node for node in ids if node not in placed)
+                break
 
-        if len(pos_marker.keys()):
-            max_latest_pos = max(pos_marker.keys())
-
-            for i in range(max_latest_pos + 1):
-                if i in pos_marker:
-                    uuid, uuid_set = pos_marker[i]
-                    new_order[uuid] = uuid_set
-                    new_order.move_to_end(uuid)
-
-            self.order = new_order
+        self.order = OrderedDict((node, self.order[node]) for node in result)
 
     def order_links_by_frameworks(self) -> None:
         for trekker, uuids in self.data.items():
@@ -212,7 +197,7 @@ class LinkTrekker:
 
 
 class ResolveLinks:
-    def __init__(self, graph: Graph, links: Optional[set[Link]] = None) -> None:
+    def __init__(self, graph: Graph, links: set[Link] | None = None) -> None:
         self.graph = graph
         self.links = links
         self.link_trekker = LinkTrekker()
@@ -295,7 +280,7 @@ class ResolveLinks:
         right_fg: type,
         right_feature: Any = None,
         left_feature: Any = None,
-        pinned_links: Optional[list[Link]] = None,
+        pinned_links: list[Link] | None = None,
     ) -> list[Link]:
         """Find all matching links using two-pass matching: exact first, then polymorphic.
 
@@ -411,8 +396,8 @@ class ResolveLinks:
     def create_link_trekker_key(
         self,
         link: Link,
-        left_frameworks: Optional[set[type[ComputeFramework]]] = None,
-        right_frameworks: Optional[set[type[ComputeFramework]]] = None,
+        left_frameworks: set[type[ComputeFramework]] | None = None,
+        right_frameworks: set[type[ComputeFramework]] | None = None,
     ) -> LinkFrameworkTrekker:
         """Both sides reduce exactly like Feature.get_compute_framework; the join lookup compares the two."""
         if left_frameworks is None or right_frameworks is None:

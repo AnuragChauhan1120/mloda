@@ -13,7 +13,7 @@ Expected Behavior:
 - Feature("base~0") returns ONLY base~0 column (new capability)
 """
 
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -37,7 +37,7 @@ class SubColumnTestDataCreator(FeatureGroup):
     """Test data creator providing source data for sub-column tests."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator({"source_data"})
 
     @classmethod
@@ -67,7 +67,7 @@ class MultiColumnProducerForSubColumnTest(FeatureGroup):
     def feature_names_supported(cls) -> set[str]:
         return {"base_feature"}
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature("source_data")}
 
     @classmethod
@@ -97,7 +97,7 @@ class SubColumnConsumer(FeatureGroup):
     def feature_names_supported(cls) -> set[str]:
         return {"sub_column_consumer_output"}
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature("base_feature~1")}
 
     @classmethod
@@ -147,6 +147,15 @@ class TestSubColumnFeatureMatching:
 
             assert result is True, f"Sub-column 'base_feature~{suffix}' should match the parent FeatureGroup"
 
+    def test_non_digit_suffix_does_not_match_parent_feature_group(self) -> None:
+        """A non-digit suffix (e.g. base_feature~mean) does not resolve to the parent FeatureGroup."""
+        feature_name = FeatureName("base_feature~mean")
+        options = Options({})
+
+        result = MultiColumnProducerForSubColumnTest.match_feature_group_criteria(feature_name, options, None)
+
+        assert result is False, "A non-digit sub-column suffix should not match the parent FeatureGroup"
+
 
 class TestSubColumnDependencyResolution:
     """Tests for resolving sub-column dependencies to parent FeatureGroups."""
@@ -176,8 +185,7 @@ class TestSubColumnDependencyResolution:
             {PandasDataFrame},
             plugin_collector=plugin_collector,
         )
-        api._batch_run()
-        results = api.get_result()
+        results = api.run()
 
         assert len(results) > 0, "Should return at least one result DataFrame"
 
@@ -386,7 +394,7 @@ class TestSubColumnIntegration:
             def feature_names_supported(cls) -> set[str]:
                 return {"validating_consumer_output"}
 
-            def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+            def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
                 return {Feature("base_feature~1")}
 
             @classmethod
@@ -450,7 +458,7 @@ class TestSubColumnIntegration:
             def feature_names_supported(cls) -> set[str]:
                 return {"multi_sub_column_consumer_output"}
 
-            def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+            def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
                 return {Feature("base_feature~0"), Feature("base_feature~2")}
 
             @classmethod
@@ -639,7 +647,7 @@ class TestSubColumnIntegration:
             def feature_names_supported(cls) -> set[str]:
                 return {"first_consumer_output"}
 
-            def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+            def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
                 return {Feature("base_feature~1")}
 
             @classmethod
@@ -659,7 +667,7 @@ class TestSubColumnIntegration:
             def feature_names_supported(cls) -> set[str]:
                 return {"second_consumer_output"}
 
-            def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+            def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
                 return {Feature("first_consumer_output")}
 
             @classmethod

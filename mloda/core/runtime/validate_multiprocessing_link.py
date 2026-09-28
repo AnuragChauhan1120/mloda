@@ -1,15 +1,18 @@
-"""Guards a JoinStep's Link, and a FeatureGroupStep's or TransformFrameworkStep's feature group
-classes, against a value pickle cannot round-trip, which otherwise fails deep inside a
-multiprocessing worker with an opaque PicklingError instead of being rejected clearly at plan
-time. This only proves resolvability in the current process: a class resolvable here but not
-inside a freshly spawned worker (e.g. one under `if __name__ == "__main__":`) can still fail there.
+"""Guards a Link, a feature group class, a child_bootstrap callable, or an extender against a value
+pickle cannot round-trip, which otherwise fails deep inside a multiprocessing worker with an opaque
+PicklingError instead of being rejected clearly at plan time, and guards a MULTIPROCESSING-capable
+compute framework that resolved a live DataAccessCollection connection. This only proves resolvability
+in the current process: a value resolvable here but not inside a freshly spawned worker can still fail
+there.
 """
 
 import pickle  # nosec
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.function_extender import Extender
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
 from mloda.core.core.step.join_step import JoinStep
 from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
@@ -51,6 +54,9 @@ def raise_on_unpicklable_join_link(steps: Iterable[Any]) -> None:
     """Raise ValueError if any JoinStep in steps carries a Link that multiprocessing cannot pickle."""
     for step in steps:
         if not isinstance(step, JoinStep):
+            continue
+
+        if ParallelizationMode.MULTIPROCESSING not in step.get_parallelization_mode():
             continue
 
         if _is_picklable(step.link):
@@ -112,3 +118,68 @@ def raise_on_unpicklable_step_feature_group(steps: Iterable[Any]) -> None:
                 raise ValueError(_unpicklable_step_feature_group_error(feature_group, step))
 
         raise ValueError(_unpicklable_step_generic_error(step))
+
+
+def _unpicklable_child_bootstrap_error(child_bootstrap: Callable[[], None]) -> str:
+    return (
+        f"child_bootstrap ({child_bootstrap!r}) cannot be pickled for multiprocessing, so mloda cannot send it to "
+        "a spawned worker process. This happens when the callable is a lambda, a closure over a local variable or "
+        "an unpicklable object, or an instance of a class defined inside a function instead of at module level.\n"
+        "Resolution: use a plain, picklable, no-argument callable defined at module level, or run without "
+        "ParallelizationMode.MULTIPROCESSING."
+    )
+
+
+def raise_on_unpicklable_child_bootstrap(child_bootstrap: Callable[[], None] | None) -> None:
+    """Raise ValueError if child_bootstrap is not None and multiprocessing cannot pickle it."""
+    if child_bootstrap is None:
+        return
+
+    if _is_picklable(child_bootstrap):
+        return
+
+    raise ValueError(_unpicklable_child_bootstrap_error(child_bootstrap))
+
+
+def _unpicklable_extender_error(extender: Extender, cause: Exception) -> str:
+    return (
+        f"Extender {extender!r} cannot be pickled for multiprocessing, so mloda cannot send it to a spawned "
+        f"worker process: {type(cause).__name__}: {cause}\n"
+        "Resolution: if the extender builds unpicklable state (e.g. a threading.Lock, an open connection, "
+        "or a client handle) eagerly in __init__, rebuild it lazily instead (e.g. inside __call__ or "
+        "__setstate__); if the caller injects such state (e.g. SomeExtender(client=...)), pass a picklable "
+        "value instead of a live client, or have the extender build its own per-worker handle rather than "
+        "accepting one from the caller; or run without ParallelizationMode.MULTIPROCESSING."
+    )
+
+
+def raise_on_unpicklable_extender(function_extender: set[Extender] | None) -> None:
+    """Raise ValueError if function_extender is not None/empty and any extender in it cannot be pickled."""
+    if not function_extender:
+        return
+
+    for extender in function_extender:
+        try:
+            pickle.dumps(extender)
+        except _UNPICKLABLE_ERRORS as cause:
+            raise ValueError(_unpicklable_extender_error(extender, cause)) from cause
+
+
+def _multiprocessing_connection_conflict_error(cfw_class: type[ComputeFramework]) -> str:
+    return (
+        f"{cfw_class.__name__} supports ParallelizationMode.MULTIPROCESSING and a connection was "
+        "resolved for it from the DataAccessCollection, but a TFS destination that runs in a spawned "
+        "worker is never handed a connection (the worker-side connection bind only runs on the sync "
+        "and threading execute paths).\n"
+        "Resolution: the framework author excludes ParallelizationMode.MULTIPROCESSING from "
+        f"{cfw_class.__name__}.supported_parallelization_modes(), or the caller runs without "
+        "ParallelizationMode.MULTIPROCESSING, or the caller omits that connection from the "
+        "DataAccessCollection."
+    )
+
+
+def raise_on_multiprocessing_connection_conflict(tfs_connection_map: dict[type[ComputeFramework], Any]) -> None:
+    """Raise ValueError if a cfw class in tfs_connection_map supports MULTIPROCESSING."""
+    for cfw_class in tfs_connection_map:
+        if ParallelizationMode.MULTIPROCESSING in cfw_class.supported_parallelization_modes():
+            raise ValueError(_multiprocessing_connection_conflict_error(cfw_class))

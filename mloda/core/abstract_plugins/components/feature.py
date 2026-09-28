@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import copy
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 from mloda.core.abstract_plugins.components.data_types import DataType
 
@@ -56,12 +56,12 @@ class Feature:
     Attributes:
         name (FeatureName): The name of the feature.
         options (Options): The options associated with the feature.
-        domain (Optional[str | Domain]): The domain of the feature.
-        compute_frameworks (Optional[Set[Type[ComputeFramework]]]): The compute frameworks supported by the feature.
-        data_type (Optional[DataType]): The data type of the feature.
+        domain (str | Domain | None): The domain of the feature.
+        compute_frameworks (set[type[ComputeFramework]] | None): The compute frameworks supported by the feature.
+        data_type (DataType | None): The data type of the feature.
         initial_requested_data (bool): Whether the data was initially requested.
-        link (Optional[Link]): The link associated with the feature.
-        index (Optional[Index]): The index associated with the feature.
+        link (Link | None): The link associated with the feature.
+        index (Index | None): The index associated with the feature.
         feature_group_scope (str | type[FeatureGroup] | None): Read by feature resolution and filter
             matching; excluded from identity.
 
@@ -104,13 +104,13 @@ class Feature:
     def __init__(
         self,
         name: str | FeatureName,
-        options: Optional[dict[str, Any] | Options] = None,
-        domain: Optional[str | Domain] = None,
-        compute_framework: Optional[str] = None,
-        data_type: Optional[DataType | str] = None,
+        options: dict[str, Any] | Options | None = None,
+        domain: str | Domain | None = None,
+        compute_framework: str | None = None,
+        data_type: DataType | str | None = None,
         initial_requested_data: bool = False,
-        link: Optional[Link] = None,
-        index: Optional[Index] = None,
+        link: Link | None = None,
+        index: Index | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
         forward_group: frozenset[str] | set[str] | list[str] | tuple[str, ...] | bool | None = None,
         forward_group_exclude: frozenset[str] | set[str] | list[str] | tuple[str, ...] | None = None,
@@ -144,7 +144,7 @@ class Feature:
                 )
 
         # Engine-stamped consumer metadata; in equality/hash via cycle-safe _child_options_key (#608).
-        self.child_options: Optional[Options] = None
+        self.child_options: Options | None = None
 
         self.initial_requested_data = initial_requested_data
 
@@ -158,7 +158,10 @@ class Feature:
 
         # Resolution-only metadata stamped by the engine: one (consumer class name, consumer
         # PROPERTY_MAPPING keys) entry appended per consumer feature group that declares this
-        # feature as an input feature; excluded from equality and hash like link/index.
+        # feature as an input feature; excluded from equality and hash like link/index. Also
+        # unioned in when value-equal requests merge at intake; membership is order-independent.
+        # Never reset: accumulates across runs on a reused instance, so the dual-option warning
+        # may read stale entries.
         self.consumer_attributions: list[tuple[str, frozenset[str]]] = []
 
         # Group keys forwarded onto this input feature, set by Features.merge_options; excluded
@@ -189,8 +192,8 @@ class Feature:
         """Record a consumer attribution, skipping an identical (name, keys) entry.
 
         Appended per consumer feature group that declares this feature as an input feature.
-        Idempotent so re-stamping the same Feature instance across mloda runs does not grow
-        the list unboundedly.
+        Idempotent, which bounds growth on an instance reused across runs but not staleness.
+        Also called by the engine to union a merged twin's entries in.
         """
         entry = (name, keys)
         if entry not in self.consumer_attributions:
@@ -216,7 +219,7 @@ class Feature:
     def not_typed(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> Feature:
         if options is None:
@@ -228,7 +231,7 @@ class Feature:
     def str_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> Feature:
         return cls._typed_of(name, DataType.STRING, options, feature_group)
@@ -237,7 +240,7 @@ class Feature:
     def int32_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> Feature:
         return cls._typed_of(name, DataType.INT32, options, feature_group)
@@ -246,7 +249,7 @@ class Feature:
     def int64_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.INT64, options, feature_group)
@@ -255,7 +258,7 @@ class Feature:
     def float_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.FLOAT, options, feature_group)
@@ -264,7 +267,7 @@ class Feature:
     def double_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.DOUBLE, options, feature_group)
@@ -273,7 +276,7 @@ class Feature:
     def boolean_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.BOOLEAN, options, feature_group)
@@ -282,7 +285,7 @@ class Feature:
     def binary_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.BINARY, options, feature_group)
@@ -291,7 +294,7 @@ class Feature:
     def date_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.DATE, options, feature_group)
@@ -300,7 +303,7 @@ class Feature:
     def timestamp_millis_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.TIMESTAMP_MILLIS, options, feature_group)
@@ -309,7 +312,7 @@ class Feature:
     def timestamp_micros_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.TIMESTAMP_MICROS, options, feature_group)
@@ -318,7 +321,7 @@ class Feature:
     def decimal_of(
         cls,
         name: str | FeatureName,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> "Feature":
         return cls._typed_of(name, DataType.DECIMAL, options, feature_group)
@@ -328,7 +331,7 @@ class Feature:
         cls,
         name: str | FeatureName,
         data_type: DataType,
-        options: Optional[dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
         feature_group: str | type[FeatureGroup] | None = None,
     ) -> Feature:
         if options is None:
@@ -377,6 +380,8 @@ class Feature:
 
         compute_frameworks is hashed too, so it is owned for the same reason. A shallow set() copy is
         enough: its elements are classes, not option values with a repr/address hazard.
+
+        consumer_attributions is owned too, since the engine appends to it in place.
         """
         # One level: a Feature nested inside child_options.group keeps sharing its own options, the
         # documented limitation class of _isolate_forwarded_value.
@@ -387,6 +392,7 @@ class Feature:
             duplicate.child_options = copy(self.child_options)
         if self.compute_frameworks is not None:
             duplicate.compute_frameworks = set(self.compute_frameworks)
+        duplicate.consumer_attributions = list(self.consumer_attributions)
         return duplicate
 
     def _child_options_key(self) -> Any:
@@ -484,7 +490,7 @@ class Feature:
         """
         return self._grouping_hash(split_keys, include_data_type=False)
 
-    def _set_domain(self, domain: Optional[str | Domain], domain_options: Optional[str | Domain]) -> None | Domain:
+    def _set_domain(self, domain: str | Domain | None, domain_options: str | Domain | None) -> None | Domain:
         if domain:
             return domain if isinstance(domain, Domain) else Domain(domain)
         elif domain_options:
@@ -492,8 +498,8 @@ class Feature:
         return None
 
     def _set_compute_framework(
-        self, compute_framework: Optional[str], compute_framework_options: Optional[str]
-    ) -> Optional[type[ComputeFramework]]:
+        self, compute_framework: str | None, compute_framework_options: str | None
+    ) -> type[ComputeFramework] | None:
         if compute_framework:
             return FeatureValidator.validate_and_resolve_compute_framework(
                 compute_framework, get_all_subclasses(ComputeFramework), "parameter"

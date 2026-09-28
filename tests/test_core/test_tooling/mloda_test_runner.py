@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -44,7 +44,7 @@ class RunResult:
 
     results: list[Any] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
-    runner: Optional[ExecutionOrchestrator] = None
+    runner: ExecutionOrchestrator | None = None  # already torn down; only get_result()/get_artifacts() are safe
 
 
 class MlodaTestRunner:
@@ -65,22 +65,22 @@ class MlodaTestRunner:
     @staticmethod
     def run_api(
         features: Features,
-        compute_frameworks: Optional[set[type[ComputeFramework]]] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        compute_frameworks: set[type[ComputeFramework]] | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
         flight_server: Any = None,
-        function_extender: Optional[set[Extender]] = None,
-        links: Optional[set[Link]] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, Any]] = None,
+        function_extender: set[Extender] | None = None,
+        links: set[Link] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, Any] | None = None,
         cleanup_flight_server: bool = True,
-        plugin_collector: Optional[PluginCollector] = None,
+        plugin_collector: PluginCollector | None = None,
         strict_type_enforcement: bool = False,
     ) -> RunResult:
         """
         Run mloda with the given configuration.
 
         This is the recommended method for most integration tests.
-        Uses mloda instance + _batch_run() for full access to results and artifacts.
+        Uses mloda instance + run() for full access to results and artifacts.
 
         Args:
             features: The feature set to compute
@@ -96,7 +96,7 @@ class MlodaTestRunner:
             strict_type_enforcement: If True, enforce strict type matching for typed features
 
         Returns:
-            RunResult containing results, artifacts, and optionally the runner
+            RunResult containing results, artifacts, and the runner
         """
         if compute_frameworks is None:
             compute_frameworks = {PyArrowTable}
@@ -112,23 +112,25 @@ class MlodaTestRunner:
             plugin_collector=plugin_collector,
             strict_type_enforcement=strict_type_enforcement,
         )
-        api._batch_run(parallelization_modes, flight_server, function_extender)
-
-        results = api.get_result()
+        results = api.run(
+            parallelization_modes=parallelization_modes,
+            flight_server=flight_server,
+            function_extender=function_extender,
+        )
         artifacts = api.get_artifacts()
 
         if cleanup_flight_server:
             MlodaTestRunner.assert_flight_server_clean(parallelization_modes, flight_server)
 
-        return RunResult(results=results, artifacts=artifacts)
+        return RunResult(results=results, artifacts=artifacts, runner=api.runner)
 
     @staticmethod
     def run_api_simple(
         features: Features,
-        compute_frameworks: Optional[set[type[ComputeFramework]]] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        compute_frameworks: set[type[ComputeFramework]] | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
         flight_server: Any = None,
-        function_extender: Optional[set[Extender]] = None,
+        function_extender: set[Extender] | None = None,
     ) -> list[Any]:
         """
         Simplified runner using mloda.run_all().
@@ -163,13 +165,13 @@ class MlodaTestRunner:
     @staticmethod
     def run_engine(
         features: Features,
-        compute_frameworks: Optional[set[type[ComputeFramework]]] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        compute_frameworks: set[type[ComputeFramework]] | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
         flight_server: Any = None,
-        function_extender: Optional[set[Extender]] = None,
-        links: Optional[set[Link]] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, Any]] = None,
+        function_extender: set[Extender] | None = None,
+        links: set[Link] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, Any] | None = None,
     ) -> ExecutionOrchestrator:
         """
         Run using Engine + ExecutionOrchestrator for full control over execution.
@@ -202,10 +204,8 @@ class MlodaTestRunner:
         try:
             runner.__enter__(parallelization_modes, function_extender, api_data)
             runner.compute()
-            runner.__exit__(None, None, None)
         finally:
-            if runner.manager is not None:
-                runner.manager.shutdown()
+            runner.__exit__(None, None, None)
 
         return runner
 

@@ -1,13 +1,64 @@
+import importlib
+import logging
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from conftest import _write_broken_optional_root_package
+
+import mloda.core.abstract_plugins.plugin_loader.plugin_loader as plugin_loader_module
 from mloda.core.abstract_plugins.components.input_data.base_input_data import (
     _collect_filtered_subclasses,  # noqa: F401
     get_all_filtered_subclasses,
 )
+from mloda.core.abstract_plugins.plugin_loader.plugin_loader import OPTIONAL_PLUGIN_DEPENDENCIES
 from mloda.core.abstract_plugins.plugin_registry.plugin_registry import PluginRegistry
 from mloda.user import PluginLoader
+
+
+def _write_fake_base_package(base_dir: Path, base_pkg_name: str, submodule_name: str, imports: str) -> None:
+    """A fake base package standing in for mloda_plugins."""
+    pkg_dir = base_dir / base_pkg_name
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("")
+    (pkg_dir / f"{submodule_name}.py").write_text(f"import {imports}\n")
+    importlib.invalidate_caches()
+
+
+def _write_root_module(base_dir: Path, module_name: str) -> None:
+    """A standalone top-level module (not a package), so importing a missing name from it raises
+    plain ImportError rather than ModuleNotFoundError."""
+    (base_dir / f"{module_name}.py").write_text("")
+
+
+def _write_fake_base_package_bad_from_import(
+    base_dir: Path, base_pkg_name: str, submodule_name: str, root_module: str
+) -> None:
+    """A fake base package submodule doing `from <root_module> import missing_name`."""
+    pkg_dir = base_dir / base_pkg_name
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("")
+    (pkg_dir / f"{submodule_name}.py").write_text(f"from {root_module} import missing_name\n")
+    importlib.invalidate_caches()
+
+
+def _raise_import_error(module_name: str, message: str = "boom") -> None:
+    """Raise ImportError from a frame whose f_globals['__name__'] is module_name."""
+    code = compile(f"raise ImportError({message!r})", "<tb_test>", "exec")
+    # Static literal source compiled above, no external/attacker input.
+    exec(code, {"__name__": module_name})  # nosec B102
+
+
+def _raise_import_error_nested(outer_name: str, inner_name: str, message: str = "boom") -> None:
+    """Raise ImportError two frames deep: outer frame's __name__ is outer_name, inner frame's is inner_name."""
+    inner_code = compile(f"raise ImportError({message!r})", "<tb_test_inner>", "exec")
+    outer_code = compile("exec(inner_code, inner_globals)", "<tb_test_outer>", "exec")
+    # Static literal source compiled above, no external/attacker input.
+    exec(  # nosec B102
+        outer_code,
+        {"__name__": outer_name, "inner_code": inner_code, "inner_globals": {"__name__": inner_name}},
+    )
 
 
 class TestPluginLoader:
@@ -218,3 +269,301 @@ class TestPluginLoader:
             with patch.object(PluginLoader, "load_entry_points", MagicMock()):
                 with pytest.raises(RuntimeError):
                     PluginLoader.all()
+
+    def test_optional_plugin_dependencies_has_no_orphaned_opentelemetry_entry(self) -> None:
+        """opentelemetry was only imported by OtelExtender, deleted on this branch; nothing imports it now."""
+        assert "opentelemetry" not in OPTIONAL_PLUGIN_DEPENDENCIES
+
+
+class TestLoadPluginTransitiveOptionalDependency:
+    def test_transitive_missing_dependency_inside_declared_optional_root_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A declared-optional root whose OWN import fails must be skipped by _load_plugin, mirroring
+        the already-fixed load_entry_points traceback fallback."""
+        optional_root_pkg = "pltest_transroot_optional_dep"
+        missing_subdep = "pltest_transroot_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_fake_base_pkg"
+        submodule = "broken_consumer"
+        _write_fake_base_package(tmp_path, base_pkg, submodule, optional_root_pkg)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+
+        with caplog.at_level(logging.WARNING, logger=plugin_loader_module.__name__):
+            loader._load_plugin(submodule)
+
+        assert f"{base_pkg}.{submodule}" not in loader.plugins
+        warning_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+        assert any(missing_subdep in message for message in warning_messages), (
+            f"expected a WARNING message naming the missing transitive module, got: {warning_messages}"
+        )
+        assert PluginLoader.skipped_plugins() == {f"{base_pkg}.{submodule}": missing_subdep}
+
+    def test_second_load_of_same_skipped_module_warns_only_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        optional_root_pkg = "pltest_repeat_optional_dep"
+        missing_subdep = "pltest_repeat_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_repeat_fake_base_pkg"
+        submodule = "broken_consumer"
+        _write_fake_base_package(tmp_path, base_pkg, submodule, optional_root_pkg)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+
+        with caplog.at_level(logging.WARNING, logger=plugin_loader_module.__name__):
+            loader._load_plugin(submodule)
+            loader._load_plugin(submodule)
+
+        warning_count = sum(
+            1
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == plugin_loader_module.__name__
+        )
+        assert warning_count == 1, f"expected exactly one WARNING across two loads, got {warning_count}"
+
+    def test_module_healed_after_dependency_becomes_importable_drops_from_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        optional_root_pkg = "pltest_heal_optional_dep"
+        missing_subdep = "pltest_heal_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_heal_fake_base_pkg"
+        submodule = "broken_consumer"
+        _write_fake_base_package(tmp_path, base_pkg, submodule, optional_root_pkg)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+        loader._load_plugin(submodule)
+
+        full_module_name = f"{base_pkg}.{submodule}"
+        assert full_module_name in PluginLoader.skipped_plugins()
+
+        # Heal the dependency: writing the missing transitive module lets the optional root import cleanly.
+        (tmp_path / f"{missing_subdep}.py").write_text("")
+        importlib.invalidate_caches()
+
+        loader._load_plugin(submodule)
+
+        assert full_module_name not in PluginLoader.skipped_plugins()
+        assert full_module_name in loader.plugins
+
+    def test_reset_cache_clears_skipped_plugins_record(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        optional_root_pkg = "pltest_resetrecord_optional_dep"
+        missing_subdep = "pltest_resetrecord_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_resetrecord_fake_base_pkg"
+        submodule = "broken_consumer"
+        _write_fake_base_package(tmp_path, base_pkg, submodule, optional_root_pkg)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+        loader._load_plugin(submodule)
+
+        assert PluginLoader.skipped_plugins()
+
+        PluginLoader.reset_cache()
+
+        assert PluginLoader.skipped_plugins() == {}
+
+    def test_skipped_plugins_returns_a_copy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        optional_root_pkg = "pltest_copyrecord_optional_dep"
+        missing_subdep = "pltest_copyrecord_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_copyrecord_fake_base_pkg"
+        submodule = "broken_consumer"
+        _write_fake_base_package(tmp_path, base_pkg, submodule, optional_root_pkg)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+        loader._load_plugin(submodule)
+
+        first = PluginLoader.skipped_plugins()
+        first["mutated_key_should_not_leak"] = "mutated_value"
+
+        assert "mutated_key_should_not_leak" not in PluginLoader.skipped_plugins()
+
+
+class TestLoadPluginPlainImportError:
+    def test_declared_optional_root_catches_plain_import_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A plain ImportError (not ModuleNotFoundError) from an existing declared-optional root
+        must be skipped, proving the ImportError widening isn't limited to ModuleNotFoundError."""
+        root_module = "pltest_importerror_root"
+        _write_root_module(tmp_path, root_module)
+
+        base_pkg = "pltest_importerror_base_pkg"
+        submodule = "bad_from_import"
+        _write_fake_base_package_bad_from_import(tmp_path, base_pkg, submodule, root_module)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({root_module}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+
+        with caplog.at_level(logging.WARNING, logger=plugin_loader_module.__name__):
+            loader._load_plugin(submodule)
+
+        assert f"{base_pkg}.{submodule}" not in loader.plugins
+        warning_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+        assert any(root_module in message for message in warning_messages), (
+            f"expected a WARNING message naming the missing root, got: {warning_messages}"
+        )
+        assert PluginLoader.skipped_plugins() == {f"{base_pkg}.{submodule}": root_module}
+
+    def test_undeclared_root_import_error_still_propagates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Plain ImportError whose root is declared nowhere must still propagate, proving the
+        propagation path isn't narrower than ImportError."""
+        root_module = "pltest_undeclared_importerror_root"
+        _write_root_module(tmp_path, root_module)
+
+        base_pkg = "pltest_undeclared_importerror_base_pkg"
+        submodule = "bad_from_import"
+        _write_fake_base_package_bad_from_import(tmp_path, base_pkg, submodule, root_module)
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+
+        with pytest.raises(ImportError) as exc_info:
+            loader._load_plugin(submodule)
+        assert not isinstance(exc_info.value, ModuleNotFoundError)
+
+
+class TestLoadGroupContinuesPastSkippedPlugin:
+    def test_broken_optional_dependency_plugin_does_not_abort_group_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One bundled plugin hitting a skippable optional-dependency failure must not abort the
+        rest of the group scan, proving load_all_plugins()'s DoD through the real load_group path."""
+        optional_root_pkg = "pltest_group_optional_dep"
+        missing_subdep = "pltest_group_missing_subdep"
+        _write_broken_optional_root_package(tmp_path, optional_root_pkg, missing_subdep)
+
+        base_pkg = "pltest_group_fake_base_pkg"
+        group_name = "mygroup"
+        base_dir = tmp_path / base_pkg
+        base_dir.mkdir()
+        (base_dir / "__init__.py").write_text("")
+        group_dir = base_dir / group_name
+        group_dir.mkdir()
+        (group_dir / "__init__.py").write_text("")
+        (group_dir / "broken.py").write_text(f"import {optional_root_pkg}\n")
+        (group_dir / "good.py").write_text("")
+        importlib.invalidate_caches()
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            plugin_loader_module,
+            "OPTIONAL_PLUGIN_DEPENDENCIES",
+            plugin_loader_module.OPTIONAL_PLUGIN_DEPENDENCIES | frozenset({optional_root_pkg}),
+        )
+
+        loader = PluginLoader()
+        loader.base_package = base_pkg
+
+        with caplog.at_level(logging.WARNING, logger=plugin_loader_module.__name__):
+            loader.load_group(group_name)
+
+        assert f"{base_pkg}.{group_name}.broken" not in loader.plugins
+        assert f"{base_pkg}.{group_name}.good" in loader.plugins
+        warning_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+        assert any(missing_subdep in message for message in warning_messages), (
+            f"expected a WARNING message naming the missing transitive module, got: {warning_messages}"
+        )
+        assert PluginLoader.skipped_plugins() == {f"{base_pkg}.{group_name}.broken": missing_subdep}
+
+
+class TestTracebackBlamesRoot:
+    def test_exact_root_match_returns_true(self) -> None:
+        root = "pltest_tb_exact_root"
+        with pytest.raises(ImportError) as exc_info:
+            _raise_import_error(root)
+        assert plugin_loader_module.traceback_blames_root(exc_info.value, root) is True
+
+    def test_submodule_match_returns_true(self) -> None:
+        root = "pltest_tb_submodule_root"
+        with pytest.raises(ImportError) as exc_info:
+            _raise_import_error(f"{root}.sub")
+        assert plugin_loader_module.traceback_blames_root(exc_info.value, root) is True
+
+    def test_sibling_prefix_does_not_match(self) -> None:
+        """A shared string prefix without a dot boundary must not count as a match."""
+        with pytest.raises(ImportError) as exc_info:
+            _raise_import_error("foox")
+        assert plugin_loader_module.traceback_blames_root(exc_info.value, "foo") is False
+
+    def test_innermost_frame_wins_when_only_outer_matches(self) -> None:
+        """The outer frame matches root but the innermost frame does not: must not blame root."""
+        root = "pltest_tb_outer_only_root"
+        with pytest.raises(ImportError) as exc_info:
+            _raise_import_error_nested(outer_name=root, inner_name="pltest_tb_unrelated_inner")
+        assert plugin_loader_module.traceback_blames_root(exc_info.value, root) is False
+
+    def test_innermost_frame_wins_when_only_inner_matches(self) -> None:
+        """The innermost frame matches root while the outer frame does not: must blame root."""
+        root = "pltest_tb_inner_only_root"
+        with pytest.raises(ImportError) as exc_info:
+            _raise_import_error_nested(outer_name="pltest_tb_unrelated_outer", inner_name=root)
+        assert plugin_loader_module.traceback_blames_root(exc_info.value, root) is True
+
+    def test_no_traceback_returns_false(self) -> None:
+        exc = ImportError("boom")
+        assert exc.__traceback__ is None
+        assert plugin_loader_module.traceback_blames_root(exc, "anything") is False
+
+    def test_rename_removes_private_alias(self) -> None:
+        """The rename must drop the old private name entirely, not leave it as an alias."""
+        assert not hasattr(plugin_loader_module, "_traceback_blames_root")

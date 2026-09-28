@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
 from mloda.core.abstract_plugins.components.options import Options
@@ -16,7 +16,7 @@ class MatchData:
         cls,
         feature_name: str,
         options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
+        data_access_collection: DataAccessCollection | None = None,
     ) -> bool:
         """
         We look if feature scope data access or global scope access is set.
@@ -46,6 +46,7 @@ class MatchData:
 
         matched_data_access = cls.match_data_access(feature_name, options, None, framework_connection_object)
         if matched_data_access:
+            options.mark_non_forwarded(cls_name)
             return True
         return False
 
@@ -54,7 +55,7 @@ class MatchData:
         cls,
         feature_name: str,
         options: Options,
-        data_access_collection: Optional[DataAccessCollection],
+        data_access_collection: DataAccessCollection | None,
     ) -> bool:
         """
         We check for global scope data access if any data access collection matches the framework connection and matching logic."""
@@ -75,8 +76,8 @@ class MatchData:
         cls,
         feature_name: str,
         options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        framework_connection_object: Optional[Any] = None,
+        data_access_collection: DataAccessCollection | None = None,
+        framework_connection_object: Any | None = None,
     ) -> Any:
         """
         We check for data access collection if any child classes match the data access.
@@ -96,6 +97,7 @@ class MatchData:
             existing_data = options.get(cls_name)
             # `is True`, not a truth test: a non-bool __eq__ result (numpy array) must not raise unmarked here.
             if (existing_data == matched_data_access) is True:
+                options.mark_non_forwarded(cls_name)
                 return
 
             # Marked: two conflicting readers for one feature is a user misconfiguration.
@@ -106,7 +108,7 @@ class MatchData:
                     f"incoming={type(matched_data_access).__name__}, existing={type(existing_data).__name__}"
                 )
             )
-        options.add_to_group(cls_name, matched_data_access)
+        options.add_to_group(cls_name, matched_data_access, forward=False)
 
     @classmethod
     def get_class_name(cls) -> str:

@@ -2,11 +2,12 @@ import logging
 import re
 import sqlite3
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.provider import BaseMergeEngine
 from mloda.provider import ComputeFramework
+from mloda.provider import OutputSchema
 from mloda.provider import BaseFilterEngine, BaseMaskEngine
 from mloda.user import FeatureName, ParallelizationMode
 from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_filter_engine import SqliteFilterEngine
@@ -17,7 +18,7 @@ from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_relation
 logger = logging.getLogger(__name__)
 
 
-def _regexp(pattern: str, string: Optional[str]) -> bool:
+def _regexp(pattern: str, string: str | None) -> bool:
     """SQLite REGEXP implementation. Warning: pattern comes from filter values; malicious
     patterns (e.g. '(a+)+$') can cause exponential backtracking on crafted input."""
     if string is None:
@@ -26,7 +27,7 @@ def _regexp(pattern: str, string: Optional[str]) -> bool:
 
 
 class SqliteFramework(ComputeFramework):
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         if framework_connection_object is None:
             raise ValueError("A sqlite3.Connection object is required.")
         if not isinstance(framework_connection_object, sqlite3.Connection):
@@ -64,8 +65,8 @@ class SqliteFramework(ComputeFramework):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         column_names = set(data.columns)
         _selected_feature_names = self.identify_naming_convention(
@@ -78,13 +79,35 @@ class SqliteFramework(ComputeFramework):
     def _extract_column_names(self, data: Any) -> set[str]:
         return set(data.columns)
 
+    def _row_count(self, data: Any) -> int | None:
+        """A SqliteRelation's __len__ runs a SELECT COUNT(*), a real query; never call it for observability."""
+        if isinstance(data, SqliteRelation):
+            return None
+        return super()._row_count(data)
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Report propagated hints (None per unresolved column) or, without any hints, PRAGMA affinity types.
+
+        Resolving an unresolved hint scans every row, so it is never done here.
+        """
+        if not isinstance(data, SqliteRelation):
+            return super()._output_schema(data)
+        columns = data.columns
+        if not columns:
+            return None
+        hints = data.type_hints if data.type_hints is not None else data.types
+        return tuple(
+            (name, None if hint is None else str(hint))
+            for name, hint in sorted(zip(columns, hints), key=lambda pair: pair[0])
+        )
+
     def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
         if not hasattr(data, "columns") or column_name not in data.columns:
             return None
         idx = data.columns.index(column_name)
         return str(data.types[idx])
 
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         if not hasattr(data, "columns") or column_name not in data.columns:
             return None
         idx = data.columns.index(column_name)

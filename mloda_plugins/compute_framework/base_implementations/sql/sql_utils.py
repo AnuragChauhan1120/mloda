@@ -7,12 +7,13 @@ SQL injection prevention follows two layers:
 - Literal values should use PEP 249 (DB-API 2.0) parameterized queries
   whenever the backend supports them. ``quote_value`` and ``inline_params``
   exist as a fallback for backends whose API lacks PEP 249 parameter binding.
-  They accept primitive scalars (None, bool, int, float, str) and datetime;
-  unsupported types raise.
+  They accept primitive scalars (None, bool, int, float, str, Decimal) and
+  datetime; unsupported types raise.
 """
 
 import math
 from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -24,6 +25,14 @@ def is_ordered_arrow_type(t: "pa.DataType") -> bool:
     import pyarrow as pa
 
     return bool(pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t) or pa.types.is_temporal(t))
+
+
+def null_or_nan_condition(quoted_column: str, nan_condition: str | None) -> str:
+    """Return a SQL condition true when the column is NULL, plus ``nan_condition`` when given."""
+    cond = f"{quoted_column} IS NULL"
+    if nan_condition is not None:
+        return f"({cond} OR {nan_condition})"
+    return cond
 
 
 def quote_ident(name: str) -> str:
@@ -41,6 +50,10 @@ def quote_value(value: Any) -> str:
         if not math.isfinite(value):
             raise ValueError(f"Cannot convert non-finite float to SQL: {value!r}")
         return str(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"Cannot convert non-finite Decimal to SQL: {value!r}")
+        return format(value, "f")
     if isinstance(value, datetime):
         # ISO 8601 string literal. DuckDB / SQLite / most engines auto-cast against
         # a temporal column. isoformat() emits no embedded single quotes.

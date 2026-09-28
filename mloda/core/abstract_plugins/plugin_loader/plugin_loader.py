@@ -3,12 +3,12 @@ import importlib.metadata
 import inspect
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import logging
 from types import ModuleType
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.feature_group import FeatureGroup
@@ -17,6 +17,7 @@ from mloda.core.abstract_plugins.plugin_registry.plugin_policy import PluginPoli
 from mloda.core.abstract_plugins.plugin_registry.plugin_registry import (
     PluginRegistry,
     PluginSource,
+    _is_class,
     register_module_plugins,
     warn_policy_denied,
 )
@@ -36,7 +37,6 @@ OPTIONAL_PLUGIN_DEPENDENCIES: frozenset[str] = frozenset(
         "duckdb",
         "pyiceberg",
         "pyspark",
-        "opentelemetry",
         "sklearn",
         "joblib",
         "nltk",
@@ -53,21 +53,46 @@ ENTRY_POINT_GROUPS: dict[str, type[Any]] = {
     "mloda.extenders": Extender,
 }
 
+# Companion group: an entry here, named after the entry point it protects, declares its own
+# optional import roots, overriding the OPTIONAL_PLUGIN_DEPENDENCIES fallback.
+OPTIONAL_DEPENDENCY_ENTRY_POINT_GROUP: str = "mloda.optional_dependencies"
+
 # Plugin classes defined in mloda.core, not under the scanned mloda_plugins package. The loader
 # registers them explicitly so they are first-class registry entries like every bundled plugin.
 CORE_PLUGIN_MODULES: tuple[str, ...] = ("mloda.core.abstract_plugins.components.input_data.api.api_input_data_feature",)
 
 
+def traceback_blames_root(exc: ImportError, root: str) -> bool:
+    """True if the innermost (deepest) frame of exc's traceback, i.e. where the failure actually
+    occurred, belongs to root or a submodule of it."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    module_name = tb.tb_frame.f_globals.get("__name__")
+    return isinstance(module_name, str) and (module_name == root or module_name.startswith(f"{root}."))
+
+
 class PluginLoader:
     _disabled_groups: ClassVar[set[str]] = set()
-    _cached_loader: ClassVar[Optional["PluginLoader"]] = None
+    _cached_loader: ClassVar["PluginLoader | None"] = None
     _cached_generation: ClassVar[int | None] = None
     _building_thread_id: ClassVar[int | None] = None
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
+    # Process-wide, not per-instance: every skipped plugin module or entry point, mapped to its missing dependency.
+    _skipped: ClassVar[dict[str, str]] = {}
+    # Separate from _skipped (which only tracks skipped plugins): last problem warned about per malformed marker.
+    _warned_markers: ClassVar[dict[tuple[str | None, str], str]] = {}
 
     @classmethod
     def disable_auto_load(cls, group: str) -> None:
         cls._disabled_groups.add(group)
+
+    @classmethod
+    def skipped_plugins(cls) -> dict[str, str]:
+        """Every plugin module or entry point skipped so far for a missing optional dependency."""
+        return dict(cls._skipped)
 
     def __init__(self) -> None:
         """
@@ -148,6 +173,8 @@ class PluginLoader:
         with cls._cache_lock:
             cls._cached_loader = None
             cls._cached_generation = None
+            cls._skipped.clear()
+            cls._warned_markers.clear()
 
     def load_entry_points(self, group: str | None = None) -> list[str]:
         """Discover installed entry-point manifests and register their plugin classes."""
@@ -155,22 +182,69 @@ class PluginLoader:
             valid = ", ".join(ENTRY_POINT_GROUPS)
             raise ValueError(f"Unknown entry-point group '{group}'. Valid groups are: {valid}.")
         groups = [group] if group is not None else list(ENTRY_POINT_GROUPS)
+        declared_optional = self._load_declared_optional_dependencies()
         keys: list[str] = []
         for group_name in groups:
             base_type = ENTRY_POINT_GROUPS[group_name]
             for entry_point in importlib.metadata.entry_points(group=group_name):
+                skipped_key = f"{entry_point.name} ({entry_point.value})"
                 try:
                     manifest = entry_point.load()
-                except ModuleNotFoundError as e:
+                except ImportError as e:
                     root = e.name.split(".")[0] if e.name else None
-                    if root in OPTIONAL_PLUGIN_DEPENDENCIES:
-                        logger.debug(
-                            "Skipping entry point %s: missing optional dependency %s", entry_point.name, e.name
-                        )
+                    own_root = entry_point.module.split(".")[0]
+                    if root == own_root:
+                        raise
+                    dist_name = entry_point.dist.name if entry_point.dist is not None else None
+                    optional_roots = declared_optional.get((dist_name, entry_point.name), OPTIONAL_PLUGIN_DEPENDENCIES)
+                    # Exclude any root the entry point's own module is at or under, so a namespace
+                    # collision can't misattribute the plugin's own bug to that root's traceback frame.
+                    own_module = entry_point.module
+                    tb_roots = [r for r in optional_roots if own_module != r and not own_module.startswith(f"{r}.")]
+                    blamed_root = next((r for r in tb_roots if traceback_blames_root(e, r)), None)
+                    if root in optional_roots or blamed_root is not None:
+                        dependency = e.name or blamed_root
+                        assert dependency is not None
+                        already_recorded = self._skipped.get(skipped_key) == dependency
+                        self._skipped[skipped_key] = dependency
+                        if not already_recorded:
+                            logger.warning(
+                                "Skipping entry point %s (%s): missing optional dependency %s",
+                                entry_point.name,
+                                entry_point.value,
+                                dependency,
+                            )
                         continue
                     raise
+                self._skipped.pop(skipped_key, None)
                 keys.extend(self._register_manifest(entry_point.name, group_name, base_type, manifest))
         return sorted(set(keys))
+
+    def _load_declared_optional_dependencies(self) -> dict[tuple[str | None, str], frozenset[str]]:
+        """Load per-(distribution, entry-point) optional-root declarations; a marker that fails to
+        load, or isn't a non-string iterable of roots, is skipped with a WARNING logged once per problem.
+        """
+        declared: dict[tuple[str | None, str], frozenset[str]] = {}
+        for entry_point in importlib.metadata.entry_points(group=OPTIONAL_DEPENDENCY_ENTRY_POINT_GROUP):
+            dist_name = entry_point.dist.name if entry_point.dist is not None else None
+            try:
+                roots = entry_point.load()
+            except (ImportError, AttributeError, TypeError) as e:
+                self._warn_marker_once(dist_name, entry_point.name, f"failed to load ({e})")
+                continue
+            if isinstance(roots, (str, bytes)) or not isinstance(roots, Iterable):
+                self._warn_marker_once(
+                    dist_name, entry_point.name, f"expected an iterable of module roots, got {roots!r}"
+                )
+                continue
+            declared[(dist_name, entry_point.name)] = frozenset(roots)
+        return declared
+
+    def _warn_marker_once(self, dist_name: str | None, name: str, problem: str) -> None:
+        if self._warned_markers.get((dist_name, name)) == problem:
+            return
+        self._warned_markers[(dist_name, name)] = problem
+        logger.warning("Ignoring optional-dependency marker %s: %s", name, problem)
 
     def _register_manifest(self, label: str, group_name: str, base_type: type[Any], manifest: Any) -> list[str]:
         """Validate a manifest sequence and register its concrete classes."""
@@ -181,7 +255,7 @@ class PluginLoader:
         registry = PluginRegistry.default()
         keys: list[str] = []
         for cls in manifest:
-            if not isinstance(cls, type):
+            if not _is_class(cls):
                 raise TypeError(f"Entry point '{label}' manifest contains a non-class item: {cls!r}.")
             if not issubclass(cls, base_type):
                 raise TypeError(
@@ -242,6 +316,7 @@ class PluginLoader:
         """Internal function to load a plugin."""
         full_module_name = f"{self.base_package}.{module_path}"
         if full_module_name in sys.modules:
+            self._skipped.pop(full_module_name, None)
             cached_module = sys.modules[full_module_name]
             self.plugins[full_module_name] = cached_module
             self._add_plugin_to_graph(full_module_name)
@@ -250,15 +325,22 @@ class PluginLoader:
 
         try:
             module = importlib.import_module(full_module_name)
-        except ModuleNotFoundError as e:
-            if e.name and (e.name == self.base_package or e.name.startswith(self.base_package + ".")):
-                raise
+        except ImportError as e:
             root = e.name.split(".")[0] if e.name else None
-            if root in OPTIONAL_PLUGIN_DEPENDENCIES:
-                logger.debug("Skipping plugin %s: missing optional dependency %s", full_module_name, e.name)
+            if root == self.base_package:
+                raise
+            blamed_root = next((r for r in OPTIONAL_PLUGIN_DEPENDENCIES if traceback_blames_root(e, r)), None)
+            if root in OPTIONAL_PLUGIN_DEPENDENCIES or blamed_root is not None:
+                dependency = e.name or blamed_root
+                assert dependency is not None
+                already_recorded = self._skipped.get(full_module_name) == dependency
+                self._skipped[full_module_name] = dependency
+                if not already_recorded:
+                    logger.warning("Skipping plugin %s: missing optional dependency %s", full_module_name, dependency)
                 return
             raise
 
+        self._skipped.pop(full_module_name, None)
         self.plugins[full_module_name] = module
         self._add_plugin_to_graph(full_module_name)
         register_module_plugins(module, source="loader")
@@ -309,7 +391,7 @@ class PluginLoader:
         package_path = Path(base_package).parent
         return package_path / group_name
 
-    def display_plugin_graph(self, plugin_category: Optional[str] = None) -> list[str]:
+    def display_plugin_graph(self, plugin_category: str | None = None) -> list[str]:
         """Display the plugin graph."""
 
         _list_plugins_dependencies: list[str] = []
@@ -325,7 +407,7 @@ class PluginLoader:
             raise ValueError(f"No plugins found for category {plugin_category}")
         return _list_plugins_dependencies
 
-    def list_loaded_modules(self, plugin_category: Optional[str] = None) -> list[str]:
+    def list_loaded_modules(self, plugin_category: str | None = None) -> list[str]:
         """List all loaded modules (plugins)."""
 
         _list_plugins_dependencies: list[str] = []

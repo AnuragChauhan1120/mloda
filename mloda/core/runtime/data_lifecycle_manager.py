@@ -1,5 +1,5 @@
-from collections.abc import Sequence
-from typing import Any, Generator, Optional
+from collections.abc import Callable, Sequence
+from typing import Any, Generator
 from uuid import UUID
 
 from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import ComputeFrameworkTransformer
@@ -19,9 +19,9 @@ class DataLifecycleManager:
 
     def __init__(
         self,
-        transformer: Optional[ComputeFrameworkTransformer] = None,
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        transformer: ComputeFrameworkTransformer | None = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> None:
         """
         Initializes DataLifecycleManager with empty state and transformer.
@@ -39,7 +39,11 @@ class DataLifecycleManager:
         self.request_feature_order = request_feature_order
 
     def drop_data_for_finished_cfws(
-        self, finished_ids: set[UUID], cfw_collection: dict[UUID, ComputeFramework], location: Optional[str] = None
+        self,
+        finished_ids: set[UUID],
+        cfw_collection: dict[UUID, ComputeFramework],
+        location: str | None = None,
+        drop_action: Callable[[UUID, ComputeFramework], None] | None = None,
     ) -> None:
         """
         Drops data for CFWs when all their dependent steps are finished.
@@ -48,6 +52,9 @@ class DataLifecycleManager:
             finished_ids: Set of step UUIDs that have been completed.
             cfw_collection: Dictionary of CFWs keyed by UUID.
             location: Optional location string for remote data dropping.
+            drop_action: Optional override for how a single CFW's data is dropped, e.g. to route
+                the drop through a worker process that still owns the live instance. Defaults to
+                calling `cfw.drop_last_data()` directly on the `cfw_collection` entry.
         """
         if not finished_ids:
             return
@@ -55,14 +62,18 @@ class DataLifecycleManager:
         cfw_to_delete = set()
         for cfw_uuid, step_uuids in self.track_data_to_drop.items():
             if all(step_id in finished_ids for step_id in step_uuids):
-                self.drop_cfw_data(cfw_uuid, cfw_collection, location)
+                self.drop_cfw_data(cfw_uuid, cfw_collection, location, drop_action)
                 cfw_to_delete.add(cfw_uuid)
 
         for cfw_uuid in cfw_to_delete:
             del self.track_data_to_drop[cfw_uuid]
 
     def drop_cfw_data(
-        self, cfw_uuid: UUID, cfw_collection: dict[UUID, ComputeFramework], location: Optional[str] = None
+        self,
+        cfw_uuid: UUID,
+        cfw_collection: dict[UUID, ComputeFramework],
+        location: str | None = None,
+        drop_action: Callable[[UUID, ComputeFramework], None] | None = None,
     ) -> None:
         """
         Drops data associated with a specific CFW.
@@ -71,15 +82,17 @@ class DataLifecycleManager:
             cfw_uuid: The UUID of the CFW to drop data for.
             cfw_collection: Dictionary of CFWs keyed by UUID.
             location: Optional location string for remote data dropping.
+            drop_action: Optional override for how the drop itself is performed (see
+                `drop_data_for_finished_cfws`).
         """
         cfw = cfw_collection[cfw_uuid]
-        if location:
-            cfw.drop_last_data(location)
-        else:
-            cfw.drop_last_data(None)
+        if drop_action is not None:
+            drop_action(cfw_uuid, cfw)
+            return
+        cfw.drop_last_data(location)
 
     def add_to_result_data_collection(
-        self, cfw: ComputeFramework, features: FeatureSet, step_uuid: UUID, location: Optional[str] = None
+        self, cfw: ComputeFramework, features: FeatureSet, step_uuid: UUID, location: str | None = None
     ) -> None:
         """
         Adds result data to the collection if features are requested.
@@ -99,7 +112,7 @@ class DataLifecycleManager:
             self.result_data_collection[step_uuid] = result
 
     def get_result_data(
-        self, cfw: ComputeFramework, selected_feature_names: Sequence[FeatureName], location: Optional[str] = None
+        self, cfw: ComputeFramework, selected_feature_names: Sequence[FeatureName], location: str | None = None
     ) -> Any:
         """
         Gets result data from the compute framework.
@@ -154,24 +167,28 @@ class DataLifecycleManager:
         Raises:
             ValueError: If no results have been collected.
         """
+        return [value for _, value in self.get_result_items()]
+
+    def get_result_items(self) -> list[tuple[UUID, Any]]:
+        """Like get_results(), but keeps each result's step uuid."""
         if not self.result_data_collection:
             raise ValueError(
                 f"No results found: {self.__class__.__name__} has an empty result collection, "
                 "so no step produced a result to return"
             )
 
-        return list(self.result_data_collection.values())
+        return list(self.result_data_collection.items())
 
     def pop_result_data_collection(self) -> Generator[tuple[UUID, Any], None, None]:
-        """Drain completed results one at a time.
+        """Drain completed results one at a time, in insertion order.
 
         Each yielded ``(step_uuid, result)`` pair contains a full result — not
         a partial chunk.  Results are removed from the internal collection as
         they are yielded.
         """
         while self.result_data_collection:
-            step_uuid, result = self.result_data_collection.popitem()
-            yield step_uuid, result
+            step_uuid = next(iter(self.result_data_collection))
+            yield step_uuid, self.result_data_collection.pop(step_uuid)
 
     def set_artifacts(self, artifacts: dict[str, Any]) -> None:
         """

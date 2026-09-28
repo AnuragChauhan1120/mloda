@@ -43,9 +43,9 @@ The base `ComputeFramework` class provides methods to manage connection objects:
 class ComputeFramework(ABC):
     def __init__(self) -> None:
         # Connection object for frameworks that need persistent connections
-        self.framework_connection_object: Optional[Any] = None
+        self.framework_connection_object: Any | None = None
     
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         """
         Some compute frameworks (e.g., DuckDB, Spark) require sharing their connection
         with merge engines to ensure data consistency. Override this method in
@@ -64,7 +64,7 @@ Framework transformers receive the connection object as a parameter:
 
 ```py
 @classmethod
-def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Optional[Any] = None) -> Any:
+def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Any | None = None) -> Any:
     """
     Transform data from the secondary framework to the primary framework.
     
@@ -128,20 +128,22 @@ result = mloda.run_all(
 
 ### DuckDB Transformer Example
 
-The `DuckDBPyarrowTransformer` requires a connection object for PyArrow → DuckDB transformations:
+The `DuckDBPyArrowTransformer` requires a connection object for PyArrow → DuckDB transformations. The shared `transform_other_fw_to_fw` lives in its base class `SqlBasePyArrowTransformer`, which validates the connection and delegates to the framework-specific hooks:
 
 ```py
-class DuckDBPyarrowTransformer(BaseTransformer):
+class DuckDBPyArrowTransformer(SqlBasePyArrowTransformer):
     @classmethod
-    def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Optional[Any] = None) -> Any:
-        """Transform a PyArrow Table to a DuckDB relation."""
-        if framework_connection_object is None:
-            raise ValueError("A DuckDB connection object is required for this transformation.")
-        
-        if not isinstance(framework_connection_object, duckdb.DuckDBPyConnection):
-            raise ValueError(f"Expected a DuckDB connection object, got {type(framework_connection_object)}")
-        
-        return framework_connection_object.from_arrow(data)
+    def _convert_to_arrow(cls, data: Any) -> Any:
+        return data.to_arrow_table()
+
+    @classmethod
+    def _convert_to_native(cls, data: Any, connection: Any) -> Any:
+        return DuckdbRelation.from_arrow(connection, data)
+
+    @classmethod
+    def _validate_connection(cls, connection: Any) -> None:
+        if not isinstance(connection, duckdb.DuckDBPyConnection):
+            raise ValueError(f"Expected a DuckDB connection object, got {type(connection)}")
 ```
 
 ## Implementation Guidelines
@@ -152,7 +154,7 @@ When implementing a new compute framework that requires a connection object:
 
 1. **Override `set_framework_connection_object`**:
 ```py
-def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
     if framework_connection_object is not None:
         if not isinstance(framework_connection_object, ExpectedConnectionType):
             raise ValueError(f"Expected connection type, got {type(framework_connection_object)}")
@@ -161,6 +163,8 @@ def set_framework_connection_object(self, framework_connection_object: Optional[
 
 2. **Pass connection objects** to merge engines and other components that need them.
 
+3. **Declare the modes the connection can survive.** A live connection or session cannot be pickled into a spawned worker. Override `supported_parallelization_modes` to leave out `ParallelizationMode.MULTIPROCESSING`, keeping `THREADING` only if the handle is thread-safe (DuckDB and SQLite declare `{ParallelizationMode.SYNC}` alone). The framework's steps then stay in the parent process under a MULTIPROCESSING run and take their connection exactly as in a SYNC run. Skipping this raises at plan time.
+
 ### For Transformer Developers
 
 When implementing transformers for stateful frameworks:
@@ -168,7 +172,7 @@ When implementing transformers for stateful frameworks:
 1. **Accept the connection object parameter**:
 ```py
 @classmethod
-def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Optional[Any] = None) -> Any:
+def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Any | None = None) -> Any:
     # Implementation here
 ```
 
@@ -188,7 +192,7 @@ return framework_connection_object.from_other_format(data)
 
 1. **Missing Connection Object**:
    ```
-   ValueError: A DuckDB connection object is required for this transformation.
+   ValueError: A connection object is required for this transformation.
    ```
    **Solution**: Ensure you're providing a connection object when using stateful frameworks. Currently, parent features are not receiving the connection details automatically. Thus, you might need to give them a second time to root features!
 

@@ -1,12 +1,7 @@
-"""
-Shared test mixin for _extract_column_dtype implementations.
+"""Shared dtype extraction tests for compute frameworks.
 
-This mixin verifies that each compute framework's _extract_column_dtype method
-returns dtype strings that are correctly classified by the _is_string_dtype and
-_is_numeric_dtype static methods. Each framework-specific test class should
-inherit from this mixin and provide:
-- framework_instance fixture: Returns a compute framework instance
-- dtype_sample_data fixture: Returns framework-specific data with int_col, str_col, float_col
+The default suite covers decimal data; frameworks that cannot support a test override it and skip it with a reason.
+Fixture contract: `framework_instance`, `dtype_sample_data` (`int_col`, `str_col`, `float_col`), `decimal_sample_data`.
 """
 
 from abc import abstractmethod
@@ -15,6 +10,7 @@ from typing import Any
 import pytest
 
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.user import DataType
 
 
 class DtypeExtractionTestMixin:
@@ -81,4 +77,105 @@ class DtypeExtractionTestMixin:
         assert dtype is not None
         assert not ComputeFramework._is_numeric_dtype(str(dtype).lower()), (
             f"string dtype '{dtype}' incorrectly classified as numeric"
+        )
+
+    @pytest.fixture
+    @abstractmethod
+    def decimal_sample_data(self) -> Any:
+        """Return a decimal column named d, including a null where supported."""
+        raise NotImplementedError
+
+    def test_extract_decimal_column_data_type(self, framework_instance: Any, decimal_sample_data: Any) -> None:
+        assert framework_instance._extract_column_data_type(decimal_sample_data, "d") == DataType.DECIMAL
+
+
+class DuplicateColumnDtypeExtractionTestMixin:
+    """Shared tests for _extract_column_dtype/_extract_column_data_type on duplicate-column data.
+
+    Opt-in, not part of DtypeExtractionTestMixin's abstract fixture contract: frameworks whose
+    _extract_column_dtype resolves the name positionally mix this in (Pandas, PyArrow, and
+    Iceberg's post-transform PyArrow branch). DuckDB and Spark are already first-occurrence safe
+    and could be mixed in too; frameworks that pin duplicate-column behavior at the
+    _output_schema level cover it in test_output_schema_hook.py instead.
+
+    The mixin is intentionally named without a ``Test`` prefix so pytest does not collect it
+    standalone. Framework subclasses pick up the test methods by inheritance.
+    """
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        """Return a compute framework instance.
+
+        Override in framework-specific test class.
+        """
+        raise NotImplementedError
+
+    @pytest.fixture
+    def dtype_duplicate_column_data(self) -> Any:
+        """Return a pa.Table with two columns named "dup_col": first int, second string.
+
+        Override in framework-specific test class.
+        """
+        raise NotImplementedError
+
+    @pytest.fixture
+    def dtype_duplicate_column_data_reversed(self) -> Any:
+        """Return a pa.Table with two columns named "dup_col": first string, second int.
+
+        Override in framework-specific test class. The reversed order pins first-occurrence
+        semantics: an implementation that merely prefers the numeric column would pass the
+        int-first fixture but fail this one.
+        """
+        raise NotImplementedError
+
+    def test_extract_duplicate_column_dtype_returns_first_occurrence(
+        self, framework_instance: Any, dtype_duplicate_column_data: Any
+    ) -> None:
+        """A duplicate column name must not raise; the first occurrence's dtype wins."""
+        dtype = framework_instance._extract_column_dtype(dtype_duplicate_column_data, "dup_col")
+        assert dtype is not None, "_extract_column_dtype returned None for a duplicate column"
+        assert ComputeFramework._is_numeric_dtype(str(dtype).lower()), (
+            f"duplicate column dtype '{dtype}' should match the first (int) occurrence"
+        )
+
+    def test_extract_duplicate_column_data_type_returns_first_occurrence(
+        self, framework_instance: Any, dtype_duplicate_column_data: Any
+    ) -> None:
+        """A duplicate column name must not raise; _extract_column_data_type returns the first occurrence."""
+        data_type = framework_instance._extract_column_data_type(dtype_duplicate_column_data, "dup_col")
+        assert data_type is not None, "_extract_column_data_type returned None for a duplicate column"
+        assert data_type == DataType.INT64, (
+            f"duplicate column data type '{data_type}' should match the first (int) occurrence"
+        )
+
+    def test_extract_duplicate_column_dtype_reversed_order_returns_first_occurrence(
+        self, framework_instance: Any, dtype_duplicate_column_data_reversed: Any
+    ) -> None:
+        """Reversing which column comes first proves first-occurrence wins, not "prefers numeric"."""
+        dtype = framework_instance._extract_column_dtype(dtype_duplicate_column_data_reversed, "dup_col")
+        assert dtype is not None, "_extract_column_dtype returned None for a duplicate column"
+        assert ComputeFramework._is_string_dtype(str(dtype).lower()), (
+            f"duplicate column dtype '{dtype}' should match the first (string) occurrence"
+        )
+
+    def test_extract_duplicate_column_data_type_reversed_order_returns_first_occurrence(
+        self, framework_instance: Any, dtype_duplicate_column_data_reversed: Any
+    ) -> None:
+        """Reversing which column comes first proves first-occurrence wins, not "prefers numeric"."""
+        data_type = framework_instance._extract_column_data_type(dtype_duplicate_column_data_reversed, "dup_col")
+        assert data_type is not None, "_extract_column_data_type returned None for a duplicate column"
+        assert data_type == DataType.STRING, (
+            f"duplicate column data type '{data_type}' should match the first (string) occurrence"
+        )
+
+    def test_extract_column_dtype_consistent_with_output_schema(
+        self, framework_instance: Any, dtype_duplicate_column_data: Any
+    ) -> None:
+        """_extract_column_dtype must agree with _output_schema's first-occurrence handling."""
+        output_schema = framework_instance._output_schema(dtype_duplicate_column_data)
+        assert output_schema is not None, "_output_schema returned None for a duplicate column table"
+        schema_dtype = dict(output_schema)["dup_col"]
+        extracted_dtype = framework_instance._extract_column_dtype(dtype_duplicate_column_data, "dup_col")
+        assert schema_dtype == extracted_dtype, (
+            f"_output_schema reports '{schema_dtype}' but _extract_column_dtype reports '{extracted_dtype}'"
         )

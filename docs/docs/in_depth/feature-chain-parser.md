@@ -69,7 +69,6 @@ The new `Options` class separates parameters into two categories:
 
 ```python
 from mloda.user import Options
-from typing import Optional
 
 # New Options architecture
 options = Options(
@@ -141,7 +140,7 @@ class MyFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 |-----------|------|---------|-------------|
 | `PREFIX_PATTERN` | `str` | Required | Regex pattern for matching feature names |
 | `PROPERTY_MAPPING` | `dict[str, PropertySpec]` | Required | Parameter validation configuration |
-| `MIN_IN_FEATURES` | `int` | `1` | Minimum required in_features |
+| `MIN_IN_FEATURES` | `int` | `1` | Minimum required in_features (an absent `in_features` counts as zero on the configuration path) |
 | `MAX_IN_FEATURES` | `int \| None` | `None` | Maximum allowed in_features (None = unlimited) |
 | `IN_FEATURE_SEPARATOR` | `str` | `"&"` | Separator for multiple in_features |
 | `RECOGNITION_ONLY_PATTERN` | `bool` | `False` | Declares a captureless pattern as recognition-only (binds no key from the name) |
@@ -265,7 +264,7 @@ Override when you need to add additional input features (e.g., time filter):
 
 ```py
 class TimeWindowFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         # Try string-based parsing first
         _, in_feature = FeatureChainParser.parse_feature_name(str(feature_name), [self.PREFIX_PATTERN])
         if in_feature is not None:
@@ -328,11 +327,14 @@ class GroupAggregation(FeatureChainParserMixin, FeatureGroup):
         "partition_by": PropertySpec(
             "Columns to partition by",
             match_guard=_is_list_of_strings,
+            expected="a list of strings",
         ),
     }
 ```
 
-The guard is only called when the option is present (not None). Validators must be pure functions, since they may be called several times during resolution. If the guard raises a TypeError, ValueError, or AttributeError, the exception is caught and the value is treated as invalid (match returns False).
+`expected` names what the guard accepts, so a rejection is reported in the resolution-failure output instead of staying a silent non-match.
+
+The guard is only called when the option is present (not None). Validators must be pure functions, since they may be called several times during resolution. If the guard raises, the value counts as rejected (match returns False).
 
 The full model, which invariant fires at which moment, the precedence between the two callables, and what a validator receives for each container type, lives in one place: [PROPERTY_MAPPING Configuration](property-mapping.md).
 
@@ -387,7 +389,7 @@ def match_feature_group_criteria(cls, feature_name, options, data_access_collect
 Handle both string-based and configuration-based features:
 
 ```py
-def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
     """Extract source feature from either configuration-based options or string parsing."""
 
     # Try string-based parsing first
@@ -505,14 +507,12 @@ on a requested feature travels down self-resolving chains (for example
 `price__mean_imputed__sum_aggr`) to the end of the chain without any ceremony:
 
 ```python
-from typing import Optional
-
 from mloda.provider import FeatureGroup
 from mloda.user import Feature, FeatureName, Options
 
 
 class GraphAnswer(FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         # The child inherits ALL of the consumer's group options by default.
         return {Feature("knowledge_graph")}
 ```
@@ -633,7 +633,7 @@ Use `resolve_multi_column_feature()` to automatically discover columns:
 
 ```py
 class MultiColumnConsumer(FeatureGroup):
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[Set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         # Request base feature without ~N suffix
         return {Feature("category__onehot_encoded")}
 

@@ -5,7 +5,7 @@ Artifact for storing trained forecasting models.
 import json
 import pickle  # nosec
 import base64
-from typing import Any, Optional
+from typing import Any
 
 from mloda.provider import BaseArtifact
 from mloda.provider import FeatureSet
@@ -94,7 +94,7 @@ class ForecastingArtifact(BaseArtifact):
         return artifact
 
     @classmethod
-    def custom_saver(cls, features: FeatureSet, artifact: Any) -> Optional[Any]:
+    def custom_saver(cls, features: FeatureSet, artifact: Any) -> Any | None:
         """
         Save the forecasting model artifact.
 
@@ -108,7 +108,7 @@ class ForecastingArtifact(BaseArtifact):
         return cls._serialize_artifact(artifact)
 
     @classmethod
-    def custom_loader(cls, features: FeatureSet) -> Optional[Any]:
+    def custom_loader(cls, features: FeatureSet) -> Any | None:
         """
         Load the forecasting model artifact.
 
@@ -121,10 +121,10 @@ class ForecastingArtifact(BaseArtifact):
 
         options = cls.get_singular_option_from_options(features)
 
-        if options is None or features.name_of_one_feature is None:
+        if options is None or features.artifact_to_load is None:
             return None
 
-        serialized_artifact = options.get(str(features.name_of_one_feature))
+        serialized_artifact = options.get(features.artifact_to_load)
         if serialized_artifact is None:
             return None
 

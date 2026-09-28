@@ -23,7 +23,8 @@ A fourth pass reads the other pairing on one ``try``: a ``finally`` that discard
 through a return, break or continue or by raising a replacement, undoes every escalation it encloses: the
 re-raises of its own clauses, and the marked raises in the arms those clauses never catch.
 
-Not covered: plugin code under ``mloda_plugins``; dynamic dispatch, which is why SEEDS is hand-written;
+Not covered: plugin code under ``mloda_plugins``, except the match helpers of ReadFile, ReadDB and
+ReadDocument, checked by the parametrized test below; dynamic dispatch, which is why SEEDS is hand-written;
 decorators; ``except*`` groups, which neither pass over a ``try`` reads, as their clauses split an exception
 group between them instead of racing for it, so the third pass's first-match reasoning does not hold there
 and the fourth drops them with it; a raise in the body of a nested try that has handlers, assumed caught there, and
@@ -112,6 +113,10 @@ RAISING_HELPERS_OUTSIDE_THE_PATH: dict[tuple[str, str], str] = {
     ("mloda/core/abstract_plugins/components/link.py", "matches"): _MATCHES_COLLISION,
     ("mloda/core/abstract_plugins/components/utils.py", "get_all_subclasses"): (
         "real edge, collided verdict: it raises nothing itself; the set.add / set.update names do"
+    ),
+    ("mloda/core/abstract_plugins/components/utils.py", "safe_field"): (
+        "real edge, collided verdict: it raises nothing itself; warn_once_for's own try/except degrades any "
+        "failure to 'not seen', and the WeakSet/set add() name collides with an unrelated raising add() elsewhere"
     ),
     ("mloda/core/prepare/resolve_links.py", "update"): _UPDATE_COLLISION,
     ("mloda/core/runtime/run.py", "join"): _JOIN_COLLISION,
@@ -2548,3 +2553,25 @@ def test_the_sweep_flags_a_returning_finally_spliced_into_the_real_seam() -> Non
     assert spliced == [FinallySite(module, lineno, function, discarded)], (
         f"a return spliced into the seam's own finally was not flagged: {spliced}"
     )
+
+
+_READER_MATCH_MODULES = [
+    pytest.param("mloda_plugins/feature_group/input_data/read_file.py", id="read_file"),
+    pytest.param("mloda_plugins/feature_group/input_data/read_db.py", id="read_db"),
+    pytest.param("mloda_plugins/feature_group/input_data/read_document.py", id="read_document"),
+]
+
+
+@pytest.mark.parametrize("module", _READER_MATCH_MODULES)
+def test_reader_match_handlers_escalate_or_declare_a_swallow(module: str) -> None:
+    """Each reader family's match helpers are plugin code, outside the walked graph, so they get a direct check."""
+    source = (_REPO_ROOT / module).read_text(encoding="utf-8")
+
+    handlers = classify_handlers(source, module, functions=None)
+    unannotated = [site for site in handlers if site.kind == "unannotated"]
+    misannotated = [site for site in handlers if site.kind == "misannotated"]
+    escalating = [site for site in handlers if site.kind == "escalating"]
+
+    assert unannotated == [], f"unannotated match handlers in {module}: {[s.location() for s in unannotated]}"
+    assert misannotated == [], f"misannotated match handlers in {module}: {[s.location() for s in misannotated]}"
+    assert escalating != [], f"expected at least one escalating handler among {module}'s match helpers"

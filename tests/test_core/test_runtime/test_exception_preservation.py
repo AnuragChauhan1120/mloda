@@ -21,7 +21,7 @@ and because ``MlodaRunError`` does not yet exist.
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -50,7 +50,7 @@ class ImportErrorFeatureGroup(FeatureGroup):
     """Root FG whose ``calculate_feature`` raises a stdlib ``ImportError``."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator(supports_features={"exc_import_error_col"})
 
     @classmethod
@@ -70,7 +70,7 @@ class DomainErrorFeatureGroup(FeatureGroup):
     """Root FG whose ``calculate_feature`` raises a ``ValueError`` subclass."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator(supports_features={"exc_domain_error_col"})
 
     @classmethod
@@ -86,7 +86,7 @@ class CauseChainFeatureGroup(FeatureGroup):
     """Root FG that raises ``ValueError`` from a ``KeyError`` (``__cause__`` chain)."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator(supports_features={"exc_cause_chain_col"})
 
     @classmethod
@@ -108,11 +108,12 @@ _ENABLED_CAUSE_CHAIN = PluginCollector.enabled_feature_groups({CauseChainFeature
 # --------------------------------------------------------------------------- #
 
 
-def test_sync_preserves_import_error_type() -> None:
+def test_sync_preserves_import_error_type(caplog: pytest.LogCaptureFixture) -> None:
     """SYNC ``run_all`` must surface the original ``ImportError`` type, not a bare Exception.
 
     FAILS today: ``_check_for_error`` raises a bare ``Exception`` so
     ``pytest.raises(ImportError)`` does not match and the Exception propagates.
+    It also logs the traceback exactly once, on an mloda logger, never on the root logger.
     """
     with pytest.raises(ImportError, match="bm25s"):
         mloda.run_all(
@@ -121,6 +122,10 @@ def test_sync_preserves_import_error_type() -> None:
             plugin_collector=_ENABLED_IMPORT_ERROR,
             parallelization_modes={ParallelizationMode.SYNC},
         )
+
+    assert [r.name for r in caplog.records if r.name == "root"] == []
+    traceback_records = [r for r in caplog.records if "Traceback" in r.getMessage()]
+    assert [r.name for r in traceback_records] == ["mloda.core.runtime.run"]
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +265,7 @@ class UnpicklableErrorFeatureGroup(FeatureGroup):
     """Root FG whose ``calculate_feature`` raises a non-picklable exception."""
 
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator(supports_features={"exc_unpicklable_col"})
 
     @classmethod

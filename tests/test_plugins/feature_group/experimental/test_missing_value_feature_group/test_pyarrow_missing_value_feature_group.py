@@ -11,10 +11,14 @@ from mloda.user import PluginCollector
 from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
 from mloda_plugins.feature_group.experimental.data_quality.missing_value.pyarrow import PyArrowMissingValueFeatureGroup
 
+from tests.test_plugins.feature_group.experimental.test_missing_value_feature_group.missing_value_zero_row_test_mixin import (
+    MissingValueZeroRowTestMixin,
+)
 from tests.test_plugins.feature_group.experimental.test_missing_value_feature_group.test_missing_value_utils import (
     PyArrowMissingValueTestDataCreator,
     validate_missing_value_features,
 )
+from tests.test_plugins.feature_group.experimental.zero_row_result_type_test_mixin import PyArrowZeroRowAdapter
 
 
 @pytest.fixture
@@ -27,6 +31,31 @@ def sample_table_with_missing() -> pa.Table:
             "category": ["A", None, "B", "A", None],
             "temperature": [72.5, 68.3, None, None, 70.1],
             "group": ["X", "Y", "X", "Y", "X"],
+        }
+    )
+
+
+@pytest.fixture
+def sample_table_with_missing_offset_group() -> pa.Table:
+    """Table where group "B" starts at global row 5 (not row 0), exposing group-local vs
+    global row-index bugs in ffill/bfill grouped imputation."""
+    return pa.Table.from_pydict(
+        {
+            "value": [10, 20, 30, 40, 50, 100, None, None, 400, 500],
+            "group": ["A", "A", "A", "A", "A", "B", "B", "B", "B", "B"],
+        }
+    )
+
+
+@pytest.fixture
+def sample_table_with_null_group_key() -> pa.Table:
+    """Table where one row's group-by-feature value is itself null (None group key),
+    and the value column also has a null at that same row, so grouped ffill/bfill
+    must resolve that row's own group without crashing."""
+    return pa.Table.from_pydict(
+        {
+            "value": [10, None, 30],
+            "group": ["A", None, "A"],
         }
     )
 
@@ -174,6 +203,64 @@ class TestPyArrowMissingValueFeatureGroup:
         assert not pc.is_null(result[1]).as_py()  # Should be imputed
         assert not pc.is_null(result[3]).as_py()  # Should be imputed
 
+    def test_perform_grouped_imputation_ffill_group_not_starting_at_zero(
+        self, sample_table_with_missing_offset_group: pa.Table
+    ) -> None:
+        """Grouped ffill must resolve each group's last-valid-before-row using the row's position
+        within the group, not its global row index, when the group does not start at row 0."""
+        result = PyArrowMissingValueFeatureGroup._perform_grouped_imputation(
+            sample_table_with_missing_offset_group, "ffill", "value", None, ["group"]
+        )
+
+        df = sample_table_with_missing_offset_group.to_pandas()
+        expected = df.groupby("group")["value"].ffill()
+
+        # Group "B" is [100, None, None, 400, 500] at global rows 5-9.
+        # Both nulls should be filled from the preceding in-group value (100), not the group's last value (500).
+        assert result[6].as_py() == expected[6]
+        assert result[7].as_py() == expected[7]
+        assert result[6].as_py() == 100
+        assert result[7].as_py() == 100
+
+    def test_perform_grouped_imputation_bfill_group_not_starting_at_zero(
+        self, sample_table_with_missing_offset_group: pa.Table
+    ) -> None:
+        """Grouped bfill must resolve each group's first-valid-after-row using the row's position
+        within the group, not its global row index, when the group does not start at row 0."""
+        result = PyArrowMissingValueFeatureGroup._perform_grouped_imputation(
+            sample_table_with_missing_offset_group, "bfill", "value", None, ["group"]
+        )
+
+        df = sample_table_with_missing_offset_group.to_pandas()
+        expected = df.groupby("group")["value"].bfill()
+
+        # Group "B" is [100, None, None, 400, 500] at global rows 5-9.
+        # Both nulls should be filled from the following in-group value (400), not left unfilled.
+        assert not pc.is_null(result[6]).as_py()
+        assert not pc.is_null(result[7]).as_py()
+        assert result[6].as_py() == expected[6]
+        assert result[7].as_py() == expected[7]
+        assert result[6].as_py() == 400
+        assert result[7].as_py() == 400
+
+    def test_perform_grouped_imputation_ffill_null_group_key(self, sample_table_with_null_group_key: pa.Table) -> None:
+        """Grouped ffill must not crash when a row needing imputation has a null group-by key:
+        Arrow's 3-valued equality makes pc.equal(col, null) all-null, so the null-key group mask
+        is all-null and the row's own index is missing from indices_nonzero(group_mask)."""
+        result = PyArrowMissingValueFeatureGroup._perform_grouped_imputation(
+            sample_table_with_null_group_key, "ffill", "value", None, ["group"]
+        )
+        assert isinstance(result, pa.Array)
+        assert len(result) == sample_table_with_null_group_key.num_rows
+
+    def test_perform_grouped_imputation_bfill_null_group_key(self, sample_table_with_null_group_key: pa.Table) -> None:
+        """Grouped bfill must not crash when a row needing imputation has a null group-by key."""
+        result = PyArrowMissingValueFeatureGroup._perform_grouped_imputation(
+            sample_table_with_null_group_key, "bfill", "value", None, ["group"]
+        )
+        assert isinstance(result, pa.Array)
+        assert len(result) == sample_table_with_null_group_key.num_rows
+
     def test_calculate_feature_single(self, sample_table_with_missing: pa.Table, feature_set_mean: FeatureSet) -> None:
         """Test calculate_feature method with a single imputation."""
         result = PyArrowMissingValueFeatureGroup.calculate_feature(sample_table_with_missing, feature_set_mean)
@@ -281,6 +368,10 @@ class TestPyArrowMissingValueFeatureGroup:
             PyArrowMissingValueFeatureGroup.calculate_feature(sample_table_with_missing, feature_set)
 
 
+class TestPyArrowMissingValueZeroRow(PyArrowZeroRowAdapter, MissingValueZeroRowTestMixin):
+    feature_group_class = PyArrowMissingValueFeatureGroup
+
+
 class TestMissingValuePyArrowIntegration:
     """Integration tests for the missing value feature group using DataCreator."""
 
@@ -304,6 +395,7 @@ class TestMissingValuePyArrowIntegration:
             "category__mode_imputed",  # Mode imputation
             "category__constant_imputed",  # Constant imputation
             "temperature__ffill_imputed",  # Forward fill imputation
+            "temperature__bfill_imputed",  # Backward fill imputation
         ]
 
         feature_list: list[str | Feature] = [Feature(name=feature, options=options) for feature in feature_str]

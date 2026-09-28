@@ -1,10 +1,11 @@
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID, uuid4
 
 from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
 from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import (
     ComputeFrameworkTransformer,
 )
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.core.cfw_manager import CfwManager
 from mloda.core.core.step.abstract_step import Step
@@ -21,9 +22,9 @@ class TransformFrameworkStep(Step):
         required_uuids: set[UUID],
         from_feature_group: type[FeatureGroup],
         to_feature_group: type[FeatureGroup],
-        link_id: Optional[UUID] = None,
-        source_framework_uuids: Optional[set[UUID]] = None,
-        source_step_uuid: Optional[UUID] = None,
+        link_id: UUID | None = None,
+        source_framework_uuids: set[UUID] | None = None,
+        source_step_uuid: UUID | None = None,
     ) -> None:
         if source_framework_uuids is None:
             source_framework_uuids = set()
@@ -40,11 +41,15 @@ class TransformFrameworkStep(Step):
         self.transformer = ComputeFrameworkTransformer()
 
         # This variable is only set, if the TFS was requested by a joinstep.
-        self.source_framework_uuid: Optional[UUID] = None
+        self.source_framework_uuid: UUID | None = None
         if len(source_framework_uuids) > 0:
             self.source_framework_uuid = next(iter(source_framework_uuids))
 
         self.step_is_done = False
+
+        # Consumer uuids the hop marks as arrived on its SOURCE-side cfw once the hop finishes;
+        # set post-construction by ExecutionPlan.add_tfs.
+        self.owed_tokens: frozenset[UUID] = frozenset()
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, TransformFrameworkStep):
@@ -76,13 +81,16 @@ class TransformFrameworkStep(Step):
     def get_uuids(self) -> set[UUID]:
         return {self.uuid}
 
+    def get_parallelization_mode(self) -> set[ParallelizationMode]:
+        return self.to_framework.supported_parallelization_modes()
+
     def execute(
         self,
         cfw_register: CfwManager,
         cfw: ComputeFramework,
-        from_cfw: Optional[ComputeFramework | UUID] = None,
-        data: Optional[Any] = None,
-    ) -> Optional[Any]:
+        from_cfw: ComputeFramework | UUID | None = None,
+        data: Any | None = None,
+    ) -> Any | None:
         self.location = cfw_register.get_location()
 
         if from_cfw is None:
@@ -95,26 +103,18 @@ class TransformFrameworkStep(Step):
             )
 
         data = self.get_data(from_cfw)
-        column_names = self.get_column_names(cfw_register, from_cfw)
-
-        data = self.transform(cfw, data, column_names)
+        data = self.transform(cfw, data)
 
         cfw.set_data(data)
         cfw.set_column_names()
 
         if self.location:
             cfw.upload_finished_data(self.location)
+            # upload_finished_data overwrites cfw.data with the Arrow transport copy; restore the
+            # native object so a same-process consumer of this cfw does not see the transport type.
+            cfw.set_data(data)
             return data
         return None
-
-    def get_column_names(self, cfw_register: CfwManager, from_cfw: ComputeFramework | UUID) -> set[str]:
-        if self.location and isinstance(from_cfw, UUID):
-            return cfw_register.get_column_names(from_cfw)
-
-        if isinstance(from_cfw, UUID):
-            raise ValueError("From_cfw is a UUID, but we are not using flightserver.")
-
-        return from_cfw.get_column_names()
 
     def get_data(self, cfw: ComputeFramework | UUID) -> Any:
         """
@@ -135,7 +135,7 @@ class TransformFrameworkStep(Step):
     def set_data(self, cfw: ComputeFramework, data: Any) -> None:
         cfw.set_data(data)
 
-    def transform(self, cfw: ComputeFramework, data: Any, feature_names: set[str]) -> Any:
+    def transform(self, cfw: ComputeFramework, data: Any) -> Any:
         _from_fw = self.from_framework.expected_data_framework()
         _to_fw = self.to_framework.expected_data_framework()
 

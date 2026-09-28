@@ -8,6 +8,7 @@ from mloda.provider import FeatureSet
 from mloda.user import DataType
 from mloda.user import Options
 from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import quote_ident
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_affinity import sqlite_affinity_class
 from mloda_plugins.feature_group.input_data.read_db import ReadDB
 
 
@@ -283,3 +284,37 @@ class SQLITEReader(ReadDB):
         if options is None:
             raise ValueError("Options were not set.")
         return options.get("BaseInputData")[1]["table_name"]
+
+    @classmethod
+    def describe_columns(cls, data_access: Any) -> dict[str, DataType | None]:
+        """Maps column name to DataType via PRAGMA table_info's declared-type affinity; a
+        NUMERIC/DECIMAL or undeclared column maps to None rather than guessing STRING."""
+        if not isinstance(data_access, dict) or not data_access.get("table_name"):
+            raise ValueError(
+                f"{cls.__name__}.describe_columns requires data_access to be a dict with a 'table_name' key."
+            )
+        if not cls.is_valid_credentials(data_access):
+            raise ValueError(
+                f"{cls.__name__}.describe_columns requires data_access to have a str path under the "
+                f"'{cls.db_path()}' key."
+            )
+        table_name = str(data_access["table_name"])
+        result, _ = cls.read_db(data_access, query=f"PRAGMA table_info({quote_ident(table_name)});")
+        if not result:
+            raise ValueError(f"{cls.__name__}.describe_columns: no such table '{table_name}'.")
+        return {row[1]: cls._affinity_to_datatype(str(row[2])) for row in result}
+
+    @staticmethod
+    def _affinity_to_datatype(declared_type: str) -> DataType | None:
+        # Shares its affinity precedence with sqlite_affinity_class, but falls back to
+        # None instead of NUMERIC/string, and targets DataType instead of pa.DataType.
+        label = sqlite_affinity_class(declared_type)
+        if label == "INTEGER":
+            return DataType.INT64
+        if label == "TEXT":
+            return DataType.STRING
+        if label == "BLOB":
+            return DataType.BINARY
+        if label == "REAL":
+            return DataType.DOUBLE
+        return None

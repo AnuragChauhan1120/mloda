@@ -25,6 +25,8 @@ def match_feature_group_criteria(cls, feature_name, options, data_access_collect
 
 Do not call `FeatureChainParser.match_configuration_feature_chain_parser` directly from a match hook: it raises on an option value the `PROPERTY_MAPPING` rejects. An exception out of a match hook is contained as a `match hook` near-miss for that candidate instead of taking the whole resolution down, but a contained crash is a worse reason than a rejection. `match_parser_criteria` turns that rejection into a non-match, and the reason still reaches the user in the "No feature groups found" error.
 
+To report why a `match_guard` declined a value without overriding `match_feature_group_criteria`, declare `expected` on the spec instead; see [PROPERTY_MAPPING Configuration](property-mapping.md).
+
 Containment covers plugin raises only: a framework-owned raise (a two-readers conflict, a forwarded value contradicting the feature name, a rejected effective-options build) still aborts the whole resolution, because it reports a misconfiguration you have to fix.
 
 Filter matching contains the same way: a raise is a non-match for that probe, like a `False` return, and is recorded in `GlobalFilter.dropped_filters` as a `match hook` near-miss, as is a typed decline the matcher records; a framework-owned raise still aborts. Every entry names the gate that dropped the filter and that gate's reason. [How filters reach your FeatureGroup](filter_data.md#how-filters-reach-your-featuregroup) tables the gates the two paths share and where filter policy differs.
@@ -32,6 +34,8 @@ Filter matching contains the same way: a raise is a non-match for that probe, li
 The probe runs per feature, but a matched filter attaches to the whole `FeatureSet`, so a non-match for one feature does not suppress a filter a sibling matched. See [Filter scope](filter_data.md#filter-scope-is-the-featureset).
 
 Every caller reads the return by truthiness: any falsy value is a non-match, any truthy value a match. Filter matching additionally reports a falsy value that is not `False`, and each distinct report is a WARNING once per setup.
+
+A match hook that refuses the feature because of its name, for example an unknown output part, records the reason with `record_match_rejection(cls.__name__, reason, stage=NAME_STAGE)` (both from `mloda.provider`) and returns `False`; the near-miss then reads `feature name` instead of `option value`. Record the reason only when the name is otherwise addressed to the group, for example its base or prefix matches but the output part is unknown; a plain name mismatch returns `False` without recording anything.
 
 The options view depends on the caller: feature resolution passes declared (pre-default) options, while filter matching runs after intake and passes the resolved feature's effective (post-default) options merged onto the filter feature's own. Matching logic that reads option values can see different values on the two paths. See [Applying declared defaults](property-mapping.md#applying-declared-defaults).
 
@@ -62,6 +66,7 @@ PROPERTY_MAPPING = {
 Every value in the mapping is a `PropertySpec`; accepted values go under `allowed_values`.
 A raw dict spec raises at class definition, and an unknown field is a constructor
 `TypeError`. See [PROPERTY_MAPPING Configuration](property-mapping.md) for the full model.
+On the configuration path, a class with the default `MIN_IN_FEATURES = 1` does not match options that omit `in_features`, because an absent or explicit `None` `in_features` counts as zero; a source-less chained group sets `MIN_IN_FEATURES = 0` to opt out.
 
 ### 3. Validation Modes
 
@@ -89,11 +94,13 @@ options = Options(context={"in_features": "custom_feature"})  # Any value OK
 For complex validation beyond simple value lists:
 
 ```python
+from mloda.provider import is_positive_int
+
 PROPERTY_MAPPING = {
     "window_size": PropertySpec(
         "Size of the time window",
         strict_validation=True,
-        element_validator=lambda x: isinstance(x, int) and x > 0,
+        element_validator=is_positive_int,
     ),
 }
 ```

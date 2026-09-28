@@ -203,7 +203,7 @@ Every failure a plugin can cause falls into one of three tiers:
   `available_only=True`, exactly as a genuinely unavailable one would be.
 - **Skip.** An entry that is not meant to be documented is dropped silently:
   classes defined in `__main__`, and the abstract bases (`get_extender_docs`
-  skips `Extender` and `_CompositeExtender` explicitly; the FeatureGroup and
+  skips `Extender` and `CompositeExtender` explicitly; the FeatureGroup and
   ComputeFramework roots never appear because `get_all_subclasses` omits them).
   Redefinition duplicates are collapsed rather than listed twice (see below).
 - **Propagate.** Errors that are not a single plugin's introspection fault are
@@ -264,7 +264,7 @@ its declaration is read. Both apply identically to a run, so a scope that rescue
 ### Shared helper
 
 The annotate tier is a single shared helper,
-`safe_field(read, fallback, catching=(Exception,), field="")` in
+`safe_field(read, fallback, catching=(Exception,), field="", warn_once_for=None)` in
 `mloda.core.abstract_plugins.components.utils`: it calls the `read` thunk and
 returns `fallback` if the read raises one of `catching`, so a catalog function or
 info field reaches for one helper instead of re-deriving a `try/except`.
@@ -277,10 +277,13 @@ also reject a non-str return, so a wrong type degrades too instead of sinking th
 call at the filter.
 
 Logging is opt-in via `field`: the labelled `get_feature_group_docs` reads warn on
-swallow, where a raise does mean a broken plugin. The unlabelled guards stay silent
-because degrading there is by design (source introspection of `type()`-built
-classes, an availability probe without its optional backend, Iceberg's deliberate
-`NotImplementedError` from `merge_engine()`).
+swallow, where a raise does mean a broken plugin (`_safe_version` included, via
+`warn_once_for` so a broken class warns once, not once per catalog walk). The
+unlabelled guards stay silent because degrading there is by design (the source-hash
+read in `accessible_plugins.py`, an availability probe without its optional backend,
+Iceberg's deliberate `NotImplementedError` from `merge_engine()`). A hot call site
+can also pass `warn_once_for` (a key, typically the plugin class) to dedup that
+WARNING to once per key instead of once per call.
 
 `get_compute_framework_docs` uses the default broad `catching` (any failure
 degrades the field), while the narrower named guards `_safe_version` (in
@@ -295,3 +298,4 @@ entry), because the catalog's job is to list a degraded class, not hide it.
 - [Plugin Loader](plugin-loader.md)
 - [Feature Group Matching](feature-group-matching.md)
 - [Feature Group Resolution Errors](troubleshooting/feature-group-resolution-errors.md)
+- [Column discovery on a reader](data-access-patterns.md#column-discovery)

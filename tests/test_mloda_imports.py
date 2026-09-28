@@ -118,12 +118,14 @@ def test_import_user_full() -> None:
 
 def test_import_provider_base_classes() -> None:
     """from mloda.provider import ... (Data Provider base classes)"""
+    import mloda.provider as provider_module
     from mloda.provider import (
         # Base classes
         FeatureGroup,
         ComputeFramework,
         # Versioning
         BaseFeatureGroupVersion,
+        ThirdPartyVersionMode,
         # Feature set
         FeatureSet,
         # Input data
@@ -156,9 +158,12 @@ def test_import_provider_base_classes() -> None:
         # Match rejection recording
         record_match_rejection,
         INPUT_DATA_STAGE,
+        NAME_STAGE,
         # Transformers
         BaseTransformer,
         ComputeFrameworkTransformer,
+        # Optional-dependency import guards
+        traceback_blames_root,
         # Engines
         BaseFilterEngine,
         BaseMergeEngine,
@@ -169,6 +174,7 @@ def test_import_provider_base_classes() -> None:
     assert ComputeFramework is not None
     # Versioning
     assert BaseFeatureGroupVersion is not None
+    assert ThirdPartyVersionMode is not None
     # Feature set
     assert FeatureSet is not None
     # Input data
@@ -201,9 +207,13 @@ def test_import_provider_base_classes() -> None:
     # Match rejection recording
     assert callable(record_match_rejection)
     assert INPUT_DATA_STAGE == "input_data"
+    assert NAME_STAGE == "name"
     # Transformers
     assert BaseTransformer is not None
     assert ComputeFrameworkTransformer is not None
+    # Optional-dependency import guards
+    assert callable(traceback_blames_root)
+    assert "traceback_blames_root" in provider_module.__all__
     # Engines
     assert BaseFilterEngine is not None
     assert BaseMergeEngine is not None
@@ -216,6 +226,7 @@ def test_import_provider_base_classes() -> None:
 
 def test_import_steward_governance() -> None:
     """from mloda.steward import ... (Data Steward governance)"""
+    import mloda.steward as steward_module
     from mloda.steward import (
         # Plugin inspection
         FeatureGroupInfo,
@@ -228,6 +239,12 @@ def test_import_steward_governance() -> None:
         # Function extenders (audit, monitoring, observability)
         Extender,
         ExtenderHook,
+        # Optional-dependency import guards
+        traceback_blames_root,
+        # Pickle safety
+        pickle_failure_reason,
+        is_picklable,
+        WarnOncePerInstance,
         # Resolved execution plan
         PlanStep,
     )
@@ -245,6 +262,16 @@ def test_import_steward_governance() -> None:
     # Function extenders
     assert Extender is not None
     assert ExtenderHook is not None
+    # Optional-dependency import guards
+    assert callable(traceback_blames_root)
+    assert "traceback_blames_root" in steward_module.__all__
+    # Pickle safety
+    assert callable(pickle_failure_reason)
+    assert callable(is_picklable)
+    assert WarnOncePerInstance is not None
+    assert "pickle_failure_reason" in steward_module.__all__
+    assert "is_picklable" in steward_module.__all__
+    assert "WarnOncePerInstance" in steward_module.__all__
 
 
 # =============================================================================

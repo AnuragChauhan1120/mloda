@@ -189,7 +189,7 @@ link = Link.inner_on(UserFeatureGroup, OrderFeatureGroup)
 link = Link.inner_on(UserFeatureGroup, OrderFeatureGroup, left_index=0, right_index=1)
 ```
 
-Available `_on` methods: `inner_on`, `left_on`, `right_on`, `outer_on`, `append_on`, `union_on`
+Available `_on` methods: `inner_on`, `left_on`, `right_on`, `outer_on`, `append_on`, `union_on`, `asof_on`
 
 **Note:** The `_on` methods raise `ValueError` if the feature group doesn't define `index_columns()` or returns an empty list, and `IndexError` if the specified index position is out of range.
 
@@ -273,6 +273,10 @@ features = {
 
 The execution planner validates that the discriminator key-value pairs exist in the corresponding feature's options to correctly identify which instance belongs to which side of the join.
 
+The two sides may use different key column names: each side's key column is injected only into the nodes matching that side's discriminator.
+
+Discriminators are part of a link's identity, so two links that differ only by their discriminators are distinct in `links=`, letting one node join to several same-class nodes.
+
 #### Polymorphic Link Matching
 
 Links support inheritance-based matching, allowing a link defined with base classes to automatically apply to subclasses. This enables defining generic join relationships that work across feature group hierarchies.
@@ -315,6 +319,8 @@ link = Link.inner(
 
 The balanced inheritance rule ensures that joins only occur between "parallel" subclasses - both sides must be at the same level in the inheritance hierarchy relative to the link definition.
 
+Key injection follows the same subclass rule: a link declared on a base class injects its key column into subclass nodes on that side just as it would the declared class, so a subclass must provide that column even when a more specific link also applies. Discriminators narrow the side only when a class matches both sides. A node whose requested feature is itself one of its links' key columns receives no other key, which keeps batches named after their key column distinguishable.
+
 When multiple batches match (e.g. three subclasses all matching a base-class link), the engine disambiguates using `right_index`: first by exact `feature.index` match, then by checking whether the feature name appears in the join key columns of `right_index`. Ensure each link's `right_index` contains the column name that uniquely identifies its right-side batch.
 
 #### mlodaAPI
@@ -341,7 +347,8 @@ In this example, we show the PandasMergeEngine.
 
 ```py
 class PandasDataFrame(ComputeFramework):
-    def merge_engine(self) -> Type[BaseMergeEngine]:
+    @classmethod
+    def merge_engine(cls) -> type[BaseMergeEngine]:
         return PandasMergeEngine
 ```
 
@@ -353,17 +360,26 @@ The merge can implement:
 -   **merge_full_outer**
 -   **merge_append**
 -   **merge_union**
+-   **merge_asof**
 
-These methods are invoked via the final implementation in the abstract class **BaseMergeEngine**:
+These methods are invoked via the final implementation in the abstract class **BaseMergeEngine**, which receives the `Link` and reads the join type and indexes from it:
 
 ```py
 @final
-def merge(self, left_data: Any, right_data: Any, jointype: JoinType, left_index: Index, right_index: Index) -> Any:
+def merge(self, left_data: Any, right_data: Any, link: Link) -> Any:
+    self.check_import()
+
+    jointype = link.jointype
+    left_index = link.left_index
+    right_index = link.right_index
+    ...
     if jointype == JoinType.INNER:
         return self.merge_inner(left_data, right_data, left_index, right_index)
-    if jointype == JoinType.LEFT:
+    elif jointype == JoinType.LEFT:
         return self.merge_left(left_data, right_data, left_index, right_index)
     ...
+    elif jointype == JoinType.ASOF:
+        return self.merge_asof(left_data, right_data, left_index, right_index, link.asof_config)
 ```
 
 A simplified MergeEngine implementation looks like this:
@@ -384,19 +400,17 @@ class PandasMergeEngine(BaseMergeEngine):
     def join_logic(
         self, join_type: str, left_data: Any, right_data: Any, left_index: Index, right_index: Index, jointype: JoinType
     ) -> Any:
+        left_idx: str | list[str]
+        right_idx: str | list[str]
         if left_index.is_multi_index() or right_index.is_multi_index():
-            raise ValueError(f"MultiIndex is not yet implemented {self.__class__.__name__}")
-
-        if left_index == right_index:
+            left_idx = list(left_index.index)
+            right_idx = list(right_index.index)
+        else:
             left_idx = left_index.index[0]
             right_idx = right_index.index[0]
-            left_data = self.pd_merge()(left_data, right_data, left_on=left_idx, right_on=right_idx, how=join_type)
-            return left_data
 
-        else:
-            raise ValueError(
-                f"JoinType {join_type} {left_index} {right_index} is not yet implemented in {self.__class__.__name__}"
-            )
+        left_data = self.pd_merge()(left_data, right_data, left_on=left_idx, right_on=right_idx, how=join_type)
+        return left_data
 ```
 
 
@@ -405,7 +419,6 @@ Key Components:
 
 -   **left_data**: Left dataset for the join.
 -   **right_data**: Right dataset for the join.
--   **left_index** and **right_index**: Indexes specifying join keys.
--   **jointype**: Instance of JoinType.
+-   **link**: The Link carrying the join type (`link.jointype`), the join keys (`link.left_index`, `link.right_index`), and for as-of joins the `link.asof_config`.
 
 By implementing these merge functionality, the compute framework automatically handles data merging operations in the background, aligning with the relationships defined by **Index**, **JoinType**, and **Link**.

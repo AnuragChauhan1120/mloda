@@ -37,6 +37,7 @@ GUARDS_FUNCTIONS = (
     "validate_name_binding",
     "warn_captureless_without_binding",
     "warn_universal_optional_matcher",
+    "warn_missing_in_features_declaration",
     "check_required_when",
     "install_required_when_guard",
     "install_name_path_presence_guard",
@@ -46,6 +47,9 @@ GUARDS_FUNCTIONS = (
     "_pattern_named_and_total_groups",
     "_flatten_patterns",
     "_str_reachable_values",
+    "_is_guard_wrapper",
+    "_matcher_carries_guard",
+    "_unwrapped_matcher_function",
 )
 
 # The public moved names, which must NOT come back as FeatureChainParser attributes.
@@ -53,6 +57,7 @@ NO_REEXPORT_NAMES = (
     "validate_name_binding",
     "warn_captureless_without_binding",
     "warn_universal_optional_matcher",
+    "warn_missing_in_features_declaration",
     "install_required_when_guard",
     "install_name_path_presence_guard",
     "check_required_when",

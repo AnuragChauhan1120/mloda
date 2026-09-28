@@ -1,5 +1,5 @@
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable
 from uuid import UUID
 
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
@@ -14,19 +14,33 @@ if TYPE_CHECKING:
     from mloda.core.abstract_plugins.feature_group import FeatureGroup
 
 
+def merge_input_feature_edges(pairs: Iterable[tuple[str, Iterable[str]]]) -> dict[str, tuple[str, ...]] | None:
+    """Fold (feature name, declared input names) pairs into output name -> sorted inputs; None when empty."""
+    merged: dict[str, set[str]] = {}
+    for name, inputs in pairs:
+        declared = {str(entry) for entry in inputs}
+        if declared:
+            merged.setdefault(str(name), set()).update(declared)
+    return {name: tuple(sorted(inputs)) for name, inputs in sorted(merged.items())} or None
+
+
 class FeatureSet:
-    def __init__(self, features: Optional[Iterable[Feature]] = None) -> None:
+    def __init__(self, features: Iterable[Feature] | None = None) -> None:
         self.features: set[Feature] = set()
-        self.options: Optional[Options] = None
+        self.options: Options | None = None
         # This is just one uuid for easier access
-        self.any_uuid: Optional[UUID] = None
-        self.filters: Optional[set[SingleFilter]] = None
-        self.name_of_one_feature: Optional[FeatureName] = None
-        self.artifact_to_save: Optional[str] = None
-        self.artifact_to_load: Optional[str] = None
-        self.save_artifact: Optional[Any] = None
+        self.any_uuid: UUID | None = None
+        self.filters: set[SingleFilter] | None = None
+        self.name_of_one_feature: FeatureName | None = None
+        self.artifact_to_save: str | None = None
+        self.artifact_to_load: str | None = None
+        self.save_artifact: Any | None = None
         self.filter_engine: type[BaseFilterEngine] = BaseFilterEngine
         self.mask_engine: type[BaseMaskEngine] | None = None
+        self.declared_input_feature_names: frozenset[str] | None = None
+        self.declared_input_features_resolved: bool = False
+        self.declared_input_feature_edges: dict[str, tuple[str, ...]] | None = None
+        self.option_split_hint: tuple[str, frozenset[Any]] | None = None
 
         if features is not None:
             for feature in features:
@@ -55,9 +69,28 @@ class FeatureSet:
 
         for feature_name in self.get_all_names():
             if feature_name in runtime_artifacts:
+                # Dedupe by identity, not equality: Options.__eq__/__hash__ is group-content-based,
+                # so distinct instances with equal groups must not collapse into one.
+                distinct_options = {id(feature.options): feature.options for feature in self.features}.values()
+
+                for options in distinct_options:
+                    if feature_name in options.group:
+                        raise ValueError(
+                            f"Artifact '{feature_name}' is already stored in Options.group from a previous "
+                            "save; supply it either via Options at prepare time or via run(artifacts=...), "
+                            f"not both (feature set anchored on '{self.get_name_of_one_feature()}')."
+                        )
+
+                # Write to context (never group, to avoid mutating any Feature's hash) on every
+                # distinct Options instance, since get_singular_option_from_options may read any of them.
+                # A raw dict write, not add_to_context(): its value-equality check crashes on
+                # non-boolean-comparable artifacts (e.g. numpy arrays) and would block re-resolving
+                # a different artifact across repeated run() calls.
+                for options in distinct_options:
+                    options.context[feature_name] = runtime_artifacts[feature_name]
+
                 self.artifact_to_load = feature_name
                 self.artifact_to_save = None
-                self.options.set(feature_name, runtime_artifacts[feature_name])
                 return
 
         self.artifact_to_load = None
@@ -65,7 +98,8 @@ class FeatureSet:
 
     def add(self, feature: Feature) -> None:
         self.features.add(feature)
-        self.name_of_one_feature = feature.name
+        if self.name_of_one_feature is None or feature.name < self.name_of_one_feature:
+            self.name_of_one_feature = feature.name
         if self.options is None:
             self.options = feature.options
         if self.any_uuid is None:
@@ -106,12 +140,19 @@ class FeatureSet:
                     f"Deduplicate the request or set the key explicitly on all twins. Affected: {names}"
                 )
             self.features = rebuilt
+        options_before = self.options
         if self.options is not None:
             entry_for_options = memo.get(id(self.options))
             if entry_for_options is not None:
                 self.options = entry_for_options[1]
             else:
                 self.options = feature_group.options_with_defaults(self.options)
+
+        # Materialized options can change what input_features declares, so drop the memo when anything changed.
+        if rebound or self.options is not options_before:
+            self.declared_input_features_resolved = False
+            self.declared_input_feature_names = None
+            self.declared_input_feature_edges = None
 
     def get_all_feature_ids(self) -> set[UUID]:
         return {feature.uuid for feature in self.features}
@@ -157,9 +198,8 @@ class FeatureSet:
         return tuple(sorted({feature.name for feature in self.features if feature.initial_requested_data}))
 
     def get_name_of_one_feature(self) -> FeatureName:
-        FeatureSetValidator.validate_feature_added(
-            self.name_of_one_feature if self.name_of_one_feature else None, "get_name_of_one_feature"
-        )
+        """Return the alphabetically smallest feature name added to the set (deterministic regardless of add() order)."""
+        FeatureSetValidator.validate_feature_added(self.name_of_one_feature, "get_name_of_one_feature")
         assert self.name_of_one_feature is not None  # Type narrowing for mypy
         return self.name_of_one_feature
 

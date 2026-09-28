@@ -133,6 +133,8 @@ for step in results.plan:
     print(step.step_kind, step.feature_names)
 ```
 
+`RunResult.frames()` pairs each result frame with the compute `PlanStep` that produced it, by `step_uuid`; the list itself is in plan order, one element per step that produced requested output.
+
 To match a `run_all` resolution, pass the same `parallelization_modes`: `run_all` defaults to `{ParallelizationMode.SYNC}`, `prepare`/`explain` default to `None`, and compute frameworks are filtered by mode.
 
 ```python
@@ -149,6 +151,8 @@ for step in mloda.explain(["sales__mean_aggr"], compute_frameworks=["PandasDataF
 - **feature_names** (`tuple[str, ...]`): Features computed by a compute step, empty otherwise. This includes engine-injected features (link index features, global-filter features); use the requested/injected split below to tell them apart.
 - **requested_feature_names** (`tuple[str, ...]`): The user-requested subset of `feature_names` on a compute step, empty for join and transform steps.
 - **injected_feature_names** (`tuple[str, ...]`): The engine-injected/dependency remainder of `feature_names` on a compute step, empty for join and transform steps.
+- **input_feature_names** (`tuple[str, ...]`): The sorted, deduplicated names a compute step's FeatureGroup declares as input, empty for a root step and for join and transform steps. It is the prepare-time twin of the run-time `HookContext.input_features`, which reads the same FeatureSet attribute.
+- **input_feature_edges** (`Mapping[str, tuple[str, ...]]`): Each output feature name of a compute step mapped to its sorted declared input names (empty for root, join and transform steps; injected features and features declaring no inputs are absent; same-named features in one step merge into one entry). Prepare-time twin of `HookContext.input_feature_edges`.
 - **feature_group** (`type[FeatureGroup] | None`): Resolved FeatureGroup; the destination for a transform step; the link's declared left side for a join.
 - **compute_framework** (`type[ComputeFramework] | None`): Selected ComputeFramework; the destination for a transform step; the merge destination for a join.
 - **source_feature_group** / **source_compute_framework**: Origin of a transform step. For a join: the link's declared right side, and the framework merged in.
@@ -157,6 +161,9 @@ for step in mloda.explain(["sales__mean_aggr"], compute_frameworks=["PandasDataF
 - **join_inverted** (`bool | None`, property): `join_destination_side == "right"`, None without a side.
 - **join_token** (`UUID | None`): the join's completion token, the uuid the scheduler tracks, for a join step; None otherwise. Excluded from equality (fresh per planning run).
 - **declared_left_frameworks** / **declared_right_frameworks** (`tuple[type[ComputeFramework], ...]`): the compute frameworks each declared side's parent features declared as candidates, sorted by class name, for a join step; empty otherwise, and empty when the plan recorded no candidates for the side. APPEND/UNION sides carry only the index-bearing parent.
+- **feature_set_options** (`Options | None`): a group-only, deep-copied snapshot of a compute step's `FeatureSet.options`; None otherwise. Excluded from equality.
+- **reader_data_access** (`tuple[type[BaseInputData], Any] | None`, property): the `(ReaderClass, data_access)` pair a compute step resolved for reading its input data; None otherwise. `data_access` may hold credentials, so use `reader.data_access_identity(data_access)` for display and logs.
+- **step_uuid** (`UUID | None`): the compute step's uuid, the key `RunResult.frames()` and `ResultStream.frames()` pair by; None otherwise. Excluded from equality (fresh per planning run).
 - **feature_group_name** / **compute_framework_name** / **source_feature_group_name** / **source_compute_framework_name** (`str | None`): Class names of the above, None when unset.
 - **declared_left_framework_names** / **declared_right_framework_names** (`tuple[str, ...]`): class names of the two tuples above, same order.
 
@@ -182,7 +189,7 @@ for step in mloda.explain(["sales__mean_aggr"], compute_frameworks=["PandasDataF
 
 `diagnose` and `resolution_report()` are the non-raising counterparts to `explain` and `resolved_plan()`: where the plan-based pair returns `PlanStep` records, these return the resolution facts a failing request would otherwise raise.
 
-`mlodaAPI.diagnose(features, ...)` runs the whole-request preflight without raising and returns a single `ResolutionDiagnosis`. It takes the same arguments as `explain` (every parameter after `features` is keyword-only). On success its `records` equal `session.resolution_report()` and `complete` is `True`; on a resolution failure it carries the records resolved before the failing feature plus `feature_name`, `failed_result`, and `message`; on an environment or config failure (redefinition conflict, framework-declaration error, compute-framework pin) it returns `records=[]`, `complete=False`, and only `message`.
+`mlodaAPI.diagnose(features, ...)` runs the whole-request preflight without raising and returns a single `ResolutionDiagnosis`. It takes the same arguments as `explain` (every parameter after `features` is keyword-only). On success its `records` equal `session.resolution_report()` and `complete` is `True`; on a resolution failure it carries the records resolved before the failing feature plus `feature_name`, `failed_result`, and `message`; on an environment or config failure (redefinition conflict, framework-declaration error, compute-framework pin) it returns `records=[]`, `complete=False`, and only `message`. Any other error, including an exception a breaking extender raises (unless it is one of the projected types), still propagates.
 
 `session.resolution_report()` returns the `list[ResolutionRecord]` captured while `prepare()` planned the request, one per feature, available before or after `run()`.
 
@@ -234,10 +241,12 @@ fgs = get_feature_group_docs(compute_framework="PandasDataFrame")
 
 - **name** (`str`, optional): Filter by name (case-insensitive partial match).
 - **search** (`str`, optional): Search in description (case-insensitive partial match).
-- **compute_framework** (`str | Type[ComputeFramework]`, optional): Filter by compute framework.
+- **compute_framework** (`str | type[ComputeFramework]`, optional): Filter by compute framework.
 - **version_contains** (`str`, optional): Filter by version substring.
+- **plugin_collector** (`PluginCollector`, optional): Filter using the plugin collector's applicability check.
+- **registered_only** (`bool`, default `False`): If `True`, only document classes in the collector's injected registry, else the default registry.
 
-**Returns:** `List[FeatureGroupInfo]` sorted by name.
+**Returns:** `list[FeatureGroupInfo]` sorted by name.
 
 ##### get_compute_framework_docs
 
@@ -258,8 +267,9 @@ available_frameworks = get_compute_framework_docs(available_only=True)
 - **name** (`str`, optional): Filter by name (case-insensitive partial match).
 - **search** (`str`, optional): Search in description (case-insensitive partial match).
 - **available_only** (`bool`, default `False`): By default all frameworks are listed (with `is_available` as the flag); set `available_only=True` to filter to available frameworks only.
+- **registered_only** (`bool`, default `False`): If `True`, only document classes in the default registry.
 
-**Returns:** `List[ComputeFrameworkInfo]` sorted by name.
+**Returns:** `list[ComputeFrameworkInfo]` sorted by name.
 
 ##### get_extender_docs
 
@@ -280,6 +290,7 @@ extenders = get_extender_docs(wraps="formula")
 - **name** (`str`, optional): Filter by name (case-insensitive partial match).
 - **search** (`str`, optional): Search in description (case-insensitive partial match).
 - **wraps** (`str`, optional): Filter by wrapped function type (case-insensitive exact match).
+- **registered_only** (`bool`, default `False`): If `True`, only document classes in the default registry.
 
-**Returns:** `List[ExtenderInfo]` sorted by name.
+**Returns:** `list[ExtenderInfo]` sorted by name.
 

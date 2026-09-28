@@ -5,7 +5,7 @@ Base implementation for forecasting feature groups.
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 from mloda.provider import FeatureGroup
 from mloda.provider import BaseArtifact
@@ -184,7 +184,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
         """
         return ForecastingArtifact
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         """Extract source feature and time filter feature from either configuration-based options or string parsing."""
 
         source_feature: str | None = None
@@ -336,7 +336,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
 
             # Check if we have a trained model in the artifact
             model_artifact = None
-            if features.artifact_to_load:
+            if features.artifact_to_load is not None:
                 model_artifact = cls.load_artifact(features)
                 if model_artifact is None:
                     raise ValueError("No artifact to load although it was requested.")
@@ -358,7 +358,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
                 )
 
                 # Save the updated artifact if needed
-                if features.artifact_to_save and updated_artifact and not features.artifact_to_load:
+                if features.artifact_to_save is not None and updated_artifact and features.artifact_to_load is None:
                     features.save_artifact = updated_artifact
 
                 # Store the results for later addition (main forecast + confidence bounds)
@@ -378,7 +378,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
                 )
 
                 # Save the updated artifact if needed
-                if features.artifact_to_save and updated_artifact and not features.artifact_to_load:
+                if features.artifact_to_save is not None and updated_artifact and features.artifact_to_load is None:
                     features.save_artifact = updated_artifact
 
                 # Store the result for later addition
@@ -406,11 +406,10 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
         Raises:
             ValueError: If parameters cannot be extracted
         """
-        source_features = cls._extract_source_features(feature)
         algorithm, horizon, time_unit = cls._extract_forecast_params(feature)
         if algorithm is None or horizon is None or time_unit is None:
             raise ValueError(f"Could not extract forecasting parameters from: {feature.name}")
-        return algorithm, horizon, time_unit, source_features[0]
+        return algorithm, horizon, time_unit, cls._extract_single_source_feature(feature)
 
     @classmethod
     def _has_valid_forecast_suffix(cls, feature_name: str) -> bool:
@@ -444,7 +443,7 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
         return True
 
     @classmethod
-    def _extract_forecast_params(cls, feature: Feature) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    def _extract_forecast_params(cls, feature: Feature) -> tuple[str | None, int | None, str | None]:
         """
         Extract forecast-specific parameters (algorithm, horizon, time_unit) from a feature.
 
@@ -509,8 +508,8 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
         time_unit: str,
         in_features: list[str],
         time_filter_feature: str,
-        model_artifact: Optional[Any] = None,
-    ) -> tuple[Any, Optional[Any]]:
+        model_artifact: Any | None = None,
+    ) -> tuple[Any, Any | None]:
         """
         Method to perform the forecasting. Should be implemented by subclasses.
 
@@ -542,8 +541,8 @@ class ForecastingFeatureGroup(TimeReferenceMixin, FeatureChainParserMixin, Featu
         time_unit: str,
         in_features: list[str],
         time_filter_feature: str,
-        model_artifact: Optional[Any] = None,
-    ) -> tuple[Any, Any, Any, Optional[Any]]:
+        model_artifact: Any | None = None,
+    ) -> tuple[Any, Any, Any, Any | None]:
         """
         Method to perform forecasting and return point forecast plus confidence intervals.
 

@@ -1,11 +1,14 @@
-from typing import Optional, Any
+from typing import Any
 from uuid import UUID, uuid4
 from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import ComputeFrameworkTransformer
+from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.function_extender import ExtenderHook, _invoke_extender
+from mloda.core.abstract_plugins.hook_context import HookContext, instrument
 from mloda.core.core.cfw_manager import CfwManager
 
 from mloda.core.core.step.abstract_step import Step
-from mloda.core.abstract_plugins.components.link import Link
+from mloda.core.abstract_plugins.components.link import JoinType, Link
 from mloda.core.runtime.flight.flight_server import FlightServer
 
 
@@ -19,7 +22,7 @@ class JoinStep(Step):
         destination_framework_uuids: set[UUID],
         source_framework_uuids: set[UUID],
         swap_merge_sides: bool = False,
-        token: Optional[UUID] = None,
+        token: UUID | None = None,
     ) -> None:
         self.link = link
         self.swap_merge_sides = swap_merge_sides
@@ -35,8 +38,43 @@ class JoinStep(Step):
         """Only this step's uuid is a completion token; the link uuid is shared by both orientations."""
         return {self.uuid}
 
+    def get_parallelization_mode(self) -> set[ParallelizationMode]:
+        return self.destination_framework.supported_parallelization_modes()
+
     def _merge_data(self, cfw: ComputeFramework, from_cfw_data: Any) -> None:
         """Merges data from another ComputeFramework into the current one."""
+        extender = cfw.get_function_extender(ExtenderHook.JOIN)
+        if extender is None:
+            self._do_merge_data(cfw, from_cfw_data)
+            return
+
+        context = HookContext(
+            hook=ExtenderHook.JOIN,
+            feature_group_class="",
+            feature_group_version="",
+            plugin_version=None,
+            feature_names=(),
+            input_features=None,
+            compute_framework_name=cfw.get_class_name(),
+            join_type=self.link.jointype.value,
+            join_keys=self._join_keys(),
+            run_id=cfw.run_context.run_id,
+            carrier=cfw.run_context.carrier,
+            tenant_id=cfw.run_context.tenant_id,
+            project_id=cfw.run_context.project_id,
+            principal=cfw.run_context.principal,
+            worker_index=cfw.worker_index,
+        )
+        with context.activate():
+            _invoke_extender(extender, instrument(context, self._do_merge_data), cfw, from_cfw_data)
+
+    def _join_keys(self) -> tuple[str, ...] | None:
+        """Pairs each left column with its corresponding right column; None for APPEND/UNION, which merge without keys."""
+        if self.link.jointype in (JoinType.APPEND, JoinType.UNION):
+            return None
+        return tuple(f"{left}={right}" for left, right in zip(self.link.left_index.index, self.link.right_index.index))
+
+    def _do_merge_data(self, cfw: ComputeFramework, from_cfw_data: Any) -> None:
         merge_engine_class = cfw.merge_engine()
         framework_connection = cfw.get_framework_connection_object()
         merge_engine_instance = merge_engine_class(framework_connection)
@@ -49,18 +87,22 @@ class JoinStep(Step):
         cfw.set_column_names()
 
     def _upload_data_if_needed(self, cfw: ComputeFramework, cfw_register: CfwManager) -> None:
-        """Uploads the merged data to Flyway if a location is configured."""
+        """Uploads the merged data to the flight server if a location is configured."""
         if self.location:
             if cfw_register.get_uuid_flyway_datasets(cfw.uuid):
+                native = cfw.data
                 cfw.upload_finished_data(self.location)
+                if cfw.mode is not ParallelizationMode.MULTIPROCESSING:
+                    # a same-process consumer or the result collector reads cfw.data next; keep it native
+                    cfw.set_data(native)
 
     def execute(
         self,
         cfw_register: CfwManager,
         cfw: ComputeFramework,
-        from_cfw: Optional[ComputeFramework | UUID] = None,
-        data: Optional[Any] = None,
-    ) -> Optional[Any]:
+        from_cfw: ComputeFramework | UUID | None = None,
+        data: Any | None = None,
+    ) -> Any | None:
         self.location = cfw_register.get_location()
 
         if from_cfw is None:
@@ -92,7 +134,7 @@ class JoinStep(Step):
             raise ValueError("From_cfw is a UUID, but we are not using flightserver.")
         return from_cfw.get_data(), from_cfw.uuid
 
-    def matched(self, other_framework: type[ComputeFramework], uuid: UUID) -> Optional[UUID]:
+    def matched(self, other_framework: type[ComputeFramework], uuid: UUID) -> UUID | None:
         """
         If matched, return the uuid of the join step.
         """

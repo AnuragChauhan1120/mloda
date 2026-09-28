@@ -1,27 +1,58 @@
+import contextlib
+import pickle  # nosec B403
 from abc import ABC
-from collections.abc import Iterable, Sequence
-from typing import Any, Optional, final
+from collections.abc import Callable, Generator, Iterable, Sequence
+from contextvars import ContextVar
+from typing import Any, final
 from uuid import UUID, uuid4
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.core.abstract_plugins.components.framework_transformer.cfw_transformer import (
     ComputeFrameworkTransformer,
 )
 from mloda.core.abstract_plugins.components.merge.base_merge_engine import BaseMergeEngine
+from mloda.core.abstract_plugins.components.utils import as_str, safe_field
 from mloda.core.abstract_plugins.function_extender import (
     Extender,
     ExtenderHook,
-    _CompositeExtender,
+    CompositeExtender,
     _invoke_extender,
 )
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.input_data.input_data_descriptor import InputDataDescriptor
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
+from mloda.core.abstract_plugins.hook_context import HookContext, OutputSchema, instrument
+from mloda.core.abstract_plugins.plugin_version import resolve_plugin_version
+from mloda.core.abstract_plugins.run_context import RunContext
 from mloda.core.filter.filter_engine import BaseFilterEngine
 from mloda.core.abstract_plugins.components.mask.base_mask_engine import BaseMaskEngine
 from mloda.core.optional_dependency import loaded, require
 from mloda.core.runtime.flight.flight_server import FlightServer
 
 _PYARROW_REASON = "this operation"
+
+_current_compute_framework: ContextVar["ComputeFramework | None"] = ContextVar(
+    "_current_compute_framework", default=None
+)
+
+
+def _no_rows(data: Any) -> int | None:
+    """row_count stand-in for hooks whose return value carries no row semantics."""
+    return None
+
+
+def _python_dtype(values: Any) -> str | None:
+    """Type name of the first non-None value in a column; None when every value is None."""
+    for value in values:
+        if value is not None:
+            return type(value).__name__
+    return None
+
+
+def _dict_output_schema(data: dict[Any, Any]) -> OutputSchema | None:
+    """Schema of the dict interchange shape; a column whose values cannot be iterated keeps a None dtype."""
+    if not data:
+        return None
+    return tuple((str(key), safe_field(lambda: _python_dtype(data[key]), None)) for key in sorted(data, key=str))
 
 
 class EmptyResultError(ValueError):
@@ -53,12 +84,16 @@ class ComputeFramework(ABC):
     This use case, however, is currently not supported, as one could just run the module twice and compare the result datasets for now.
     """
 
+    # Class-level default so the attribute exists even when a subclass's __getstate__
+    # returns a filtered dict that omits it (e.g. dropping unpicklable live state).
+    _pending_extender_payload: bytes | None = None
+
     def __init__(
         self,
         mode: ParallelizationMode = ParallelizationMode.SYNC,
         children_if_root: frozenset[UUID] = frozenset(),
         uuid: UUID | None = None,
-        function_extender: Optional[set[Extender]] = None,
+        function_extender: set[Extender] | None = None,
     ) -> None:
         """This class is initialized for step execution."""
         self.mode = mode
@@ -67,6 +102,13 @@ class ComputeFramework(ABC):
         self.already_calculated_children_tracker: set[UUID] = set()
         self.column_names: set[str] = set()
         self.function_extender = function_extender if function_extender is not None else set()
+        # Raw pickled payload attached by the worker dispatch path; materialized into
+        # function_extender only by __setstate__, i.e. only on the actual unpickle in the worker.
+        self._pending_extender_payload: bytes | None = None
+        # Set post-construction so a subclass's fixed __init__ signature isn't broken.
+        # RunContext is internal; hook authors should read run_id/carrier off HookContext instead.
+        self.run_context: RunContext = RunContext()
+        self.worker_index: int | None = None
 
         self.uuid = uuid or uuid4()
 
@@ -76,7 +118,16 @@ class ComputeFramework(ABC):
         self.object_ids: list[str] = []
 
         # connection object for frameworks that need persistent connections (e.g., DuckDB, Spark)
-        self.framework_connection_object: Optional[Any] = None
+        self.framework_connection_object: Any | None = None
+
+    @final
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Materialize a deferred worker extender payload on the actual unpickle, so an
+        extender's own __setstate__ (e.g. building a live handle) fires in the worker's pid."""
+        self.__dict__.update(state)
+        if self._pending_extender_payload is not None:
+            self.function_extender = pickle.loads(self._pending_extender_payload)  # nosec B301
+            self._pending_extender_payload = None
 
     @classmethod
     def expected_data_framework(cls) -> Any:
@@ -174,8 +225,8 @@ class ComputeFramework(ABC):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         """
         If you only want to store the requested features, implement this functionality depending on your framework.
@@ -197,7 +248,7 @@ class ComputeFramework(ABC):
         """
         raise NotImplementedError(f"Merge functionality is for this compute framework not implemented {cls.__name__}.")
 
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         """
         Some compute frameworks (e.g., DuckDB, Spark) require sharing their connection
         with merge engines to ensure data consistency. Override this method in
@@ -215,7 +266,7 @@ class ComputeFramework(ABC):
         return False
 
     @classmethod
-    def pick_connection_from_dac(cls, data_access_collection: Any, options: Optional[Any] = None) -> Optional[Any]:
+    def pick_connection_from_dac(cls, data_access_collection: Any, options: Any | None = None) -> Any | None:
         """Pick the matching connection for this framework from the DataAccessCollection.
 
         Called at Engine setup (once per session), not on the per-request run path.
@@ -260,8 +311,8 @@ class ComputeFramework(ABC):
 
     @final
     def run_calculation(
-        self, feature_group: Any, features: Any, location: str | None, data: Optional[Any] = None
-    ) -> Optional[Any]:
+        self, feature_group: Any, features: Any, location: str | None, data: Any | None = None
+    ) -> Any | None:
         # case multiprocessing or case base api input feature
         if data is not None:
             self.data = data
@@ -292,12 +343,11 @@ class ComputeFramework(ABC):
 
         self.run_validate_output_features(feature_group, features)
 
-        # case threading/sync
-        if not location:
+        # only a worker-resident instance hands its data on through the flight server
+        if not location or self.mode is not ParallelizationMode.MULTIPROCESSING:
             return None
 
-        # case multiprocessing
-        # return data to be used in next step of this framework in this process
+        # worker-resident: return data to be used in next step of this framework in this process
         if len(self.children_if_root) > len(self.already_calculated_children_tracker) + len(features.features):
             return self.data
 
@@ -483,9 +533,9 @@ class ComputeFramework(ABC):
         return any(dtype_str.startswith(p) for p in ComputeFramework._NUMERIC_PREFIXES)
 
     def _extract_column_names(self, data: Any) -> set[str]:
-        """Extract column names from the data.
+        """Extract column names from the framework's data after transform.
 
-        Called only with the non-None output of calculate_feature.
+        Also called via _output_schema with a non-dict raw calculate_feature result, where a raise degrades to None.
         """
         raise NotImplementedError
 
@@ -500,7 +550,7 @@ class ComputeFramework(ABC):
         """
         return False
 
-    def _extract_column_dtype(self, data: Any, column_name: str) -> Optional[str]:
+    def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
         """Extract the dtype of a specific column as a human-readable string.
 
         Returns None when the framework does not support dtype extraction.
@@ -508,7 +558,7 @@ class ComputeFramework(ABC):
         """
         return None
 
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         """Resolve a column's native dtype to the unified DataType enum.
 
         Default: return None. Frameworks must override to convert their native
@@ -517,6 +567,26 @@ class ComputeFramework(ABC):
         Returning None means the validator skips that column (graceful no-op).
         """
         return None
+
+    def _row_count(self, data: Any) -> int | None:
+        """Best-effort row count for observability; override when __len__ is missing, wrong,
+        or would materialize/query."""
+        return HookContext.row_count(data)
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Best-effort (column, dtype) pairs sorted by name; the dict interchange shape is read directly.
+
+        None when no columns can be read; a failed dtype read keeps None; override if reading materializes or queries.
+        """
+        if isinstance(data, dict):
+            return _dict_output_schema(data)
+        names = self._extract_column_names(data)
+        if not names:
+            return None
+        return tuple(
+            (str(name), safe_field(lambda: self._extract_column_dtype(data, name), None))
+            for name in sorted(names, key=str)
+        )
 
     @final
     def set_filter_engine(self, features: Any) -> Any:
@@ -553,16 +623,69 @@ class ComputeFramework(ABC):
             features.mask_engine = engine
         return features
 
+    @classmethod
+    def current(cls) -> "ComputeFramework | None":
+        """Return the ComputeFramework active in the current activate() scope, else None."""
+        return _current_compute_framework.get()
+
+    @contextlib.contextmanager
+    def activate(self) -> Generator["ComputeFramework", None, None]:
+        """Make this instance the current() compute framework for the scope, restoring the previous one on exit."""
+        token = _current_compute_framework.set(self)
+        try:
+            yield self
+        finally:
+            _current_compute_framework.reset(token)
+
+    @final
+    def _run_hook(self, hook: ExtenderHook, feature_group: Any, method: Callable[..., Any], features: Any) -> Any:
+        """Dispatch method through hook's extender (if any), instrumenting the call with a HookContext.
+        For FEATURE_GROUP_CALCULATE_FEATURE, also activates self so a nested reader.load_data() call can find it via ComputeFramework.current()."""
+        extender = self.get_function_extender(hook)
+        if hook is not ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE:
+            if extender is None:
+                return method(self.data, features)
+            context = self._build_hook_context(hook, feature_group, features)
+
+            def _output_schema_reader(_: Any) -> OutputSchema | None:
+                # VALIDATE_OUTPUT_FEATURE's return value carries no schema, so this reads self.data
+                # the same way rows_in does, but only once the call returns without raising (rows_in
+                # is captured before the call, so it is also present when the call raises).
+                if hook is ExtenderHook.VALIDATE_OUTPUT_FEATURE:
+                    return self._output_schema(self.data)
+                return None
+
+            with context.activate():
+                return _invoke_extender(
+                    extender,
+                    instrument(context, method, row_count=_no_rows, output_schema=_output_schema_reader),
+                    self.data,
+                    features,
+                )
+
+        fetch_extender = self.get_function_extender(ExtenderHook.INPUT_DATA_LOAD)
+        if extender is None and fetch_extender is None:
+            return method(self.data, features)
+
+        context = self._build_hook_context(hook, feature_group, features)
+        with self.activate(), context.activate():
+            if extender is None:
+                return method(self.data, features)
+            return _invoke_extender(
+                extender,
+                instrument(context, method, row_count=self._row_count, output_schema=self._output_schema),
+                self.data,
+                features,
+            )
+
     @final
     def run_validate_input_features(self, feature_group: Any, features: Any) -> None:
         if self.data is None:
             return
 
-        extender = self.get_function_extender(ExtenderHook.VALIDATE_INPUT_FEATURE)
-        if extender is None:
-            feature_group.validate_input_features(self.data, features)
-        else:
-            extender(feature_group.validate_input_features, self.data, features)
+        self._run_hook(
+            ExtenderHook.VALIDATE_INPUT_FEATURE, feature_group, feature_group.validate_input_features, features
+        )
 
     @final
     def run_validate_output_features(self, feature_group: Any, features: Any) -> None:
@@ -586,11 +709,9 @@ class ComputeFramework(ABC):
             lambda col_name: self._extract_column_data_type(self.data, col_name),
         )
 
-        extender = self.get_function_extender(ExtenderHook.VALIDATE_OUTPUT_FEATURE)
-        if extender is None:
-            feature_group.validate_output_features(self.data, features)
-        else:
-            extender(feature_group.validate_output_features, self.data, features)
+        self._run_hook(
+            ExtenderHook.VALIDATE_OUTPUT_FEATURE, feature_group, feature_group.validate_output_features, features
+        )
 
     @final
     def get_column_names(self) -> set[str]:
@@ -625,7 +746,7 @@ class ComputeFramework(ABC):
     def __hash__(self) -> int:
         return hash((id(type(self)), self.children_if_root))
 
-    def validate_expected_framework(self, location: Optional[str] = None) -> None:
+    def validate_expected_framework(self, location: str | None = None) -> None:
         """
         Validates that the data is in the expected framework.
         Only touch this if your framework supports multiple data frameworks.
@@ -652,7 +773,7 @@ class ComputeFramework(ABC):
 
     @final
     def add_already_calculated_children_and_drop_if_possible(
-        self, children: set[UUID], location: Optional[str] = None
+        self, children: set[UUID], location: str | None = None
     ) -> bool | frozenset[UUID]:
         self.already_calculated_children_tracker.update(children)
 
@@ -661,12 +782,16 @@ class ComputeFramework(ABC):
             return True
 
         if len(self.object_ids) > 0:
-            return self.children_if_root
+            # Only the members still outstanding: a caller tracking this externally (e.g. against
+            # a set of step uuids that will eventually all complete) must not be handed a member
+            # that already-arrived children can never re-supply, such as a link uuid that is not
+            # itself any step's own completion token.
+            return self.children_if_root - self.already_calculated_children_tracker
 
         return False
 
     @final
-    def get_function_extender(self, wrapper_function_enum: ExtenderHook) -> Optional[Extender]:
+    def get_function_extender(self, wrapper_function_enum: ExtenderHook) -> Extender | None:
         matching_extenders = []
         for extender in self.function_extender:
             if wrapper_function_enum in extender.wraps():
@@ -678,7 +803,86 @@ class ComputeFramework(ABC):
             return matching_extenders[0]
 
         sorted_extenders = sorted(matching_extenders, key=lambda e: e.priority)
-        return _CompositeExtender(sorted_extenders, wrapper_function_enum)
+        return CompositeExtender(sorted_extenders, wrapper_function_enum)
+
+    @final
+    def _build_hook_context(self, hook: ExtenderHook, feature_group: Any, features: Any) -> HookContext:
+        from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+
+        # feature_group is a class in production; normalize since test doubles may pass an instance.
+        feature_group_cls: Any = feature_group if isinstance(feature_group, type) else type(feature_group)
+
+        feature_group_class = f"{feature_group_cls.__module__}.{feature_group_cls.__qualname__}"
+
+        feature_names: tuple[str, ...] = ()
+        input_features: frozenset[str] | None = None
+        input_feature_edges: dict[str, tuple[str, ...]] | None = None
+        if isinstance(features, FeatureSet):
+            feature_names = tuple(str(name) for name in features.get_all_names())
+            input_features = self._declared_input_feature_names(feature_group_cls, features)
+            input_feature_edges = getattr(features, "declared_input_feature_edges", None)
+
+        return HookContext(
+            hook=hook,
+            feature_group_class=feature_group_class,
+            feature_group_version=safe_field(
+                lambda: as_str(feature_group_cls.version()),
+                "unavailable",
+                field=f"{feature_group_class}.version",
+                warn_once_for=feature_group_cls,
+            ),
+            plugin_version=resolve_plugin_version(feature_group_cls.__module__),
+            feature_names=feature_names,
+            input_features=input_features,
+            input_feature_edges=input_feature_edges,
+            compute_framework_name=self.get_class_name(),
+            rows_in=safe_field(lambda: self._row_count(self.data), None),
+            run_id=self.run_context.run_id,
+            carrier=self.run_context.carrier,
+            tenant_id=self.run_context.tenant_id,
+            project_id=self.run_context.project_id,
+            principal=self.run_context.principal,
+            worker_index=self.worker_index,
+        )
+
+    @staticmethod
+    @final
+    def _declared_input_feature_names(feature_group: Any, features: Any) -> frozenset[str] | None:
+        """Feature names feature_group declares as input, memoized on the FeatureSet.
+
+        A root feature group or an unreadable options/instance degrades silently to None.
+        """
+        from mloda.core.abstract_plugins.components.feature_set import merge_input_feature_edges
+
+        resolved: bool = getattr(features, "declared_input_features_resolved", False)
+        memoized: frozenset[str] | None = getattr(features, "declared_input_feature_names", None)
+        if resolved:
+            return memoized
+
+        result: frozenset[str] | None = None
+        pairs: list[tuple[str, list[str]]] = []
+        if features.options is not None:
+            instance = safe_field(lambda: feature_group(), None)
+            if instance is not None:
+                names: set[str] = set()
+                for feature in features.features:
+
+                    def _read(feature: Any = feature) -> Any:
+                        return instance.input_features(
+                            feature.options if feature.options is not None else features.options, feature.name
+                        )
+
+                    declared = safe_field(_read, None)
+                    if declared:
+                        entries = [str(entry) if isinstance(entry, str) else str(entry.name) for entry in declared]
+                        names.update(entries)
+                        pairs.append((str(feature.name), entries))
+                result = frozenset(names) or None
+
+        features.declared_input_feature_names = result
+        features.declared_input_feature_edges = merge_input_feature_edges(pairs)
+        features.declared_input_features_resolved = True
+        return result
 
     @final
     def run_calculate_feature(self, feature_group: Any, features: Any) -> Any:
@@ -688,26 +892,38 @@ class ComputeFramework(ABC):
         # Tests pass non-FeatureSet stand-ins for features; only a real FeatureSet is materialized (#796).
         if isinstance(features, FeatureSet):
             features.materialize_option_defaults(feature_group)
-        extender = self.get_function_extender(ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
 
         try:
-            if extender is None:
-                return feature_group.calculate_feature(self.data, features)
-            return _invoke_extender(extender, feature_group.calculate_feature, self.data, features)
+            return self._run_hook(
+                ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, feature_group, feature_group.calculate_feature, features
+            )
         except KeyError as e:
             # Provide helpful error message for missing columns
-            self._raise_helpful_missing_column_error(feature_group, e)
+            self._raise_helpful_missing_column_error(feature_group, e, features)
 
-    def _raise_helpful_missing_column_error(self, feature_group: Any, error: KeyError) -> None:
+    def _raise_helpful_missing_column_error(self, feature_group: Any, error: KeyError, features: Any) -> None:
         """
         Raises a helpful ValueError suggesting the KeyError might be due to missing Links.
         """
+        # Local import: feature_set -> feature -> compute_framework would cycle at module level.
+        from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+
         feature_name = feature_group.get_class_name()
         error_str = str(error)
 
+        option_split_paragraph = ""
+        if isinstance(features, FeatureSet) and features.option_split_hint is not None:
+            split_feature_group_name, differing_keys = features.option_split_hint
+            differing_keys_str = ", ".join(sorted((str(k) for k in differing_keys), key=str))
+            option_split_paragraph = f"""
+'{split_feature_group_name}' also ran as a separate step with differing option(s) ({differing_keys_str})
+in this run, which is the likely cause. Align the differing option(s) across the requests, or add
+a Link if the split is intentional.
+"""
+
         error_message = f"""
 Feature '{feature_name}' failed with a KeyError: {error_str}
-
+{option_split_paragraph}
 This might be caused by missing Links when your feature has multiple dependencies.
 
 When a feature depends on multiple input features, you must provide explicit Links to specify
@@ -763,7 +979,7 @@ Available join types:
         return self.upload_table(location, self.uuid)
 
     @final
-    def upload_table(self, location: str, object_id: Optional[UUID] = None) -> str:
+    def upload_table(self, location: str, object_id: UUID | None = None) -> str:
         pa = require("pyarrow", _PYARROW_REASON)
         if object_id is None:
             object_id = uuid4()
@@ -811,10 +1027,13 @@ Available join types:
         FlightServer.drop_tables(location, table_keys)
 
     @final
-    def drop_last_data(self, location: Optional[str] = None) -> None:
-        if isinstance(self.data, str) and location:
-            self.drop_data({self.data}, location)
+    def drop_last_data(self, location: str | None = None) -> None:
+        """Drops every table this cfw ever uploaded, tracked in `object_ids`, not just a
+        string held in `self.data` (a restored-to-native cfw.data never is one)."""
+        if location and self.object_ids:
+            self.drop_data(set(self.object_ids), location)
 
+        self.object_ids = []
         self.data = None
 
     @final
@@ -828,8 +1047,8 @@ Available join types:
         self,
         selected_feature_names: Sequence[FeatureName],
         column_names: set[str],
-        ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> set[str] | list[str]:
         """
         Identifies columns that match feature names or follow the naming convention pattern.

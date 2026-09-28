@@ -15,7 +15,7 @@ Example:
     docs = get_feature_group_docs()
 """
 
-from typing import Any, Optional
+from typing import Any
 
 from mloda.core.abstract_plugins.components.base_feature_group_version import SOURCE_INTROSPECTION_ERRORS
 from mloda.core.abstract_plugins.components.subtype_declaration import SubtypeDeclaration
@@ -51,11 +51,23 @@ def list_registered(plugin_type: type[Any]) -> list[type[Any]]:
 
 
 def _safe_version(fg_class: type[FeatureGroup]) -> str:
-    """Return the feature group version or "unavailable" if source introspection fails or version() is not a str."""
-    return safe_field(lambda: as_str(fg_class.version()), "unavailable", catching=SOURCE_INTROSPECTION_ERRORS)
+    """Return the feature group version or "unavailable" if source introspection fails or version() is not a str.
+
+    Warns once per class (via warn_once_for) when it degrades.
+    """
+    cls_name = fg_class.__name__
+    return safe_field(
+        lambda: as_str(fg_class.version()),
+        "unavailable",
+        catching=SOURCE_INTROSPECTION_ERRORS,
+        field=f"{cls_name}.version",
+        # Shares this dedup key with compute_framework.py's _build_hook_context version read;
+        # only whichever call site hits first per class actually warns for it in a process.
+        warn_once_for=fg_class,
+    )
 
 
-def _subtype_support_or_error(fg_class: type[FeatureGroup]) -> tuple[dict[str, list[str]], Optional[str]]:
+def _subtype_support_or_error(fg_class: type[FeatureGroup]) -> tuple[dict[str, list[str]], str | None]:
     """Return the sorted subtype support matrix, degrading a raising class to ({}, message)."""
     empty: dict[str, frozenset[str]] = {}
     matrix, error = safe_field_with_error(lambda: fg_class.subtype_support_matrix(), empty)
@@ -66,9 +78,9 @@ def _subtype_support_or_error(fg_class: type[FeatureGroup]) -> tuple[dict[str, l
 
 def _resolved_subtype_fields(
     fg_class: type[FeatureGroup], feature_name: FeatureName, options: Options
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Resolve (subtype, subtype_family) for a candidate, degrading a raising declaration to (None, None)."""
-    subtype: Optional[str] = safe_field(lambda: fg_class.resolve_subtype(feature_name, options), None)
+    subtype: str | None = safe_field(lambda: fg_class.resolve_subtype(feature_name, options), None)
     if subtype is None:
         return None, None
     raw_subtype = subtype
@@ -89,11 +101,11 @@ def _dedup_degrading_on_conflict(
 
 
 def get_feature_group_docs(
-    name: Optional[str] = None,
-    search: Optional[str] = None,
-    compute_framework: Optional[str | type[ComputeFramework]] = None,
-    version_contains: Optional[str] = None,
-    plugin_collector: Optional[PluginCollector] = None,
+    name: str | None = None,
+    search: str | None = None,
+    compute_framework: str | type[ComputeFramework] | None = None,
+    version_contains: str | None = None,
+    plugin_collector: PluginCollector | None = None,
     registered_only: bool = False,
 ) -> list[FeatureGroupInfo]:
     """
@@ -138,7 +150,6 @@ def get_feature_group_docs(
         fg_name = safe_field(lambda: as_str(fg_class.get_class_name()), cls_name, field=f"{cls_name}.get_class_name")
         doc_fallback = (fg_class.__doc__ or "").strip() or cls_name
         description = safe_field(lambda: as_str(fg_class.description()), doc_fallback, field=f"{cls_name}.description")
-        version = _safe_version(fg_class)
         module = fg_class.__module__
         compute_frameworks: list[str] = safe_field(
             lambda: [cfw.__name__ for cfw in fg_class.compute_framework_definition()],
@@ -161,10 +172,12 @@ def get_feature_group_docs(
             if cfw_name.lower() not in {c.lower() for c in compute_frameworks}:
                 continue
 
+        # Read after the cheap filters: version() hashes the class source.
+        version = _safe_version(fg_class)
         if version_contains is not None and version_contains not in version:
             continue
 
-        declaration: Optional[SubtypeDeclaration] = safe_field(
+        declaration: SubtypeDeclaration | None = safe_field(
             lambda: fg_class.SUBTYPES, None, field=f"{cls_name}.SUBTYPES"
         )
         subtype_key = declaration.key if declaration is not None else None
@@ -195,8 +208,8 @@ def get_feature_group_docs(
 
 
 def get_compute_framework_docs(
-    name: Optional[str] = None,
-    search: Optional[str] = None,
+    name: str | None = None,
+    search: str | None = None,
     available_only: bool = False,
     registered_only: bool = False,
 ) -> list[ComputeFrameworkInfo]:
@@ -260,9 +273,9 @@ def get_compute_framework_docs(
 
 
 def get_extender_docs(
-    name: Optional[str] = None,
-    search: Optional[str] = None,
-    wraps: Optional[str] = None,
+    name: str | None = None,
+    search: str | None = None,
+    wraps: str | None = None,
     registered_only: bool = False,
 ) -> list[ExtenderInfo]:
     """
@@ -294,7 +307,7 @@ def get_extender_docs(
         description = (ext_class.__doc__ or "").strip() or ext_class.__name__
         module = ext_class.__module__
 
-        if ext_name in ("Extender", "_CompositeExtender"):
+        if ext_name in ("Extender", "CompositeExtender"):
             continue
 
         wraps_list: list[str] = safe_field(lambda: [w.value for w in ext_class().wraps()], [])
@@ -325,12 +338,12 @@ def get_extender_docs(
 def resolve_feature(
     feature: str | Feature,
     *,
-    options: Optional[Options] = None,
-    plugin_collector: Optional[PluginCollector] = None,
+    options: Options | None = None,
+    plugin_collector: PluginCollector | None = None,
     feature_group: str | type[FeatureGroup] | None = None,
-    links: Optional[set[Link]] = None,
-    data_access_collection: Optional[DataAccessCollection] = None,
-    compute_frameworks: Optional[set[type[ComputeFramework]]] = None,
+    links: set[Link] | None = None,
+    data_access_collection: DataAccessCollection | None = None,
+    compute_frameworks: set[type[ComputeFramework]] | None = None,
 ) -> ResolvedFeature:
     """
     Resolve a feature name (or a Feature object) to its matching FeatureGroup class.
@@ -376,7 +389,7 @@ def resolve_feature(
                 "resolve_feature(Feature(...)) is the single source of truth for name, options and scope; "
                 "set them on the Feature, do not also pass 'options' or 'feature_group'"
             )
-        feature_obj: Optional[Feature] = feature
+        feature_obj: Feature | None = feature
         feature_name = str(feature.name)
         scope = feature.feature_group_scope
         resolved_options = feature.options

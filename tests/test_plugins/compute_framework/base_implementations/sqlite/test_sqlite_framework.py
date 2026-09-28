@@ -1,5 +1,6 @@
 import sqlite3
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -13,6 +14,9 @@ from tests.test_plugins.compute_framework.test_tooling.availability_test_helper 
 )
 from tests.test_plugins.compute_framework.base_implementations.datatype_validator_test_mixin import (
     DataTypeValidatorFrameworkTestMixin,
+)
+from tests.test_plugins.compute_framework.base_implementations.dict_interchange_output_schema_test_mixin import (
+    DictInterchangeOutputSchemaTestMixin,
 )
 from tests.test_plugins.compute_framework.base_implementations.dtype_extraction_test_mixin import (
     DtypeExtractionTestMixin,
@@ -183,7 +187,7 @@ class TestSqliteFrameworkMerge(DataFrameTestBase):
         arrow_table = pa.Table.from_pydict(data)
         return SqliteRelation.from_arrow(self.conn, arrow_table)
 
-    def get_connection(self) -> Optional[Any]:
+    def get_connection(self) -> Any | None:
         return self.conn
 
     def _create_test_framework(self) -> Any:
@@ -216,6 +220,15 @@ class TestSqliteDtypeExtraction(DtypeExtractionTestMixin):
         )
         return SqliteRelation.from_arrow(connection, arrow_table)
 
+    @pytest.mark.skip(reason="SQLite has no decimal storage type; a decimal column cannot be inserted")
+    def test_extract_decimal_column_data_type(self, framework_instance: Any, decimal_sample_data: Any) -> None: ...
+
+    def test_relation_from_decimal_column_raises(self, connection: sqlite3.Connection) -> None:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+
+        with pytest.raises((sqlite3.InterfaceError, sqlite3.ProgrammingError)):
+            SqliteRelation.from_arrow(connection, pa.table({"d": pa.array(values, type=pa.decimal128(10, 2))}))
+
     def test_extract_raw_sql_expression_column_data_type_is_numeric(
         self, connection: sqlite3.Connection, framework_instance: SqliteFramework
     ) -> None:
@@ -231,6 +244,18 @@ class TestSqliteDtypeExtraction(DtypeExtractionTestMixin):
             "dtype": str(materialized_type),
             "data_type": DataType.INT64,
         }
+
+
+class TestSqliteDictInterchangeOutputSchema(DictInterchangeOutputSchemaTestMixin):
+    """Test SqliteFramework._output_schema on the dict interchange shape using shared mixin.
+
+    SqliteFramework overrides _output_schema for SqliteRelation data; a dict falls through
+    its isinstance(data, SqliteRelation) check to the same base path every other framework uses.
+    """
+
+    @pytest.fixture
+    def framework_instance(self) -> Any:
+        return SqliteFramework(mode=ParallelizationMode.SYNC, children_if_root=frozenset())
 
 
 class TestSqliteDataTypeValidator(DataTypeValidatorFrameworkTestMixin):

@@ -30,25 +30,25 @@ The following example demonstrates how to implement and test an artifact.
 Here, we create a `FeatureGroup` with a configured `BaseArtifact`.
 
 ```python
-from typing import Type, Any, Optional
+from typing import Any
 from mloda.provider import FeatureGroup, FeatureSet, BaseArtifact, DataCreator, BaseInputData
 
 
 class BaseExampleArtifactFeature(FeatureGroup):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator({cls.get_class_name()})
 
     @staticmethod
-    def artifact() -> Type[BaseArtifact] | None:
+    def artifact() -> type[BaseArtifact] | None:
         return BaseArtifact
 
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
-        if features.artifact_to_save:
+        if features.artifact_to_save is not None:
             features.save_artifact = "BasicArtifact"
 
-        if features.artifact_to_load:
+        if features.artifact_to_load is not None:
             result = cls.load_artifact(features)
             print(f"{result} is the loaded artifact.")
 
@@ -131,7 +131,10 @@ for fold_data in folds:
 ```
 
 When `artifacts` is not provided (the default), the artifact mode from
-`prepare()` is used.
+`prepare()` is used. Baking an artifact into `Options` at prepare time and also
+supplying it via `run(artifacts=...)` for the same feature are mutually
+exclusive: resolving a runtime artifact when the key is already present in
+`Options.group` raises, rather than silently picking one over the other.
 
 #### Testing Artifacts
 
@@ -148,13 +151,13 @@ from mloda_plugins.feature_group.experimental.sklearn.sklearn_artifact import Sk
 
 class MySklearnFeatureGroup(FeatureGroup):
     @staticmethod
-    def artifact() -> Type[BaseArtifact] | None:
+    def artifact() -> type[BaseArtifact] | None:
         return SklearnArtifact
 
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
         # Save multiple artifacts with unique keys
-        if features.artifact_to_save:
+        if features.artifact_to_save is not None:
             SklearnArtifact.save_sklearn_artifact(
                 features, 
                 "my_transformer", 
@@ -162,7 +165,7 @@ class MySklearnFeatureGroup(FeatureGroup):
             )
         
         # Load specific artifact by key
-        if features.artifact_to_load:
+        if features.artifact_to_load is not None:
             artifact_data = SklearnArtifact.load_sklearn_artifact(features, "my_transformer")
             fitted_model = artifact_data["fitted_transformer"]
 ```

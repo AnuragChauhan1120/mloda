@@ -7,7 +7,7 @@ mloda supports optional data type declarations on Features, enabling runtime val
 Use typed constructors to declare the expected data type:
 
 ```python
-from typing import Any, Optional
+from typing import Any
 from mloda.user import Feature
 
 # Typed features: Will be validated at runtime
@@ -97,7 +97,7 @@ In strict mode, only exact type matches or standard widening conversions are all
 Enforcement is driven by a single override point on `ComputeFramework`:
 
 ```python
-def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
     ...
 ```
 
@@ -126,7 +126,7 @@ from mloda.provider import ComputeFramework
 
 
 class MyFramework(ComputeFramework):
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         native = data.schema.field(column_name).type  # framework-specific access
         if native == ...:
             return DataType.INT64
@@ -153,6 +153,21 @@ Not every backend's native type system can distinguish every precision mloda dec
 | Iceberg | yes | yes | no (only `TimestampType` exists) |
 | SQLite | no (INTEGER affinity) | no (REAL affinity) | no (stored as TEXT) |
 | PythonDict | no (`type.__name__` is "int") | no (Python float is 64-bit) | no (`datetime.datetime` is microsecond) |
+
+## Decimal Columns
+
+`DataType.DECIMAL` means a decimal of any precision and scale: a `Feature` cannot declare precision or scale, and validation checks only the family. `to_arrow_type` maps `DECIMAL` to `decimal128(38, 18)` only when mloda must build an Arrow schema without data (the SQLite reader). `DECIMAL` never coerces to or from the float or integer family, in strict and lenient mode alike: exactness is the reason to declare it.
+
+| Framework | Extraction | Filter, mask, merge | PyArrow transformer |
+|---|---|---|---|
+| Pandas | `DECIMAL` for an Arrow-backed decimal dtype; `object` columns are not validated (indistinguishable from object strings) | exact | Arrow-backed decimals are kept in both directions; an `object` column of `Decimal` has its precision inferred from the values on the way out, and comes back Arrow-backed after a round trip through Arrow |
+| Polars (eager / lazy) | `DECIMAL` | exact (including `is_in`; values the column cannot represent never match) | exact |
+| PyArrow | `DECIMAL` | exact | native |
+| DuckDB | `DECIMAL` | exact (a `Decimal` value renders as an exact decimal literal) | exact |
+| SQLite | no decimal storage type: inserting `Decimal` values fails | a `Decimal` filter or mask value renders as a numeric literal, which SQLite compares as REAL against a TEXT column | fails |
+| PythonDict | `DECIMAL` | exact | precision inferred from the values (a dict carries no schema) |
+| Spark | `DECIMAL` | mask `is_in` exact; filter and merge not checked | not checked (no schema is passed on the way in) |
+| Iceberg | `DECIMAL` | decimal filters are not pushed into the scan; they run exactly in the PyArrow pass, for both an Iceberg `Table` and a `pa.Table` result; no mask or merge | pass-through |
 
 ## Execution Plan Grouping
 

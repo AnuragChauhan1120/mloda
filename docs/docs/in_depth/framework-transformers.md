@@ -174,7 +174,7 @@ To create a custom transformer for a new pair of frameworks:
 Example of a two-way transformer:
 
 ```python
-from typing import Any, Optional
+from typing import Any
 
 class CustomTransformer(BaseTransformer):
     @classmethod
@@ -199,7 +199,7 @@ class CustomTransformer(BaseTransformer):
         return other_framework.from_custom(data)
 
     @classmethod
-    def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Optional[Any] = None) -> Any:
+    def transform_other_fw_to_fw(cls, data: Any, framework_connection_object: Any | None = None) -> Any:
         # Convert from OtherFramework to CustomFramework
         return custom_framework.from_other(data)
 ```
@@ -215,12 +215,24 @@ The `ComputeFramework` class uses the transformer system to convert data between
 The transformation is handled automatically by the `apply_compute_framework_transformer` method:
 
 ```py
+@final
 def apply_compute_framework_transformer(self, data: Any) -> Any:
     _from_fw = type(data)
     _to_fw = self.expected_data_framework()
-    transformer_cls = self.transformer.transformer_map.get((_from_fw, _to_fw), None)
-    if transformer_cls is not None:
-        return transformer_cls.transform(_from_fw, _to_fw, data)
+
+    # Same native type: nothing to transform.
+    if _from_fw == _to_fw:
+        return None
+
+    # A direct transformer always applies.
+    direct = self.transformer.transformer_map.get((_from_fw, _to_fw))
+    if direct is not None:
+        return direct.transform(_from_fw, _to_fw, data, self.framework_connection_object)
+
+    # A multi-hop chain (through pa.Table) is only valid for a descriptor input.
+    if isinstance(data, InputDataDescriptor):
+        return self._materialize_descriptor(data, _from_fw, _to_fw)
+
     return None
 ```
 

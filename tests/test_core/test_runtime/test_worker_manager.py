@@ -2,7 +2,6 @@
 
 import multiprocessing
 import queue
-import sys
 import threading
 import time
 from typing import Any
@@ -11,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from mloda.core.runtime.mp_context import mp_spawn_context
 from mloda.core.runtime.worker_manager import WorkerManager
 
 
@@ -19,12 +19,9 @@ def _noop_target(*args: Any, **kwargs: Any) -> None:
     return None
 
 
-def _loop_forever_target(command_queue: Any, result_queue: Any) -> None:
-    """Picklable worker target that never exits on its own.
-
-    Module-level so it pickles under the spawn context. create_worker_process
-    prepends command_queue and result_queue to the args it passes to the target.
-    """
+def _loop_forever_target(command_queue: Any, result_queue: Any, worker_index: int) -> None:
+    """Picklable worker matching create_worker_process's signature; signals READY, never drains its command queue."""
+    result_queue.put("READY")
     while True:
         time.sleep(0.1)
 
@@ -151,6 +148,26 @@ class TestWorkerManagerProcessCreation:
             manager.create_worker_process(cfw_uuid, target_func, args)
 
         mock_process.start.assert_called_once()
+
+    def test_create_worker_process_passes_daemon_true(self) -> None:
+        """Worker processes must be daemonic so they are reaped if the parent interpreter exits."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+        target_func = Mock()
+        args = ("arg1", "arg2")
+
+        mock_process = Mock()
+        mock_ctx = Mock()
+        mock_ctx.Process.return_value = mock_process
+        mock_ctx.Queue.return_value = Mock()
+
+        with patch(
+            "mloda.core.runtime.worker_manager.mp_spawn_context",
+            return_value=mock_ctx,
+        ):
+            manager.create_worker_process(cfw_uuid, target_func, args)
+
+        assert mock_ctx.Process.call_args.kwargs.get("daemon") is True
 
 
 class TestWorkerManagerProcessRetrieval:
@@ -285,58 +302,64 @@ class TestWorkerManagerResultPolling:
         assert UUID(uuid2) in manager.result_uuids_collection
         assert len(manager.result_uuids_collection) == 2
 
-    def test_poll_result_queues_ignores_stale_drop_complete_tuple(self) -> None:
-        """A stale ("DROP_COMPLETE", cfw_uuid) control tuple must not be parsed as a UUID.
-
-        The worker's single result_queue carries BOTH step-completion UUID
-        strings and ("DROP_COMPLETE", cfw_uuid) control tuples. When a drop
-        wait times out, the tuple lingers in the queue and a later poll picks
-        it up. poll_result_queues must skip it instead of calling
-        ``UUID(("DROP_COMPLETE", cfw_uuid))`` (which raises
-        ``AttributeError: 'tuple' object has no attribute 'replace'``).
-        """
+    def test_poll_result_queues_drains_multiple_messages_in_a_single_call(self) -> None:
+        """A single poll_result_queues() call must drain every queued message, not just the first."""
         manager = WorkerManager()
-        cfw_uuid = uuid4()
-
-        mock_queue = MagicMock()
-        mock_queue.get.side_effect = [("DROP_COMPLETE", cfw_uuid), queue.Empty()]
-        manager.result_queues_collection.add(mock_queue)
-
-        # Must not raise; the control tuple is ignored, not interpreted as a UUID.
-        manager.poll_result_queues()
-
-        assert cfw_uuid not in manager.result_uuids_collection
-        assert manager.result_uuids_collection == set()
-
-    def test_poll_result_queues_keeps_valid_uuid_when_interleaved_with_stale_tuple(self) -> None:
-        """A valid UUID string must still be collected even when a stale tuple follows it.
-
-        Mirrors production: one poll consumes the step-completion UUID string,
-        a later poll consumes the lingering ("DROP_COMPLETE", cfw_uuid) tuple.
-        Extra ``queue.Empty()`` sentinels keep the test robust whether the fix
-        keeps single-get-per-poll semantics or drains each queue to empty.
-        """
-        manager = WorkerManager()
-        valid_uuid = str(uuid4())
-        other_uuid = uuid4()
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+        uuid3 = str(uuid4())
 
         mock_queue = MagicMock()
         mock_queue.get.side_effect = [
-            valid_uuid,
-            ("DROP_COMPLETE", other_uuid),
-            queue.Empty(),
-            queue.Empty(),
+            uuid1,
+            uuid2,
+            uuid3,
             queue.Empty(),
         ]
         manager.result_queues_collection.add(mock_queue)
 
-        # First poll picks up the valid UUID; the second reaches the stale tuple,
-        # which must be ignored rather than raise AttributeError.
-        manager.poll_result_queues()
         manager.poll_result_queues()
 
-        assert UUID(valid_uuid) in manager.result_uuids_collection
-        assert other_uuid not in manager.result_uuids_collection
+        assert manager.result_uuids_collection == {UUID(uuid1), UUID(uuid2), UUID(uuid3)}
+        # One get() per queued item, plus the Empty that ends the drain.
+        assert mock_queue.get.call_count == 4
+
+    def test_poll_result_queues_drains_real_multiprocessing_queue_without_blocking(self) -> None:
+        """Drain-to-empty must hold for a real (non-mocked) multiprocessing.Queue too, and return promptly."""
+        manager = WorkerManager()
+        mp_queue: Any = mp_spawn_context().Queue()
+
+        uuid1 = str(uuid4())
+        uuid2 = str(uuid4())
+        uuid3 = str(uuid4())
+
+        mp_queue.put(uuid1)
+        mp_queue.put(uuid2)
+        mp_queue.put(uuid3)
+
+        manager.result_queues_collection.add(mp_queue)
+
+        try:
+            # put() flushes via a background feeder thread, so a single poll can race an
+            # empty pipe. Retry with a short sleep instead of one fixed delay, bounded by
+            # a wall-clock deadline so a real hang still fails the test.
+            start_time = time.time()
+            deadline = start_time + 3.0
+            expected = {UUID(uuid1), UUID(uuid2), UUID(uuid3)}
+            while time.time() < deadline:
+                manager.poll_result_queues()
+                if expected <= manager.result_uuids_collection:
+                    break
+                time.sleep(0.01)
+            elapsed = time.time() - start_time
+
+            assert elapsed < 3.0
+            assert manager.result_uuids_collection == expected
+            with pytest.raises(queue.Empty):
+                mp_queue.get(timeout=0.1)
+        finally:
+            mp_queue.close()
+            mp_queue.join_thread()
 
 
 class TestWorkerManagerStepCompletion:
@@ -508,68 +531,6 @@ class TestWorkerManagerOrphanedStepDetection:
         assert {entry[0] for entry in manager.find_orphaned_steps()} == {first_cfw, second_cfw}
 
 
-class TestWorkerManagerDropCompletion:
-    """Test waiting for drop completion messages."""
-
-    def test_wait_for_drop_completion_returns_on_drop_complete_message(self) -> None:
-        """wait_for_drop_completion should return when DROP_COMPLETE message received."""
-        manager = WorkerManager()
-        cfw_uuid = uuid4()
-
-        mock_queue = MagicMock()
-        mock_queue.get.return_value = ("DROP_COMPLETE", cfw_uuid)
-
-        manager.wait_for_drop_completion(mock_queue, cfw_uuid, timeout=1.0)
-
-        # Should complete without timeout
-        mock_queue.get.assert_called()
-
-    def test_wait_for_drop_completion_puts_back_other_messages(self) -> None:
-        """wait_for_drop_completion should put back non-drop messages."""
-        manager = WorkerManager()
-        cfw_uuid = uuid4()
-        other_message = str(uuid4())
-
-        mock_queue = MagicMock()
-        mock_queue.get.side_effect = [other_message, ("DROP_COMPLETE", cfw_uuid)]
-
-        manager.wait_for_drop_completion(mock_queue, cfw_uuid, timeout=1.0)
-
-        # Should put back the other message
-        mock_queue.put.assert_called_with(other_message, block=False)
-
-    def test_wait_for_drop_completion_times_out(self) -> None:
-        """wait_for_drop_completion should timeout if no message received."""
-        manager = WorkerManager()
-        cfw_uuid = uuid4()
-
-        mock_queue = MagicMock()
-        mock_queue.get.side_effect = queue.Empty()
-
-        start_time = time.time()
-        manager.wait_for_drop_completion(mock_queue, cfw_uuid, timeout=0.1)
-        elapsed = time.time() - start_time
-
-        # Should timeout after approximately 0.1 seconds. On Python 3.14 the
-        # spawn-context teardown of unrelated workers can stretch time.sleep(0.001)
-        # ticks on loaded CI, so widen the upper bound there only; the assertion
-        # exists to guard against an infinite loop, not to verify wall-clock precision.
-        upper = 1.0 if sys.version_info >= (3, 14) else 0.2
-        assert 0.09 < elapsed < upper
-
-    def test_wait_for_drop_completion_uses_non_blocking_get(self) -> None:
-        """wait_for_drop_completion should use non-blocking queue get."""
-        manager = WorkerManager()
-        cfw_uuid = uuid4()
-
-        mock_queue = MagicMock()
-        mock_queue.get.return_value = ("DROP_COMPLETE", cfw_uuid)
-
-        manager.wait_for_drop_completion(mock_queue, cfw_uuid, timeout=1.0)
-
-        mock_queue.get.assert_called_with(block=False)
-
-
 class TestWorkerManagerJoinAll:
     """Test joining and terminating all tasks."""
 
@@ -658,11 +619,14 @@ class TestWorkerManagerJoinAll:
         forever on a worker that does not exit on its own (GitHub issue #514).
         """
         manager = WorkerManager()
-        process, _, _ = manager.create_worker_process(cfw_uuid=uuid4(), target=_loop_forever_target, args=())
+        process, _, result_queue = manager.create_worker_process(cfw_uuid=uuid4(), target=_loop_forever_target, args=())
 
         join_thread = threading.Thread(target=manager.join_all, daemon=True)
-        join_thread.start()
         try:
+            assert result_queue.get(timeout=5) == "READY"
+            assert process.is_alive(), "worker exited before join_all() could terminate it"
+            assert process.exitcode is None
+            join_thread.start()
             deadline = time.time() + 5.0
             while join_thread.is_alive() and time.time() < deadline:
                 join_thread.join(timeout=0.1)
@@ -676,7 +640,47 @@ class TestWorkerManagerJoinAll:
             if process.is_alive():
                 process.kill()
                 process.join(timeout=5)
-            join_thread.join(timeout=1.0)
+            if join_thread.ident is not None:
+                join_thread.join(timeout=1.0)
+
+    def test_join_all_sends_graceful_stop_to_registered_processes_before_final_terminate(self) -> None:
+        """Sends a graceful STOP to every alive registered process, and the final
+        terminate-fallback loop over self.tasks still runs afterward."""
+        manager = WorkerManager()
+        cfw_uuid = uuid4()
+
+        mock_process = Mock(spec=multiprocessing.Process)
+        mock_process.is_alive.return_value = True
+        mock_command_queue = MagicMock()
+        mock_result_queue = MagicMock()
+        manager.process_register[cfw_uuid] = (mock_process, mock_command_queue, mock_result_queue)
+        manager.tasks.append(mock_process)
+
+        manager.join_all()
+
+        mock_command_queue.put.assert_called_once_with("STOP", block=False)
+        mock_process.terminate.assert_called_once()
+
+    @pytest.mark.timeout(30)
+    def test_join_all_terminates_after_graceful_timeout_when_worker_ignores_stop(self) -> None:
+        """A worker that never drains its command queue must still be terminated once
+        graceful_timeout elapses."""
+        manager = WorkerManager()
+        process, _, _ = manager.create_worker_process(cfw_uuid=uuid4(), target=_loop_forever_target, args=())
+        try:
+            start_time = time.time()
+            manager.join_all(graceful_timeout=0.3)
+            elapsed = time.time() - start_time
+
+            assert not process.is_alive()
+            assert elapsed < 10.0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
 
 
 class TestWorkerManagerIntegration:

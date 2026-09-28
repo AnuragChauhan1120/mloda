@@ -13,7 +13,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 
@@ -51,7 +51,7 @@ E2E_TARGET = "gfc_target_feat_899"  # never requested directly; only reachable a
 T = TypeVar("T")
 
 
-def _capture(call: Callable[[], T]) -> tuple[Optional[T], Optional[str]]:
+def _capture(call: Callable[[], T]) -> tuple[T | None, str | None]:
     """Run call, returning (value, None) or (None, 'Type: message'). No traceback is retained."""
     try:
         return call(), None
@@ -59,7 +59,7 @@ def _capture(call: Callable[[], T]) -> tuple[Optional[T], Optional[str]]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
-def _single(filter_feature_name: str, options: Optional[Options] = None) -> SingleFilter:
+def _single(filter_feature_name: str, options: Options | None = None) -> SingleFilter:
     """A minimal EQUAL filter on one feature name, optionally carrying that filter feature's own options."""
     filter_feature: Feature | str = filter_feature_name if options is None else Feature(filter_feature_name, options)
     return SingleFilter(filter_feature, FilterType.EQUAL, {"value": 1})
@@ -80,7 +80,7 @@ def _make_raising_filter_matcher_fg() -> type[FeatureGroup]:
             cls,
             feature_name: FeatureName | str,
             options: Options,
-            data_access_collection: Optional[DataAccessCollection] = None,
+            data_access_collection: DataAccessCollection | None = None,
         ) -> bool:
             if str(feature_name) == FILTER_FEATURE_RAISING:
                 raise RuntimeError(RAISE_MESSAGE)
@@ -103,7 +103,7 @@ def _make_escalating_filter_matcher_fg(marker: BaseException) -> type[FeatureGro
             cls,
             feature_name: FeatureName | str,
             options: Options,
-            data_access_collection: Optional[DataAccessCollection] = None,
+            data_access_collection: DataAccessCollection | None = None,
         ) -> bool:
             if str(feature_name) == FILTER_FEATURE_RAISING:
                 raise marker
@@ -216,7 +216,7 @@ def _make_hostile_filter_matcher_fg() -> type[FeatureGroup]:
             cls,
             feature_name: FeatureName | str,
             options: Options,
-            data_access_collection: Optional[DataAccessCollection] = None,
+            data_access_collection: DataAccessCollection | None = None,
         ) -> bool:
             if str(feature_name) == FILTER_FEATURE_RAISING:
                 raise HostileFilterMatcherError899(RAISE_MESSAGE)
@@ -225,9 +225,9 @@ def _make_hostile_filter_matcher_fg() -> type[FeatureGroup]:
     return HostileFilterMatcherFG899
 
 
-def _ledger(global_filter: GlobalFilter) -> Optional[dict[Any, Any]]:
+def _ledger(global_filter: GlobalFilter) -> dict[Any, Any] | None:
     """The instance drop ledger, read via getattr so a missing one asserts readably instead of pinning the class."""
-    return cast(Optional[dict[Any, Any]], getattr(global_filter, "dropped_filters", None))
+    return cast(dict[Any, Any] | None, getattr(global_filter, "dropped_filters", None))
 
 
 def _reason_of(recorded: Any) -> Any:
@@ -241,7 +241,7 @@ def _messages(caplog: pytest.LogCaptureFixture, level: int) -> tuple[str, ...]:
     return tuple(record.getMessage() for record in records)
 
 
-def _capture_type_name(call: Callable[[], T]) -> tuple[Optional[T], Optional[str]]:
+def _capture_type_name(call: Callable[[], T]) -> tuple[T | None, str | None]:
     """Run call, returning (value, None) or (None, type name). Reads no message: a double's str() raises."""
     try:
         return call(), None
@@ -253,8 +253,8 @@ def _capture_type_name(call: Callable[[], T]) -> tuple[Optional[T], Optional[str
 class _DropSnapshot:
     """Plain-data readout of one or more criteria calls. Holds no class and no exception object."""
 
-    results: tuple[Optional[bool], ...]
-    escaped: Optional[str]
+    results: tuple[bool | None, ...]
+    escaped: str | None
     has_ledger: bool
     keyed_by_group_and_filter: bool
     entries: tuple[tuple[str, str], ...]  # (feature group class name, filter feature name), sorted
@@ -269,7 +269,7 @@ def _drive_criteria(
     filter_feature_name: str,
     caplog: pytest.LogCaptureFixture,
     calls: int = 1,
-    options: Optional[Options] = None,
+    options: Options | None = None,
 ) -> _DropSnapshot:
     """Call criteria `calls` times against ONE GlobalFilter; the finally unbinds every name that pins the class."""
     caplog.clear()
@@ -277,11 +277,11 @@ def _drive_criteria(
     global_filter = GlobalFilter()
     # The engine probes a per-match deepcopy of one declaration, so all `calls` share one ledger key.
     declared = _single(filter_feature_name, options)
-    ledger: Optional[dict[Any, Any]] = None
+    ledger: dict[Any, Any] | None = None
     items: list[tuple[Any, Any]] = []
     try:
-        results: list[Optional[bool]] = []
-        escaped: Optional[str] = None
+        results: list[bool | None] = []
+        escaped: str | None = None
         with caplog.at_level(logging.DEBUG, logger=GF_LOGGER_NAME):
             for _ in range(calls):
                 value, failure = _capture_type_name(partial(global_filter.criteria, fg, deepcopy(declared), None))
@@ -391,7 +391,7 @@ def _make_in_features_mixin_fg() -> type[FeatureGroup]:
     class InFeaturesMixinFilterFG884(FeatureChainParserMixin, FeatureGroup):
         PROPERTY_MAPPING = {"operation": property_spec("operation", allowed_values=("op1",), context=True)}
 
-        def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+        def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
             return None
 
     return InFeaturesMixinFilterFG884
@@ -411,6 +411,23 @@ class TestUnresolvableInFeaturesIsNotADrop:
         assert snapshot.results == (False,), f"an unresolvable in_features is a non-match, got: {snapshot.results}"
         assert snapshot.entries == (), f"a non-match is not a drop, got: {snapshot.entries}"
         assert snapshot.warnings == (), f"a non-match must not warn, got: {snapshot.warnings}"
+
+
+class TestFilterOnRawColumnWithoutInFeatures:
+    def test_chained_group_with_default_min_does_not_match_a_raw_column_filter(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Effective options carry no in_features, so a MIN=1 chained group is a non-match, not a drop."""
+        snapshot = _drive_criteria(
+            _make_in_features_mixin_fg,
+            "gfc_raw_source_column_filter",
+            caplog,
+            options=Options(context={"operation": "op1"}),
+        )
+
+        assert snapshot.escaped is None, f"nothing may cross GlobalFilter.criteria: {snapshot.escaped}"
+        assert snapshot.results == (False,), f"an absent in_features is a non-match, got: {snapshot.results}"
+        assert snapshot.entries == (), f"a non-match is not a drop, got: {snapshot.entries}"
 
 
 class TestHostileExceptionStaysInsideTheExceptBlock:
@@ -452,7 +469,7 @@ def _make_e2e_probe_fg(escalate: bool) -> type[FeatureGroup]:
             cls,
             feature_name: FeatureName | str,
             options: Options,
-            data_access_collection: Optional[DataAccessCollection] = None,
+            data_access_collection: DataAccessCollection | None = None,
         ) -> bool:
             if str(feature_name) == E2E_TARGET:
                 if escalate:
@@ -487,7 +504,7 @@ def _single_row(frame: Any, column: str) -> Any:
     return values[0]
 
 
-def _run(escalate: bool) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+def _run(escalate: bool) -> tuple[dict[str, Any] | None, str | None]:
     """Run E2E_MAIN under a filter; the escape is text, not pytest.raises, whose ExceptionInfo pins the class."""
     fg = _make_e2e_probe_fg(escalate)
     collector = PluginCollector.enabled_feature_groups({fg})

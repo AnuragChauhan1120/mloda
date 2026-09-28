@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from copy import copy, deepcopy
-from typing import Any, Generator, NamedTuple, Optional
+from typing import Any, Generator, NamedTuple
 from uuid import UUID, uuid4
 
 from mloda.core.abstract_plugins.components.error_utils import REPORT_URL, internal_invariant_error
@@ -41,7 +41,8 @@ from mloda.core.core.step.join_step import JoinStep
 from mloda.core.core.step.transform_frame_work_step import TransformFrameworkStep
 from mloda.core.abstract_plugins.feature_group import FeatureGroup, format_feature_group_class
 from mloda.core.abstract_plugins.components.feature import Feature
-from mloda.core.abstract_plugins.components.feature_set import FeatureSet
+from mloda.core.abstract_plugins.components.feature_set import FeatureSet, merge_input_feature_edges
+from mloda.core.abstract_plugins.components.hashable_dict import _deep_hashable
 from mloda.core.abstract_plugins.components.link import JoinType, Link
 from collections import defaultdict
 import logging
@@ -93,14 +94,16 @@ class _JoinServedParent(NamedTuple):
 class ExecutionPlan:
     def __init__(
         self,
-        global_filter: Optional[GlobalFilter] = None,
-        api_input_data_collection: Optional[ApiInputDataCollection] = None,
+        global_filter: GlobalFilter | None = None,
+        api_input_data_collection: ApiInputDataCollection | None = None,
+        resolved_input_feature_names: dict[UUID, frozenset[str] | None] | None = None,
     ) -> None:
         # Maps a step to itself so a dedup hit can recover the already-inserted canonical member.
         self.tfs_collection: dict[TransformFrameworkStep, TransformFrameworkStep] = {}
         self.joinstep_collection = JoinStepCollection()
         self.global_filter = global_filter
         self.api_input_data_collection = api_input_data_collection
+        self.resolved_input_feature_names = resolved_input_feature_names
 
         # Helper variable
         self.feature_set_collections: list[set[UUID]] = []
@@ -113,6 +116,16 @@ class ExecutionPlan:
         self.declared_frameworks: DeclaredFrameworks = {}
         self.resolved_join_plan = ResolvedJoinPlan((), ())
         self.join_signatures_at_build: frozenset[JoinSignature] = frozenset()
+
+        # Per root feature_group class, the distinct option/context buckets run_feature_group split
+        # it into: f_hash -> (a representative feature, the union of feature uuids in that bucket).
+        # Non-root feature groups (their features have upstream ancestors) are never recorded here,
+        # since a split with no ancestors can never be the actual cause of a missing-Links error.
+        # Feeds the missing-Links error's option-split hint.
+        self._option_split_buckets: dict[type[FeatureGroup], dict[Any, tuple[Feature, set[UUID]]]] = {}
+        # Per root feature_group class, the union of inherited_context_keys used to hash its
+        # buckets (the actual split_keys `group_features_by_compute_framework_and_options` used).
+        self._option_split_keys: dict[type[FeatureGroup], frozenset[Any]] = {}
 
     def __iter__(self) -> Generator[TransformFrameworkStep | JoinStep | FeatureGroupStep, None, None]:
         yield from self.execution_plan
@@ -134,10 +147,17 @@ class ExecutionPlan:
         self.joinstep_collection = JoinStepCollection()
         self.feature_set_collections = []
         self.declared_frameworks = declared_frameworks if declared_frameworks is not None else {}
+        self._option_split_buckets = {}
+        self._option_split_keys = {}
 
         child_links = self.invert_link_trekker(link_trekker)
         pre_execution_plan = self.add_feature_group_step(queue, graph.parent_to_children_mapping, child_links)
         fw_execution_plan = self.add_joinstep(pre_execution_plan, link_trekker, graph)
+
+        # Run after add_joinstep, not inside add_feature_group_step: self.planned_records (which
+        # records already-resolved Links) is only populated by add_joinstep's run_link calls, and a
+        # split already bridged by a Link must not be blamed (see _stamp_option_split_hints).
+        self._stamp_option_split_hints(fw_execution_plan, graph.parent_to_children_mapping)
 
         # Built before add_tfs, whose write serialization edges are not part of the join decision.
         join_steps = [step for step in fw_execution_plan if isinstance(step, JoinStep)]
@@ -154,8 +174,10 @@ class ExecutionPlan:
 
         # Only read during add_joinstep above; ExecutionPlan gets deepcopy'd on every Engine.compute()
         # call, so this (potentially O(#features), UUID-keyed) dict and its live reference into
-        # ResolveComputeFrameworks's own dict must not linger past the plan build that needs it.
+        # ResolveComputeFrameworks's own dict must not linger past the plan build that needs it, and
+        # neither must the engine's resolved_input_feature_names map that run_feature_group read.
         self.declared_frameworks = {}
+        self.resolved_input_feature_names = None
 
     def add_feature_group_step(
         self,
@@ -181,7 +203,115 @@ class ExecutionPlan:
 
             else:
                 raise ValueError(f"Element {element} is not a valid element.")
+
         return pre_execution_plan
+
+    def _stamp_option_split_hints(
+        self,
+        plan: list[JoinStep | FeatureGroupStep],
+        parent_to_children_mapping: dict[UUID, set[UUID]],
+    ) -> None:
+        """Stamp an option-split hint on steps whose ancestors span two option/context buckets of a
+        root feature group, computing the differing keys only from the buckets that consumer's own
+        ancestors actually intersect, and only when those buckets are not already bridged by a
+        resolved Link."""
+        candidate_feature_groups = {
+            feature_group: buckets for feature_group, buckets in self._option_split_buckets.items() if len(buckets) >= 2
+        }
+        if not candidate_feature_groups:
+            self._option_split_buckets = {}
+            self._option_split_keys = {}
+            return
+
+        ordered_feature_groups = sorted(candidate_feature_groups, key=lambda fg: fg.get_class_name())
+
+        for step in plan:
+            if not isinstance(step, FeatureGroupStep):
+                continue
+
+            ancestor_union: set[UUID] = set()
+            for uuid in step.features.get_all_feature_ids():
+                ancestor_union.update(parent_to_children_mapping.get(uuid, set()))
+
+            for feature_group in ordered_feature_groups:
+                buckets = candidate_feature_groups[feature_group]
+                intersected_hashes = [f_hash for f_hash, (_, uuids) in buckets.items() if ancestor_union & uuids]
+                if len(intersected_hashes) < 2:
+                    continue
+
+                unresolved_hashes = self._exclude_link_resolved_buckets(intersected_hashes, buckets)
+                if len(unresolved_hashes) < 2:
+                    continue
+
+                representatives = [buckets[f_hash][0] for f_hash in unresolved_hashes]
+                split_keys = self._option_split_keys.get(feature_group, frozenset())
+                differing_keys = self._differing_option_keys(representatives, split_keys)
+                if not differing_keys:
+                    continue
+
+                step.features.option_split_hint = (feature_group.get_class_name(), differing_keys)
+                break
+
+        self._option_split_buckets = {}
+        self._option_split_keys = {}
+
+    def _exclude_link_resolved_buckets(
+        self,
+        hashes: list[Any],
+        buckets: dict[Any, tuple[Feature, set[UUID]]],
+    ) -> list[Any]:
+        """Collapse the given buckets into connected components bridged by an already-resolved Link
+        (``self.planned_records``); one representative hash survives per component. All buckets
+        already resolved into a single component means the split caused no actual problem."""
+        parent: dict[Any, Any] = {f_hash: f_hash for f_hash in hashes}
+
+        def find(x: Any) -> Any:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: Any, b: Any) -> None:
+            root_a, root_b = find(a), find(b)
+            if root_a != root_b:
+                parent[root_a] = root_b
+
+        for record in self.planned_records:
+            left_hashes = [f_hash for f_hash in hashes if buckets[f_hash][1] & record.left.uuids]
+            right_hashes = [f_hash for f_hash in hashes if buckets[f_hash][1] & record.right.uuids]
+            for left_hash in left_hashes:
+                for right_hash in right_hashes:
+                    union(left_hash, right_hash)
+
+        components: dict[Any, Any] = {}
+        for f_hash in hashes:
+            components.setdefault(find(f_hash), f_hash)
+        return list(components.values())
+
+    def _differing_option_keys(self, representatives: list[Feature], split_keys: frozenset[Any]) -> frozenset[Any]:
+        """Option/forwarded-context keys whose value differs across the given representative features, counting a key present in one and absent in another as differing."""
+        if len(representatives) < 2:
+            return frozenset()
+
+        candidate_keys: set[Any] = set()
+        for feature in representatives:
+            candidate_keys.update(feature.options.group.keys())
+            candidate_keys.update(key for key in split_keys if key in feature.options.context)
+
+        _ABSENT = object()
+        differing_keys: set[Any] = set()
+        for key in candidate_keys:
+            observed: set[Any] = set()
+            for feature in representatives:
+                if key in feature.options.group:
+                    observed.add(_deep_hashable(feature.options.group[key]))
+                elif key in split_keys and key in feature.options.context:
+                    observed.add(_deep_hashable(feature.options.context[key]))
+                else:
+                    observed.add(_ABSENT)
+            if len(observed) > 1:
+                differing_keys.add(key)
+        return frozenset(differing_keys)
 
     def add_joinstep(
         self,
@@ -254,9 +384,30 @@ class ExecutionPlan:
         )
 
     @staticmethod
-    def _parents_linked_by_join(uuid_a: UUID, uuid_b: UUID, join_steps: set[JoinStep]) -> bool:
+    def _shares_graph_ancestor(uuid_a: UUID, uuid_b: UUID, graph: Graph) -> bool:
+        """Whether two parents' full transitive ancestor closures (already computed by
+        Graph.set_all_parents_for_each_child) intersect."""
+        closure_a = {uuid_a} | graph.parent_to_children_mapping.get(uuid_a, set())
+        closure_b = {uuid_b} | graph.parent_to_children_mapping.get(uuid_b, set())
+        return bool(closure_a & closure_b)
+
+    @staticmethod
+    def _parents_linked_by_join(uuid_a: UUID, uuid_b: UUID, join_steps: set[JoinStep], graph: Graph) -> bool:
         """Whether two parents are linked, directly or transitively, via JoinSteps' genuine sides
-        (not ``required_uuids``, which unions all of a join's consumers' parents, not just its own two)."""
+        (not ``required_uuids``, which unions all of a join's consumers' parents, not just its own two).
+
+        Each side is widened to its own graph ancestors before the join-adjacency walk: a case-override
+        hop's parent (e.g. a derived feature) never sits on a JoinStep's side itself, only its own
+        upstream dependency does, so the bridge must be found through that dependency, not through
+        whichever sibling request happens to have pulled the join's index feature into its own parents
+        (an accident of feature-intake order, not a meaningful distinction).
+
+        This ancestor walk and the subclass check in `_entries_linked` (see add_tfs) are independent
+        mechanisms that can both decide two hops are linked. A join-served subclass pairing stays
+        linked unconditionally, since the join machinery already resolves it; every other subclass
+        pairing is additionally gated on `_shares_graph_ancestor`, confirming shared physical lineage
+        rather than independent roots that merely subclass for code reuse, with this walk as the
+        fallback for a subclass pair whose bridge has no shared ancestor of its own."""
         if uuid_a == uuid_b:
             return True
 
@@ -267,11 +418,14 @@ class ExecutionPlan:
             for src_uuid in js.source_framework_uuids:
                 adjacency[src_uuid].update(js.destination_framework_uuids)
 
-        visited = {uuid_a}
-        frontier = {uuid_a}
+        starts = {uuid_a} | graph.parent_to_children_mapping.get(uuid_a, set())
+        targets = {uuid_b} | graph.parent_to_children_mapping.get(uuid_b, set())
+
+        visited = set(starts)
+        frontier = set(starts)
         while frontier:
             frontier = set().union(*(adjacency[node] for node in frontier)) - visited
-            if uuid_b in frontier:
+            if frontier & targets:
                 return True
             visited |= frontier
         return False
@@ -429,6 +583,10 @@ Available join types:
         left_join_frameworks: set[JoinStep] = {ep for ep in execution_plan if isinstance(ep, JoinStep)}
         need_to_upload_collector: set[UUID] = set()
 
+        # Which JoinStep uuids a canonical cross-framework join hop serves; a join hop's owed-token
+        # route tokens are these, not its own uuid (see the owed-token block below).
+        hop_serves: dict[UUID, set[UUID]] = defaultdict(set)
+
         # Features produced together by one FeatureGroupStep live on the same physical source cfw
         # instance, so a hop should key on the owning step, not each member feature's own uuid.
         owning_step_of: dict[UUID, UUID] = {
@@ -451,6 +609,7 @@ Available join types:
                         new_execution_plan.append(new_tfs)
                         canonical_tfs = new_tfs
                     ep.required_uuids.add(canonical_tfs.uuid)
+                    hop_serves[canonical_tfs.uuid].add(ep.uuid)
 
                     need_to_upload_collector.update(ep.source_framework_uuids)
 
@@ -544,8 +703,11 @@ Available join types:
                             seen_hop_uuids.add(canonical_tfs.uuid)
                             bound_entries.append((canonical_tfs, parent))
 
-                        # Records every parent the hop covers; they all share one owning step, so
-                        # this doesn't change the scheduling gate.
+                        # Records every parent the hop covers. On its own this doesn't change the
+                        # scheduling gate, since canonical_tfs is still the one owning step here;
+                        # but the subclass-cluster widening further below can still merge this
+                        # hop's required_uuids with a SIBLING hop's, so the set can end up spanning
+                        # more than one owning step/framework after all.
                         canonical_tfs.required_uuids.add(parent)
                         ep.required_uuids.add(canonical_tfs.uuid)
 
@@ -558,7 +720,9 @@ Available join types:
                 # subclass (or superclass) of the other's (catches a case-override hop whose parent lost the
                 # JoinStep's own uuid to a same-role sibling, see `_case_override_beats_nearer_wrong_framework_left`,
                 # without also bridging two entries that merely share an unrelated common ancestor via some
-                # third join's declared side), or `_parents_linked_by_join`.
+                # third join's declared side), or `_parents_linked_by_join`. A subclass pairing must
+                # additionally share genuine graph ancestry unless it is join-served, so two plain hops that
+                # merely subclass one another over otherwise unrelated roots are not merged.
                 def _entries_linked(
                     entry_a: tuple[TransformFrameworkStep | _JoinServedParent, UUID],
                     entry_b: tuple[TransformFrameworkStep | _JoinServedParent, UUID],
@@ -570,8 +734,10 @@ Available join types:
                     if issubclass(hop_a.from_feature_group, hop_b.from_feature_group) or issubclass(
                         hop_b.from_feature_group, hop_a.from_feature_group
                     ):
-                        return True
-                    return self._parents_linked_by_join(parent_a, parent_b, left_join_frameworks)
+                        join_adjacent = isinstance(hop_a, _JoinServedParent) or isinstance(hop_b, _JoinServedParent)
+                        if join_adjacent or self._shares_graph_ancestor(parent_a, parent_b, graph):
+                            return True
+                    return self._parents_linked_by_join(parent_a, parent_b, left_join_frameworks, graph)
 
                 def _add_to_groups(
                     groups: list[list[tuple[TransformFrameworkStep | _JoinServedParent, UUID]]],
@@ -597,6 +763,46 @@ Available join types:
                 for served_feature_group, served_parent in join_served_entries:
                     _add_to_groups(hop_groups, (_JoinServedParent(served_feature_group), served_parent))
 
+                # Two distinct hops linked only because one's from_feature_group subclasses the other's
+                # read the same physical source cfw instance at runtime, but each
+                # only ever waited on its own parent; whichever a later runtime lookup happens to pick
+                # may transform a stale snapshot, taken before the sibling's parent landed in it. Widen
+                # each to wait on the other's parent too, scoped to the subclass pairing specifically:
+                # the same-class and join-bridged linkages `_entries_linked` also groups by already have
+                # their own, narrower reasons to keep separate required_uuids (see the two multi-member
+                # tests in test_add_tfs_multi_member_parents.py). This widening does not re-check
+                # `_shares_graph_ancestor` for a pair only transitively grouped via a third member.
+                def _subclass_only_linked(hop_a: TransformFrameworkStep, hop_b: TransformFrameworkStep) -> bool:
+                    if hop_a.from_feature_group is hop_b.from_feature_group:
+                        return False
+                    return issubclass(hop_a.from_feature_group, hop_b.from_feature_group) or issubclass(
+                        hop_b.from_feature_group, hop_a.from_feature_group
+                    )
+
+                for group in hop_groups:
+                    tfs_members = [hop for hop, _member_parent in group if isinstance(hop, TransformFrameworkStep)]
+                    subclass_clusters: list[list[TransformFrameworkStep]] = []
+                    for tfs in tfs_members:
+                        linked_clusters = [
+                            cluster
+                            for cluster in subclass_clusters
+                            if any(_subclass_only_linked(tfs, member) for member in cluster)
+                        ]
+                        if linked_clusters:
+                            linked_clusters[0].append(tfs)
+                            for other_cluster in linked_clusters[1:]:
+                                linked_clusters[0].extend(other_cluster)
+                                subclass_clusters.remove(other_cluster)
+                        else:
+                            subclass_clusters.append([tfs])
+
+                    for cluster in subclass_clusters:
+                        if len(cluster) > 1:
+                            shared_required_uuids: set[UUID] = set().union(*(tfs.required_uuids for tfs in cluster))
+                            for tfs in cluster:
+                                # A step must never wait for a token it produces itself.
+                                tfs.required_uuids = shared_required_uuids - tfs.get_uuids()
+
                 if len(hop_groups) > 1:
                     raise ValueError(
                         self._conflicting_transform_hops_error(ep, hop_groups[0][0][0], hop_groups[1][0][0])
@@ -619,6 +825,225 @@ Available join types:
             if isinstance(_ep, FeatureGroupStep):
                 if not need_to_upload_collector.isdisjoint(_ep.get_uuids()):
                     _ep.need_to_upload = True
+
+        # A hop's SOURCE-side cfw is credited via owed_tokens, letting it drop once read. Multi-route rule: a consumer
+        # reaching two or more hops out of one source framework is credited by none, since one hop finishing could drop
+        # the cfw while another still reads it. Per-source guard: a hop is ineligible when its OWN source data - not
+        # merely its framework class - is also the source or destination of another JoinStep. The identity check is
+        # OWNING-STEP granularity (which FeatureGroupStep produced the data), not true physical-cfw granularity:
+        # several FeatureGroupSteps in one same-framework chain under a root can share ONE physical cfw instance at
+        # runtime (ComputeFrameworkExecutor.add_compute_framework reuses an existing cfw whenever CfwManager.get_cfw_uuid
+        # finds the feature in some cfw's children_if_root), so two different owning steps can disagree with true cfw
+        # sharing. That can only make the guard MORE conservative, never less: the transitive children_if_root
+        # membership check the runtime drop path applies downstream (see run.py's _drop_tfs_source_if_possible /
+        # _drop_join_source_if_possible) still gates the actual drop on every real reader of the shared cfw, whatever
+        # this guard decided. Scope: a join hop credits only its destination-framework consumer; APPEND/UNION hops
+        # stay finalize-only.
+        joinsteps_by_uuid: dict[UUID, JoinStep] = {js.uuid: js for js in left_join_frameworks}
+
+        def _owning_step(feature_uuid: UUID) -> UUID:
+            """The uuid of the FeatureGroupStep that owns a feature uuid; a bare feature uuid
+            owns itself when it has no FeatureGroupStep of its own (hand-built steps, tests)."""
+            return owning_step_of.get(feature_uuid, feature_uuid)
+
+        # Route tokens and from_framework are recorded for every hop, eligible or not: an ineligible hop
+        # still reads its source cfw, so it still counts as a route for the multi-route rule below.
+        route_tokens_by_hop: dict[UUID, set[UUID]] = {}
+        hop_from_framework: dict[UUID, type[ComputeFramework]] = {}
+        eligible_hops: dict[UUID, TransformFrameworkStep] = {}
+        # A hop's own source, keyed by hop uuid; always resolved (see the invariant checks below),
+        # read by the transitive reach walk further down.
+        hop_source_owner_by_hop: dict[UUID, UUID] = {}
+        for _ep in new_execution_plan:
+            if not isinstance(_ep, TransformFrameworkStep):
+                continue
+
+            if _ep.link_id is None:
+                served_joinstep_uuids: set[UUID] = set()
+                route_tokens = {_ep.uuid}
+            else:
+                served_joinstep_uuids = hop_serves.get(_ep.uuid, set())
+                route_tokens = set(served_joinstep_uuids)
+
+            route_tokens_by_hop[_ep.uuid] = route_tokens
+            hop_from_framework[_ep.uuid] = _ep.from_framework
+
+            served_joinsteps = [joinsteps_by_uuid[uuid] for uuid in served_joinstep_uuids]
+            if any(js.link.jointype in (JoinType.APPEND, JoinType.UNION) for js in served_joinsteps):
+                continue
+
+            # The hop's own source identity, normalized to the owning FeatureGroupStep: a plain
+            # hop's source_step_uuid is already that owner; a join hop's source_framework_uuid is
+            # the raw feature uuid the served JoinStep reads from, so it needs the same normalizing.
+            # Both are always resolvable given how hops are built: a plain hop's source_step_uuid is
+            # set unconditionally above (owning_step_of.get(parent, parent) never returns None), and
+            # _validate_join_step_uuids guarantees every JoinStep - hence fill_tfs_by_joinstep's hop -
+            # has a non-empty source_framework_uuids, so a join hop's source_framework_uuid is never
+            # None either.
+            if _ep.link_id is None:
+                if _ep.source_step_uuid is None:
+                    raise ValueError(
+                        internal_invariant_error(
+                            "Plain hop has no source_step_uuid.",
+                            f"hop uuid={_ep.uuid}, from_framework={_ep.from_framework.get_class_name()}",
+                            "add_tfs always sets source_step_uuid when building a plain hop.",
+                        )
+                    )
+                hop_source_owner: UUID = _ep.source_step_uuid
+            else:
+                if _ep.source_framework_uuid is None:
+                    raise ValueError(
+                        internal_invariant_error(
+                            "Join hop has no source_framework_uuid.",
+                            f"hop uuid={_ep.uuid}, link_id={_ep.link_id}",
+                            "_validate_join_step_uuids guarantees every JoinStep has a non-empty "
+                            "source_framework_uuids.",
+                        )
+                    )
+                hop_source_owner = _owning_step(_ep.source_framework_uuid)
+
+            hop_source_owner_by_hop[_ep.uuid] = hop_source_owner
+
+            other_join_source_owners = {
+                _owning_step(uuid)
+                for js in joinsteps_by_uuid.values()
+                if js.uuid not in served_joinstep_uuids
+                for uuid in (js.source_framework_uuids | js.destination_framework_uuids)
+            }
+            if hop_source_owner in other_join_source_owners:
+                continue
+
+            eligible_hops[_ep.uuid] = _ep
+
+        hop_uuid_by_route_token: dict[UUID, UUID] = {
+            token: hop_uuid for hop_uuid, tokens in route_tokens_by_hop.items() for token in tokens
+        }
+
+        feature_group_steps_by_uuid: dict[UUID, FeatureGroupStep] = {
+            _ep.uuid: _ep for _ep in new_execution_plan if isinstance(_ep, FeatureGroupStep)
+        }
+
+        # A hop's credit extends past its own direct consumer to that consumer's same-framework
+        # descendants, but only along the part of a descendant's dependency
+        # chain that never branches away back to the hop's source, or to another hop out of a source
+        # framework the multi-route rule below already treats as ambiguous. `_reach` walks a
+        # FeatureGroupStep's required_uuids once, memoized: a hop-route token is a hop boundary,
+        # crossed unconditionally and tagged with the hop's own source owner, while a same-framework
+        # producer token is crossed only when frameworks match (tagged `None`, a bypass marker) and
+        # folds in whatever that dependency itself already reaches. A raw ancestor token whose owner's
+        # framework does NOT match is the ancestor set's own leftover bookkeeping - the same
+        # dependency is already captured, framework-correctly, by its own hop token elsewhere in
+        # required_uuids - so it is skipped rather than read as a spurious bypass.
+        #
+        # Complexity: memoization visits each step once, but FeatureGroupStep.required_uuids holds
+        # the FULL TRANSITIVE ancestor set, not just direct parents, so a chain of N same-framework
+        # steps makes this walk do O(N) token-loop work per step across O(N) steps, merging O(N)-sized
+        # by_owner dicts at each - roughly O(N^3) for one long single-framework chain, not the
+        # O(steps * features) bound elsewhere in this block.
+        #
+        # Recursion depth: an explicit worklist, not native recursion, walks the dependency DAG below,
+        # so an arbitrarily long single-framework chain cannot raise RecursionError; this assumes the
+        # step dependency graph is acyclic, an invariant the rest of add_tfs already relies on.
+        reach_cache: dict[UUID, dict[UUID, frozenset[UUID | None]]] = {}
+        all_hops_cache: dict[UUID, frozenset[UUID]] = {}
+
+        def _reach(start_uuid: UUID) -> dict[UUID, frozenset[UUID | None]]:
+            cached = reach_cache.get(start_uuid)
+            if cached is not None:
+                return cached
+
+            work: list[tuple[UUID, bool]] = [(start_uuid, False)]
+            while work:
+                step_uuid, dependencies_ready = work.pop()
+                if step_uuid in reach_cache:
+                    continue
+
+                step = feature_group_steps_by_uuid.get(step_uuid)
+                if step is None:
+                    reach_cache[step_uuid] = {}
+                    all_hops_cache[step_uuid] = frozenset()
+                    continue
+
+                if not dependencies_ready:
+                    pending: list[UUID] = []
+                    for token in step.required_uuids:
+                        hop_uuid = hop_uuid_by_route_token.get(token)
+                        if hop_uuid is not None:
+                            owner = hop_source_owner_by_hop.get(hop_uuid)
+                            if owner is not None and owner not in reach_cache:
+                                pending.append(owner)
+                            continue
+
+                        dep_uuid = owning_step_of.get(token)
+                        if dep_uuid is None or dep_uuid == step_uuid:
+                            continue
+                        dep_step = feature_group_steps_by_uuid.get(dep_uuid)
+                        if dep_step is None or dep_step.compute_framework != step.compute_framework:
+                            continue
+                        if dep_uuid not in reach_cache:
+                            pending.append(dep_uuid)
+
+                    if pending:
+                        work.append((step_uuid, True))
+                        work.extend((dep_uuid, False) for dep_uuid in pending)
+                        continue
+
+                by_owner: dict[UUID, set[UUID | None]] = defaultdict(set)
+                hops: set[UUID] = set()
+                for token in step.required_uuids:
+                    hop_uuid = hop_uuid_by_route_token.get(token)
+                    if hop_uuid is not None:
+                        hops.add(hop_uuid)
+                        owner = hop_source_owner_by_hop.get(hop_uuid)
+                        if owner is not None:
+                            by_owner[owner].add(hop_uuid)
+                            for other_owner, markers in reach_cache[owner].items():
+                                by_owner[other_owner] |= markers
+                            hops |= all_hops_cache[owner]
+                        continue
+
+                    dep_uuid = owning_step_of.get(token)
+                    if dep_uuid is None or dep_uuid == step_uuid:
+                        continue
+                    dep_step = feature_group_steps_by_uuid.get(dep_uuid)
+                    if dep_step is None or dep_step.compute_framework != step.compute_framework:
+                        continue
+                    by_owner[dep_uuid].add(None)
+                    for other_owner, markers in reach_cache[dep_uuid].items():
+                        by_owner[other_owner] |= markers
+                    hops |= all_hops_cache[dep_uuid]
+
+                reach_cache[step_uuid] = {owner: frozenset(markers) for owner, markers in by_owner.items()}
+                all_hops_cache[step_uuid] = frozenset(hops)
+
+            return reach_cache[start_uuid]
+
+        owed_by_hop: dict[UUID, set[UUID]] = {hop_uuid: set() for hop_uuid in eligible_hops}
+        for _consumer in new_execution_plan:
+            if not isinstance(_consumer, FeatureGroupStep):
+                continue
+
+            owner_reach = _reach(_consumer.uuid)
+            reached_hop_uuids = all_hops_cache[_consumer.uuid]
+            frameworks_reached: dict[type[ComputeFramework], int] = defaultdict(int)
+            for hop_uuid in reached_hop_uuids:
+                frameworks_reached[hop_from_framework[hop_uuid]] += 1
+
+            for markers in owner_reach.values():
+                if len(markers) != 1:
+                    continue
+                (sole_marker,) = markers
+                if sole_marker is None:
+                    continue
+                if frameworks_reached[hop_from_framework[sole_marker]] > 1:
+                    continue
+                hop = eligible_hops.get(sole_marker)
+                if hop is None or (hop.link_id is not None and _consumer.compute_framework != hop.to_framework):
+                    continue
+                owed_by_hop[sole_marker].update(_consumer.get_uuids())
+
+        for hop_uuid, owed in owed_by_hop.items():
+            eligible_hops[hop_uuid].owed_tokens = frozenset(owed)
 
         return new_execution_plan
 
@@ -739,10 +1164,7 @@ Available join types:
         children_uuids: set[UUID] = set()
         attempted_key = link_fw
 
-        for stored_links, uuids in link_trekker.data.items():
-            if link_fw == stored_links:
-                children_uuids.update(uuids)
-            # this part is not working!
+        children_uuids.update(link_trekker.data.get(link_fw, set()))
 
         swap_merge_sides = False
 
@@ -754,9 +1176,7 @@ Available join types:
             swap_merge_sides = True
             attempted_key = (link, destination_framework, source_framework)
 
-            for stored_links, uuids in link_trekker.data.items():
-                if (link, destination_framework, source_framework) == stored_links:
-                    children_uuids.update(uuids)
+            children_uuids.update(link_trekker.data.get(attempted_key, set()))
 
             if len(children_uuids) == 0:
                 raise ValueError(f"Link {link} has no matching uuids.")
@@ -1087,7 +1507,7 @@ Available join types:
 
             for c_o_c in child_of_child:
                 if c_o_c in children_uuids:
-                    new_children_uuids.remove(c_o_c)
+                    new_children_uuids.discard(c_o_c)
 
         return new_children_uuids
 
@@ -1337,17 +1757,7 @@ Available join types:
             )
 
     def _matches_discriminator(self, discriminator: dict[str, Any], graph: Graph, uuid: UUID) -> bool:
-        """Check that every discriminator key-value pair is present in a node's feature options.
-
-        A discriminator identifies one node among several same-class FeatureGroup instances, so a
-        partial overlap is not enough: two nodes that differ on the deciding key but share another
-        one would both match.
-        """
-        options = graph.nodes[uuid].feature.options
-        for dk, dv in discriminator.items():
-            if dk not in options or options.get(dk) != dv:
-                return False
-        return True
+        return Link.matches_discriminator(discriminator, graph.nodes[uuid].feature.options)
 
     def check_pointer(
         self, pointer_dict: dict[str, Any], link_fw: LinkFrameworkTrekker, graph: Graph, uuid: UUID
@@ -1429,7 +1839,30 @@ Available join types:
         pre_required_uuids: set[UUID],
     ) -> dict[Any, FeatureGroupStep]:
         feature_group, features = feature_group_features[0], feature_group_features[1]
-        features_grouped_by_framework_and_options = self.group_features_by_compute_framework_and_options(features)
+        features_grouped_by_framework_and_options: dict[Any, set[Feature]] = (
+            self.group_features_by_compute_framework_and_options(features)
+        )
+        if isinstance(feature_group.input_data(), ApiInputData) and self.api_input_data_collection is not None:
+            api_groups: dict[tuple[int, str], set[Feature]] = defaultdict(set)
+            for f_hash, grouped_features in features_grouped_by_framework_and_options.items():
+                for feature in grouped_features:
+                    source_key, _ = self.api_input_data_collection.get_name_cls_by_matching_column_name(feature.name)
+                    api_groups[(f_hash, source_key)].add(feature)
+            features_grouped_by_framework_and_options = api_groups
+
+        # Only a root feature group (no upstream ancestors) can be the actual cause of a
+        # missing-Links error: a split with ancestors of its own is never the source read directly.
+        is_root = not any(parent_to_children_mapping.get(feature.uuid) for feature in features)
+        if is_root:
+            split_keys = frozenset(key for feature in features for key in feature.options.inherited_context_keys)
+            self._option_split_keys[feature_group] = self._option_split_keys.get(feature_group, frozenset()) | (
+                split_keys
+            )
+            split_buckets = self._option_split_buckets.setdefault(feature_group, {})
+            for f_hash, grouped_features in features_grouped_by_framework_and_options.items():
+                representative = next(iter(grouped_features))
+                bucket = split_buckets.setdefault(f_hash, (representative, set()))
+                bucket[1].update(feature.uuid for feature in grouped_features)
 
         fg_steps: dict[Any, FeatureGroupStep] = {}
 
@@ -1457,6 +1890,19 @@ Available join types:
                     feature.name
 
                 self.feature_set_collections.append(feature_set.get_all_feature_ids())
+
+                if self.resolved_input_feature_names is not None:
+                    # An injected filter or index feature is batched with its host and takes the host's
+                    # inputs, so the union over the resolved members is what the engine wired for the step.
+                    union: set[str] = set()
+                    edge_pairs: list[tuple[str, frozenset[str]]] = []
+                    for feature in sub_features:
+                        resolved_names = self.resolved_input_feature_names.get(feature.uuid) or frozenset()
+                        union.update(resolved_names)
+                        edge_pairs.append((str(feature.name), resolved_names))
+                    feature_set.declared_input_feature_names = frozenset(union) or None
+                    feature_set.declared_input_feature_edges = merge_input_feature_edges(edge_pairs)
+                    feature_set.declared_input_features_resolved = True
 
                 self.add_artifact_to_feature_set(feature_group, feature_set)
                 self.add_single_filters_to_feature_set(feature_group, feature_set)

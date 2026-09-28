@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any, Optional, TYPE_CHECKING, cast
+from typing import Any, TYPE_CHECKING, cast
 from copy import deepcopy
 
 from mloda.core.abstract_plugins.components.hashable_dict import _deep_equal, _deep_hashable, register_deep_node
@@ -149,8 +149,8 @@ class Options:
 
     def __init__(
         self,
-        group: Optional[dict[str, Any]] = None,
-        context: Optional[dict[str, Any]] = None,
+        group: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
         propagate_context_keys: frozenset[str] | None = None,
     ) -> None:
         self.group = _normalize_reader_class_keys(group) if group else {}
@@ -159,18 +159,62 @@ class Options:
         self.inherited_group_keys: frozenset[str] = frozenset()
         self.inherited_context_keys: frozenset[str] = frozenset()
         self.last_forwarded_group_keys: frozenset[str] = frozenset()
+        self.non_forwarded_group_keys: frozenset[str] = frozenset()
+        self._own_group_keys: frozenset[str] = frozenset(self.group.keys())
+        self._own_context_keys: frozenset[str] = frozenset(self.context.keys())
+        self._own_keys_locked: bool = False
         OptionsValidator.validate_no_duplicate_keys(self.group, self.context)
         OptionsValidator.validate_propagate_keys_in_context(self.propagate_context_keys, self.context)
 
-    def add_to_group(self, key: str, value: Any) -> None:
-        """Add parameter to group (affects Feature Group resolution/splitting)."""
+    @property
+    def own_group_keys(self) -> frozenset[str]:
+        """Group keys declared on this feature before mloda started resolving it, still present."""
+        return self._own_group_keys & self.group.keys()
+
+    @property
+    def own_context_keys(self) -> frozenset[str]:
+        """Context keys declared on this feature before mloda started resolving it, still present."""
+        return self._own_context_keys & self.context.keys()
+
+    def is_own(self, key: str) -> bool:
+        """True if key was declared on this feature before mloda started resolving it (API or engine intake,
+        or its first committed inherit_from, whichever came first). After an engine intake merge, a key is own
+        if any merged request declared it."""
+        return key in self.own_group_keys or key in self.own_context_keys
+
+    def union_own_keys(self, other: "Options") -> None:
+        """Union another Options' own-key provenance and lock flag into self; used when two value-equal
+        Feature requests from different consumers merge into one, so the merged feature's own-key answer
+        is consumer-order independent. inherited_* provenance stays the receiver's. Only ever called on
+        Options that are already equal (same group and context values), so no value copying is needed."""
+        self._own_group_keys = self._own_group_keys | other._own_group_keys
+        self._own_context_keys = self._own_context_keys | other._own_context_keys
+        self._own_keys_locked = self._own_keys_locked or other._own_keys_locked
+
+    def lock_own_keys(self) -> None:
+        """Stop later set/add_to_group/add_to_context calls from extending own keys. Idempotent."""
+        self._own_keys_locked = True
+
+    def add_to_group(self, key: str, value: Any, forward: bool = True) -> None:
+        """Add parameter to group (affects Feature Group resolution/splitting); ``forward=False``
+        marks the key via ``mark_non_forwarded`` so it never flows to input features through ``inherit_from``."""
         OptionsValidator.validate_can_add_to_group(key, value, self.group, self.context)
         self.group[key] = value
+        if not self._own_keys_locked:
+            self._own_group_keys = self._own_group_keys | frozenset({key})
+        if not forward:
+            self.mark_non_forwarded(key)
+
+    def mark_non_forwarded(self, key: str) -> None:
+        """Union ``key`` into ``non_forwarded_group_keys``, opting it out of ``inherit_from`` forwarding."""
+        self.non_forwarded_group_keys = self.non_forwarded_group_keys | frozenset({key})
 
     def add_to_context(self, key: str, value: Any) -> None:
         """Add parameter to context (metadata only, doesn't affect splitting)."""
         OptionsValidator.validate_can_add_to_context(key, value, self.group, self.context)
         self.context[key] = value
+        if not self._own_keys_locked:
+            self._own_context_keys = self._own_context_keys | frozenset({key})
 
     def __hash__(self) -> int:
         """
@@ -243,6 +287,8 @@ class Options:
         else:
             # New key, add to group by default
             self.group[key] = value
+            if not self._own_keys_locked:
+                self._own_group_keys = self._own_group_keys | frozenset({key})
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.set(key, value)
@@ -288,27 +334,42 @@ class Options:
                 "Expected list, tuple, set, frozenset, str, or Feature object."
             )
 
-    def _rebuild(self, group: dict[str, Any], context: dict[str, Any]) -> "Options":
+    def rebuild(self, group: dict[str, Any], context: dict[str, Any]) -> "Options":
         """A new Options over the given dicts, carrying this one's provenance bookkeeping over."""
         copied = Options(group=group, context=context, propagate_context_keys=self.propagate_context_keys)
         copied.inherited_group_keys = self.inherited_group_keys
         copied.inherited_context_keys = self.inherited_context_keys
         copied.last_forwarded_group_keys = self.last_forwarded_group_keys
+        copied.non_forwarded_group_keys = self.non_forwarded_group_keys
+        copied._own_group_keys = self._own_group_keys
+        copied._own_context_keys = self._own_context_keys
+        copied._own_keys_locked = self._own_keys_locked
         return copied
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Pickle protocol hook: strips every ``non_forwarded_group_keys`` entry from ``.group`` in the
+        picklable snapshot. Fires only for an actual pickle (e.g. the multiprocessing preflight check or
+        a real worker handoff), never for plain attribute access, and never for ``copy``/``deepcopy``
+        (those use ``__copy__``/``__deepcopy__`` instead)."""
+        if not self.non_forwarded_group_keys:
+            return self.__dict__
+        state = dict(self.__dict__)
+        state["group"] = {k: v for k, v in self.group.items() if k not in self.non_forwarded_group_keys}
+        return state
 
     def __copy__(self) -> "Options":
         """A new Options owning its group/context dicts while sharing every value by reference.
 
         Container ownership without __deepcopy__'s copy requirement on the values themselves.
         """
-        return self._rebuild(dict(self.group), dict(self.context))
+        return self.rebuild(dict(self.group), dict(self.context))
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "Options":
         def safe_deepcopy_dict(d: dict[str, Any]) -> dict[str, Any]:
             """Safely deepcopy a dictionary, falling back to shallow copy for unpickleable objects."""
             return {key: _safe_deepcopy(value, memo) for key, value in d.items()}
 
-        return self._rebuild(safe_deepcopy_dict(self.group), safe_deepcopy_dict(self.context))
+        return self.rebuild(safe_deepcopy_dict(self.group), safe_deepcopy_dict(self.context))
 
     def __str__(self) -> str:
         parts = f"Options(group={self.group}, context={self.context}"
@@ -344,10 +405,17 @@ class Options:
           The push is skipped when forward_group is False (only the literal False blocks it; an
           empty frozenset allowlist does not).
 
-        DefaultOptionKeys.in_features is never inherited through any flow.
+        DefaultOptionKeys.in_features is never inherited through any flow. A key in
+        consumer.non_forwarded_group_keys IS still forwarded like any other key, but its mark
+        travels with it: self.non_forwarded_group_keys gains that key too, so it keeps being
+        excluded from pickling wherever it lands (see mark_non_forwarded/__getstate__).
 
         Every key actually forwarded (including keys self already held with an equal value) is
         unioned into self.inherited_group_keys, so provenance accumulates across consumers.
+
+        The first call that commits (per instance) calls lock_own_keys, regardless of whether
+        anything ends up forwarded; a raising call does not lock. Once locked, further
+        ``set``/``add_to_group``/``add_to_context`` calls no longer extend ``own_group_keys``/``own_context_keys``.
 
         Forwarded values are isolated by a container-spine copy as they are stored: the
         container spine (dict/list/set/tuple/frozenset) is copied recursively so nested mutation on the child
@@ -395,6 +463,7 @@ class Options:
         new_context = dict(self.context)
 
         inherited: set[str] = set()
+        propagated_non_forwarded: set[str] = set()
         for key in sorted(group_keys):
             if is_non_forwarded_key(key) or key not in consumer.group:
                 continue
@@ -418,6 +487,8 @@ class Options:
             OptionsValidator.validate_can_add_to_group(key, value, new_group, new_context)
             new_group[key] = value
             inherited.add(key)
+            if key in consumer.non_forwarded_group_keys:
+                propagated_non_forwarded.add(key)
 
         inherited_context: set[str] = set()
         for key in inherit_context_keys:
@@ -444,6 +515,7 @@ class Options:
             new_context.update({key: _isolate_forwarded_value(value, memo) for key, value in propagating.items()})
             inherited_context.update(propagating.keys())
 
+        self.lock_own_keys()
         self.group.clear()
         self.group.update(new_group)
         self.context.clear()
@@ -451,6 +523,7 @@ class Options:
         self.inherited_group_keys = self.inherited_group_keys | frozenset(inherited)
         self.last_forwarded_group_keys = frozenset(inherited)
         self.inherited_context_keys = self.inherited_context_keys | frozenset(inherited_context)
+        self.non_forwarded_group_keys = self.non_forwarded_group_keys | frozenset(propagated_non_forwarded)
         return frozenset(inherited)
 
 

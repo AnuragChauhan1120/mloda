@@ -1,5 +1,6 @@
 import os
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any
 import pytest
 import pyarrow as pa
 from mloda_plugins.compute_framework.base_implementations.polars.dataframe import PolarsDataFrame
@@ -111,7 +112,7 @@ class TestPolarsDataFrameMerge(DataFrameTestBase):
         """Create a polars DataFrame from a dictionary."""
         return pl.DataFrame(data)
 
-    def get_connection(self) -> Optional[Any]:
+    def get_connection(self) -> Any | None:
         """Return connection object (None for polars)."""
         return None
 
@@ -127,6 +128,11 @@ class TestPolarsDtypeExtraction(DtypeExtractionTestMixin):
     @pytest.fixture
     def dtype_sample_data(self) -> Any:
         return pl.DataFrame({"int_col": [1, 2, 3], "str_col": ["a", "b", "c"], "float_col": [1.0, 2.0, 3.0]})
+
+    @pytest.fixture
+    def decimal_sample_data(self) -> Any:
+        values = [Decimal("12.34"), Decimal("5.50"), Decimal("99.99"), None]
+        return pl.DataFrame({"d": values}, schema={"d": pl.Decimal(10, 2)})
 
 
 @pytest.mark.skipif(pl is None, reason="Polars is not installed. Skipping this test.")

@@ -1,7 +1,8 @@
 import logging
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 from mloda.core.abstract_plugins.components.data_types import DataType
+from mloda.core.abstract_plugins.hook_context import OutputSchema
 from mloda.provider import BaseMergeEngine
 from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_merge_engine import DuckDBMergeEngine
 from mloda.user import FeatureName, ParallelizationMode
@@ -52,7 +53,7 @@ class DuckDBFramework(ComputeFramework):
     This framework does not support multiprocessing, so it should not be used with multiprocessing.
     """
 
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         """Use given DuckDB connection.
 
         Pins the DuckDB session timezone to UTC on first assignment so that timestamp
@@ -104,8 +105,8 @@ class DuckDBFramework(ComputeFramework):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         """Materialize the final result as a PyArrow Table.
 
@@ -123,6 +124,12 @@ class DuckDBFramework(ComputeFramework):
     def _extract_column_names(self, data: Any) -> set[str]:
         return set(data.columns)
 
+    def _row_count(self, data: Any) -> int | None:
+        """A DuckdbRelation's __len__ runs count_star(), a real query; never call it for observability."""
+        if isinstance(data, DuckdbRelation):
+            return None
+        return super()._row_count(data)
+
     def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
         if column_name in data.columns:
             dtypes = data.types
@@ -130,7 +137,7 @@ class DuckDBFramework(ComputeFramework):
             return str(dtypes[idx])
         return None
 
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
         if column_name not in data.columns:
             return None
         idx = data.columns.index(column_name)
@@ -141,6 +148,23 @@ class DuckDBFramework(ComputeFramework):
         if type_str.startswith("DECIMAL"):
             return DataType.DECIMAL
         return None
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read columns/types once and zip them; never index into columns per name.
+
+        Duplicate column names (e.g. an un-aliased join) collapse to one entry, first
+        occurrence wins.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        columns = data.columns
+        if not columns:
+            return None
+        types = data.types
+        seen: dict[str, str] = {}
+        for name, dtype in zip(columns, types):
+            seen.setdefault(name, str(dtype))
+        return tuple((name, seen[name]) for name in sorted(seen, key=str))
 
     @classmethod
     def duckdb_relation(cls) -> Any:

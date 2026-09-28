@@ -1,7 +1,7 @@
 from collections import defaultdict
 from copy import deepcopy
 import logging
-from typing import Any, Optional
+from typing import Any, cast
 from uuid import UUID
 import uuid
 
@@ -17,6 +17,15 @@ from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
+from mloda.core.abstract_plugins.function_extender import (
+    Extender,
+    ExtenderHook,
+    _invoke_extender,
+    get_function_extender,
+)
+from mloda.core.abstract_plugins.hook_context import HookContext, instrument
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.core.abstract_plugins.verified_context import current_verified_context
 from mloda.core.prepare.execution_plan import ExecutionPlan
 from mloda.core.prepare.graph.build_graph import BuildGraph
 from mloda.core.prepare.resolve_graph import ResolveGraph
@@ -39,19 +48,28 @@ from mloda.core.abstract_plugins.components.validators.link_validator import Lin
 logger = logging.getLogger(__name__)
 
 
+def _no_match_rows(result: Any) -> int | None:
+    """row_count stand-in for FEATURE_GROUP_MATCHED: its return value carries no row semantics."""
+    return None
+
+
 class Engine:
     def __init__(
         self,
         features: Features,
         compute_frameworks: set[type[ComputeFramework]],
-        links: Optional[set[Link]],
-        data_access_collection: Optional[DataAccessCollection] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_input_data_collection: Optional[ApiInputDataCollection] = None,
-        plugin_collector: Optional[PluginCollector] = None,
-        column_ordering: Optional[str] = None,
+        links: set[Link] | None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_input_data_collection: ApiInputDataCollection | None = None,
+        plugin_collector: PluginCollector | None = None,
+        column_ordering: str | None = None,
+        function_extender: set[Extender] | None = None,
+        run_id: str | None = None,
     ) -> None:
         # setup variables which track the primary sources and the compute platforms
+        self.function_extender = function_extender if function_extender is not None else set()
+        self.run_context = RunContext(run_id=run_id)
         # Holds the Feature objects ResolveComputeFrameworks.links rewrites: hash-stale after planning, so only read it before planning (as today).
         self.feature_group_collection: dict[type[FeatureGroup], set[Feature]] = defaultdict(set)
 
@@ -65,7 +83,7 @@ class Engine:
         self.accessible_plugins = PreFilterPlugins(compute_frameworks, plugin_collector).get_accessible_plugins()
         # get links
         LinkValidator.validate_links(links)
-        self.links = links
+        self.links = set(links) if links is not None else None
 
         # set api input collection if relevant
         self.api_input_data_collection = api_input_data_collection
@@ -82,6 +100,8 @@ class Engine:
         self._intake_options_memo: dict[tuple[type[FeatureGroup], int], tuple[Options, Options]] = {}
         # Declared (pre-default) options per surviving feature uuid, for default-equivalent merge warnings.
         self._declared_options_by_uuid: dict[UUID, Options] = {}
+        # Per feature uuid, _handle_input_features_recursion's result (None: root; injected filter/index: no entry).
+        self.resolved_input_feature_names: dict[UUID, frozenset[str] | None] = {}
         self.resolution_records: list[ResolutionRecord] = []
         self.execution_planner = self.create_setup_execution_plan(features)
         self.tfs_connection_map = self._resolve_tfs_connection_map()
@@ -105,7 +125,11 @@ class Engine:
                 connection_map[cfw_class] = conn
         return connection_map
 
-    def compute(self, flight_server: Optional[ParallelRunnerFlightServer] = None) -> ExecutionOrchestrator:
+    def get_function_extender(self, hook: ExtenderHook) -> Extender | None:
+        """Select the extender(s) registered for hook, delegating to the shared free function."""
+        return get_function_extender(self.function_extender, hook)
+
+    def compute(self, flight_server: ParallelRunnerFlightServer | None = None) -> ExecutionOrchestrator:
         execution_plan_copy = deepcopy(self.execution_planner)
         orchestrator = ExecutionOrchestrator(
             execution_plan_copy,
@@ -147,7 +171,9 @@ class Engine:
             # Setup still shifts a stored hash: a copied option Feature reaches the host's Feature via child_options.
             self.global_filter.rehash_stored_filters()
 
-        execution_planner = ExecutionPlan(self.global_filter, self.api_input_data_collection)
+        execution_planner = ExecutionPlan(
+            self.global_filter, self.api_input_data_collection, self.resolved_input_feature_names
+        )
         execution_planner.create_execution_plan(
             planned_queue,
             graph,
@@ -156,14 +182,24 @@ class Engine:
         )
         return execution_planner
 
-    def setup_features_recursion(self, features: Features, requested: bool = True) -> None:
+    def setup_features_recursion(self, features: Features, requested: bool = True, depth: int = 0) -> None:
+        # Register every sibling's own link before processing any, so index injection and feature-group
+        # resolution see the whole batch regardless of order. Does not cover a link nested in a
+        # co-sibling's input_features() subtree (see xfail
+        # test_same_class_feature_link_nested_in_co_siblings_input_features_is_not_seen_in_time): only
+        # index injection could defer that way, since identify_feature_group.py's
+        # _filter_feature_group_by_links gate runs during resolution itself, before recursion completes.
         for feature in features:
-            self._process_feature(feature, features, requested)
+            self.add_feature_link_to_links(feature)
+        for feature in features:
+            self._process_feature(feature, features, requested, depth)
 
-    def _process_feature(self, feature: Feature, features: Features, requested: bool) -> None:
+    def _process_feature(self, feature: Feature, features: Features, requested: bool, depth: int = 0) -> None:
         """Processes a single feature by delegating tasks to helper methods."""
 
-        feature_group_class, compute_frameworks, result = self._identify_feature_group_and_frameworks(feature)
+        # Feature-group matchers write into the options; those writes are never the feature's own declaration.
+        feature.options.lock_own_keys()
+        feature_group_class, compute_frameworks, result = self._identify_feature_group_and_frameworks(feature, depth)
         self.resolution_records.append(ResolutionRecord(str(feature.name), requested, result))
         self._warn_on_dual_option_consumption(feature, feature_group_class)
         feature_group = feature_group_class()
@@ -178,8 +214,13 @@ class Engine:
 
         if added:
             parent_domain = feature.domain.name if feature.domain else None
-            self._handle_input_features_recursion(
-                feature_group_class, feature.uuid, declared_options, feature.name, parent_domain=parent_domain
+            self.resolved_input_feature_names[feature.uuid] = self._handle_input_features_recursion(
+                feature_group_class,
+                feature.uuid,
+                declared_options,
+                feature.name,
+                parent_domain=parent_domain,
+                depth=depth,
             )
 
         if self.global_filter:
@@ -237,18 +278,65 @@ class Engine:
             )
 
     def _identify_feature_group_and_frameworks(
-        self, feature: Feature
+        self, feature: Feature, depth: int = 0
     ) -> tuple[type[FeatureGroup], set[type[ComputeFramework]], EvaluationResult]:
         """Identify the winning feature group via the shared helper; on failure it raises the enriched error."""
-        result = resolve_or_raise(
-            feature,
-            self.accessible_plugins,
-            self.links,
-            self.data_access_collection,
-            partial_records=self.resolution_records,
-        )
+        extender = self.get_function_extender(ExtenderHook.FEATURE_GROUP_MATCHED)
+        if extender is None:
+            result = resolve_or_raise(
+                feature,
+                self.accessible_plugins,
+                self.links,
+                self.data_access_collection,
+                partial_records=self.resolution_records,
+            )
+        else:
+            result = self._resolve_with_match_hook(extender, feature, depth)
         feature_group_class, compute_frameworks = next(iter(result.identified.items()))
         return feature_group_class, compute_frameworks, result
+
+    def _resolve_with_match_hook(self, extender: Extender, feature: Feature, depth: int) -> EvaluationResult:
+        """Dispatch resolve_or_raise through extender, instrumenting the call with a HookContext.
+        feature_group_class is only known once resolve_or_raise returns, so the context starts with a placeholder and is written post-hoc."""
+        verified = current_verified_context()
+        context = HookContext(
+            hook=ExtenderHook.FEATURE_GROUP_MATCHED,
+            feature_group_class="",
+            feature_group_version="",
+            plugin_version=None,
+            feature_names=(str(feature.name),),
+            input_features=None,
+            compute_framework_name="",
+            run_id=self.run_context.run_id,
+            carrier=None,
+            tenant_id=verified.tenant_id if verified else None,
+            project_id=verified.project_id if verified else None,
+            principal=verified.principal if verified else None,
+            worker_index=None,
+            plan_feature_count=len(self.resolution_records) + 1,
+            plan_node_count=len(self.feature_group_collection),
+            plan_depth=depth,
+        )
+
+        def _resolve(*args: Any, **kwargs: Any) -> EvaluationResult:
+            result = resolve_or_raise(*args, **kwargs)
+            winner = next(iter(result.identified.items()))[0]
+            context.feature_group_class = f"{winner.__module__}.{winner.__qualname__}"
+            return result
+
+        with context.activate():
+            return cast(
+                EvaluationResult,
+                _invoke_extender(
+                    extender,
+                    instrument(context, _resolve, row_count=_no_match_rows),
+                    feature,
+                    self.accessible_plugins,
+                    self.links,
+                    self.data_access_collection,
+                    partial_records=self.resolution_records,
+                ),
+            )
 
     def _add_index_feature(
         self,
@@ -267,6 +355,21 @@ class Engine:
         for index in indexes:
             self._process_index_feature(feature_group_class, feature_group, feature, features, index)
 
+    def _link_sides(self, link: Link, feature_group_class: type[FeatureGroup], feature: Feature) -> tuple[bool, bool]:
+        """Sides match by class or subclass; discriminators narrow only when the class matches both sides."""
+        left = issubclass(feature_group_class, link.left_feature_group)
+        right = issubclass(feature_group_class, link.right_feature_group)
+
+        if left and right:
+            left = link.left_discriminator is None or Link.matches_discriminator(
+                link.left_discriminator, feature.options
+            )
+            right = link.right_discriminator is None or Link.matches_discriminator(
+                link.right_discriminator, feature.options
+            )
+
+        return left, right
+
     def _add_index_feature_from_links(
         self,
         feature_group_class: type[FeatureGroup],
@@ -283,19 +386,21 @@ class Engine:
         for link in self.links:
             if link.jointype in (JoinType.APPEND, JoinType.UNION):
                 continue
-            if link.left_feature_group == feature_group_class and feature_name_str in link.left_index.index:
+            left, right = self._link_sides(link, feature_group_class, feature)
+            if left and feature_name_str in link.left_index.index:
                 return
-            if link.right_feature_group == feature_group_class and feature_name_str in link.right_index.index:
+            if right and feature_name_str in link.right_index.index:
                 return
 
         for link in self.links:
             if link.jointype in (JoinType.APPEND, JoinType.UNION):
                 continue
-            if link.left_feature_group == feature_group_class:
+            left, right = self._link_sides(link, feature_group_class, feature)
+            if left:
                 self._create_and_add_index_feature(
                     feature_group_class, feature_group, feature, features, link.left_index
                 )
-            if link.right_feature_group == feature_group_class:
+            if right:
                 self._create_and_add_index_feature(
                     feature_group_class, feature_group, feature, features, link.right_index
                 )
@@ -313,10 +418,11 @@ class Engine:
             return
 
         for link in self.links:
-            if link.left_feature_group == feature_group_class and link.left_index == index:
+            left, right = self._link_sides(link, feature_group_class, feature)
+            if left and link.left_index == index:
                 self._create_and_add_index_feature(feature_group_class, feature_group, feature, features, index)
 
-            if link.right_feature_group == feature_group_class and link.right_index == index:
+            if right and link.right_index == index:
                 self._create_and_add_index_feature(feature_group_class, feature_group, feature, features, index)
 
     def _create_and_add_index_feature(
@@ -368,16 +474,18 @@ class Engine:
         if feature.link is None:
             return
 
-        if self.links is None:
-            self.links = {feature.link}
-        else:
-            self.links.add(feature.link)
+        if self.links is not None and feature.link in self.links:
+            return
+
+        candidate = {feature.link} if self.links is None else self.links | {feature.link}
+        LinkValidator.validate_links(candidate)
+        self.links = candidate
 
     def add_feature_to_collection(
         self,
         feature_group_class: type[FeatureGroup],
         feature: Feature,
-        child_uuid: Optional[UUID],
+        child_uuid: UUID | None,
         if_index_feature: bool = False,
     ) -> bool:
         # Materialize declared defaults at intake: default-equivalent twins become equal and merge
@@ -402,6 +510,9 @@ class Engine:
         existing_feature = next((f for f in feature_collection if feature == f), None)
 
         if existing_feature is not None:
+            existing_feature.options.union_own_keys(feature.options)
+            for name, keys in feature.consumer_attributions:
+                existing_feature.add_consumer_attribution(name, keys)
             self._warn_on_default_equivalent_merge(feature, declared_options, existing_feature)
             # Propagate the requested flag: filter twins must not displace requested output columns (issue #712).
             if feature.initial_requested_data and not existing_feature.initial_requested_data:
@@ -445,8 +556,9 @@ class Engine:
         uuid: UUID,
         options: Options,
         feature_name: FeatureName,
-        parent_domain: Optional[str] = None,
-    ) -> None:
+        parent_domain: str | None = None,
+        depth: int = 0,
+    ) -> frozenset[str] | None:
         """Handles recursion for input features of a feature group."""
         feature_group = feature_group_class()
 
@@ -457,19 +569,20 @@ class Engine:
         except NotImplementedError:  # This means, it is a root feature.
             input_features = None
 
-        if input_features:
-            features = Features(
-                list(input_features), child_options=options, child_uuid=uuid, parent_domain=parent_domain
-            )
-            consumer_name = feature_group_class.get_class_name()
-            consumer_property_keys = self._property_mapping_keys(feature_group_class)
-            for input_feature in features.collection:
-                forwarded_declared_keys = input_feature.forwarded_group_keys & consumer_property_keys
-                input_feature.add_consumer_attribution(consumer_name, forwarded_declared_keys)
-            if features.child_uuid is None:
-                raise ValueError(f"Features {features} has no parent uuid although it should have one.")
-            self.feature_link_parents[features.child_uuid] = features.parent_uuids
-            self.setup_features_recursion(features, requested=False)
+        if not input_features:
+            return None
+
+        features = Features(list(input_features), child_options=options, child_uuid=uuid, parent_domain=parent_domain)
+        consumer_name = feature_group_class.get_class_name()
+        consumer_property_keys = self._property_mapping_keys(feature_group_class)
+        for input_feature in features.collection:
+            forwarded_declared_keys = input_feature.forwarded_group_keys & consumer_property_keys
+            input_feature.add_consumer_attribution(consumer_name, forwarded_declared_keys)
+        if features.child_uuid is None:
+            raise ValueError(f"Features {features} has no parent uuid although it should have one.")
+        self.feature_link_parents[features.child_uuid] = features.parent_uuids
+        self.setup_features_recursion(features, requested=False, depth=depth + 1)
+        return frozenset(str(f.name) for f in features.collection)
 
     def set_compute_framework(self, feature: Feature, compute_frameworks: set[type[ComputeFramework]]) -> Feature:
         """
@@ -485,7 +598,7 @@ class Engine:
             feature.compute_frameworks = compute_frameworks
         return feature
 
-    def set_data_type(self, feature: Feature, feature_group_class: type[FeatureGroup]) -> Optional[DataType]:
+    def set_data_type(self, feature: Feature, feature_group_class: type[FeatureGroup]) -> DataType | None:
         fg_data_type = feature_group_class.return_data_type_rule(feature)
         if feature.data_type and fg_data_type:
             if feature.data_type != fg_data_type:

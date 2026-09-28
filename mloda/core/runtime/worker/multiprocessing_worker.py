@@ -9,6 +9,7 @@ from uuid import UUID
 from queue import Empty
 
 from mloda.core.abstract_plugins.components.error_utils import internal_invariant_error
+from mloda.core.abstract_plugins.components.utils import contained_raise_reason, safe_exc_str
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.core.cfw_manager import CfwManager
 from mloda.core.core.step.feature_group_step import FeatureGroupStep
@@ -25,20 +26,23 @@ def _handle_stop_command(command_queue: multiprocessing.Queue[Any]) -> None:
         command_queue.put("STOP", block=False)
 
 
+def _close_extenders(cfw: ComputeFramework) -> None:
+    """A raising extender's close() must not stop the others from running."""
+    for extender in getattr(cfw, "function_extender", None) or ():
+        try:
+            extender.close()
+        except Exception as e:
+            logger.error("Extender %s.close() %s", extender.__class__.__name__, contained_raise_reason(e))
+
+
 def _handle_data_dropping(
     command_queue: multiprocessing.Queue[Any],
     cfw: ComputeFramework,
     command: set[Any],
     location: str,
-    result_queue: multiprocessing.Queue[Any],
 ) -> bool:
     """Handles dropping already calculated data based on the provided command."""
-    data_to_drop = cfw.add_already_calculated_children_and_drop_if_possible(command, location)
-
-    # Signal completion back to main thread
-    result_queue.put(("DROP_COMPLETE", cfw.uuid), block=False)
-
-    if data_to_drop is True:
+    if cfw.add_already_calculated_children_and_drop_if_possible(command, location) is True:
         _handle_stop_command(command_queue)
         return True
     return False
@@ -49,12 +53,12 @@ def _execute_command(
     cfw_register: CfwManager,
     cfw: ComputeFramework,
     data: Any,
-    from_cfw: UUID,
+    from_cfw: UUID | None,
 ) -> Any:
     """Executes a given command based on its type."""
     if isinstance(command, JoinStep):
         # Destination framework here, because it is already transformed beforehand
-        from_cfw = cfw_register.get_cfw_uuid(command.destination_framework.get_class_name(), command.link.uuid)  # type: ignore[assignment]
+        from_cfw = cfw_register.get_cfw_uuid(command.destination_framework.get_class_name(), command.link.uuid)
 
         if from_cfw is None:
             from_cfw = cfw_register.get_cfw_uuid(
@@ -67,13 +71,14 @@ def _execute_command(
     if isinstance(command, TransformFrameworkStep):
         # from cfw is not None, if the TFS is done due to a join
         if from_cfw is None:
+            if command.source_framework_uuid is None:
+                raise ValueError(f"source_framework_uuid should not be none: {command}")
             from_cfw = cfw_register.get_cfw_uuid(
                 command.from_framework.get_class_name(),
                 command.source_framework_uuid,
             )
 
     data = command.execute(cfw_register, cfw, data=data, from_cfw=from_cfw)
-    cfw_register.add_column_names_to_cf_uuid(cfw.uuid, cfw.get_column_names())
     return data
 
 
@@ -107,7 +112,8 @@ def worker(
     result_queue: multiprocessing.Queue[Any],
     cfw_register: CfwManager,
     cfw: ComputeFramework,
-    from_cfw: UUID,
+    from_cfw: UUID | None,
+    worker_index: int = 0,
 ) -> None:
     data = None
     location = cfw_register.get_location()
@@ -116,48 +122,76 @@ def worker(
         error_out(cfw_register, command_queue)
         return
 
-    while True:
-        try:
-            command = command_queue.get(block=False)  # Waits up to 10 seconds
-        except Empty:
-            time.sleep(0.01)
-            continue
+    cfw.worker_index = worker_index
 
-        if command == "STOP":
-            break
+    try:
+        bootstrap = cfw_register.get_run_context().child_bootstrap
+        if bootstrap is not None:
+            try:
+                bootstrap()
+            except Exception as e:
+                error_message = f"An error occurred: {safe_exc_str(e)}"
+                msg = f"{error_message}\nFull traceback:\n{traceback.format_exc()}"
+                exc_info = traceback.format_exc()
+                if cfw_register:
+                    try:
+                        cfw_register.set_error(msg, exc_info, exception=e)
+                    except Exception:
+                        # exception not picklable across the manager proxy; degrade to string-only
+                        cfw_register.set_error(msg, exc_info)
 
-        if isinstance(command, set):
-            if _handle_data_dropping(command_queue, cfw, command, location, result_queue):
+                _handle_stop_command(command_queue)
+                return
+
+        while True:
+            try:
+                command = command_queue.get(block=False)
+            except Empty:
+                # Lets an orphaned worker exit on its own if its parent dies (e.g. SIGKILL).
+                # Only checked here at poll time, so a command already in progress runs to
+                # completion before this loop is reached again (best-effort, not preemptive).
+                parent = multiprocessing.parent_process()
+                if parent is not None and not parent.is_alive():
+                    break
+                time.sleep(0.01)
+                continue
+
+            if command == "STOP":
                 break
-            continue
 
-        try:
-            data = _execute_command(command, cfw_register, cfw, data, from_cfw)
-            _handle_command_result(command, cfw, location, data, result_queue)
+            if isinstance(command, set):
+                if _handle_data_dropping(command_queue, cfw, command, location):
+                    break
+                continue
 
-        except Exception as e:
-            error_message = f"An error occurred: {e}"
-            msg = f"{error_message}\nFull traceback:\n{traceback.format_exc()}"
-            logging.error(msg)
-            exc_info = traceback.format_exc()
-            if cfw_register:
-                try:
-                    cfw_register.set_error(msg, exc_info, exception=e)
-                except Exception:
-                    # The exception object is not picklable across the manager
-                    # proxy; degrade to the string-only path (surfaces as MlodaRunError)
-                    # rather than let this raise and skip the STOP below (which would hang the run).
-                    cfw_register.set_error(msg, exc_info)
+            try:
+                data = _execute_command(command, cfw_register, cfw, data, from_cfw)
+                _handle_command_result(command, cfw, location, data, result_queue)
 
-            _handle_stop_command(command_queue)
-            break
+            except Exception as e:
+                error_message = f"An error occurred: {safe_exc_str(e)}"
+                msg = f"{error_message}\nFull traceback:\n{traceback.format_exc()}"
+                exc_info = traceback.format_exc()
+                if cfw_register:
+                    try:
+                        cfw_register.set_error(msg, exc_info, exception=e)
+                    except Exception:
+                        # The exception object is not picklable across the manager
+                        # proxy; degrade to the string-only path (surfaces as MlodaRunError)
+                        # rather than let this raise and skip the STOP below (which would hang the run).
+                        cfw_register.set_error(msg, exc_info)
 
-        time.sleep(0.0001)
+                _handle_stop_command(command_queue)
+                break
+
+            time.sleep(0.0001)
+    finally:
+        _close_extenders(cfw)
 
 
 def error_out(cfw_register: CfwManager, command_queue: multiprocessing.Queue[Any]) -> None:
     msg = """This is a critical error, the location should not be None."""
-    logging.error(msg)
+    logger.error(msg)
     exc_info = traceback.format_exc()
     if cfw_register:
         cfw_register.set_error(msg, exc_info)

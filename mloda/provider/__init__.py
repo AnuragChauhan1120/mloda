@@ -22,9 +22,13 @@
 from mloda.core.abstract_plugins.feature_group import FeatureGroup as FeatureGroup
 
 # Versioning
-from mloda.core.abstract_plugins.components.base_feature_group_version import BaseFeatureGroupVersion
+from mloda.core.abstract_plugins.components.base_feature_group_version import (
+    BaseFeatureGroupVersion,
+    ThirdPartyVersionMode,
+)
 from mloda.core.version import get_mloda_version
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework as ComputeFramework
+from mloda.core.abstract_plugins.hook_context import OutputSchema as OutputSchema
 from mloda.core.abstract_plugins.compute_framework import EmptyResultError as EmptyResultError
 
 # Utilities
@@ -92,6 +96,7 @@ from mloda.core.abstract_plugins.components.property_spec import (
 # Match rejection recording
 from mloda.core.abstract_plugins.components.match_rejection import (
     INPUT_DATA_STAGE,
+    NAME_STAGE,
     record_match_rejection,
 )
 
@@ -107,6 +112,9 @@ from mloda.core.abstract_plugins.plugin_registry.plugin_registry import (
     PluginRegistryCollisionError,
     register_plugin,
 )
+
+# Optional-dependency import guards
+from mloda.core.abstract_plugins.plugin_loader.plugin_loader import traceback_blames_root
 
 # Engines
 from mloda.core.filter.filter_engine import BaseFilterEngine
@@ -130,7 +138,9 @@ __all__ = [
     "FeatureGroup",
     # Versioning
     "BaseFeatureGroupVersion",
+    "ThirdPartyVersionMode",
     "ComputeFramework",
+    "OutputSchema",
     "EmptyResultError",
     # Utilities
     "HashableDict",
@@ -179,6 +189,7 @@ __all__ = [
     "NO_DEFAULT",
     # Match rejection recording
     "INPUT_DATA_STAGE",
+    "NAME_STAGE",
     "record_match_rejection",
     # Subtype declaration
     "SubtypeDeclaration",
@@ -188,6 +199,8 @@ __all__ = [
     # Plugin registry
     "PluginRegistryCollisionError",
     "register_plugin",
+    # Optional-dependency import guards
+    "traceback_blames_root",
     # Engines
     "BaseFilterEngine",
     "BaseMaskEngine",

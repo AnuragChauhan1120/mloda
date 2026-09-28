@@ -1,5 +1,7 @@
+import contextlib
 from copy import deepcopy
-from typing import Any, Generator, Optional
+from dataclasses import replace
+from typing import Any, Callable, Generator
 
 from mloda.core.abstract_plugins.components.input_data.api.api_input_data_collection import (
     ApiInputDataCollection,
@@ -29,12 +31,15 @@ from mloda.core.filter.global_filter import GlobalFilter
 from mloda.core.runtime.run import ExecutionOrchestrator
 from mloda.core.abstract_plugins.compute_framework import ComputeFramework
 from mloda.core.abstract_plugins.function_extender import Extender
+from mloda.core.abstract_plugins.run_context import RunContext
+from mloda.core.abstract_plugins.verified_context import current_verified_context
 from mloda.core.abstract_plugins.components.data_access_collection import DataAccessCollection
 from mloda.core.abstract_plugins.components.parallelization_modes import ParallelizationMode
 from mloda.core.abstract_plugins.components.feature_collection import Features
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.link import Link
 from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
+from mloda.core.runtime.run_id import generate_run_id
 
 
 class SetupConfigurationError(ValueError):
@@ -55,16 +60,17 @@ class mlodaAPI:
     def __init__(
         self,
         requested_features: Features | list[Feature | str],
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
     ) -> None:
         # Setup boundary: any invalid request argument surfaces as the typed error before planning.
         try:
@@ -78,10 +84,18 @@ class mlodaAPI:
             _requested_features = deepcopy(requested_features) if copy_features else requested_features
 
             # Handle api_data: create ApiInputDataCollection if api_data provided
-            api_input_data_collection: Optional[ApiInputDataCollection] = None
+            api_input_data_collection: ApiInputDataCollection | None = None
             if api_data is not None and len(api_data) > 0:
                 api_input_data_collection = ApiInputDataCollection()
+                column_owner: dict[str, str] = {}
                 for key_name, key_data in api_data.items():
+                    for column in key_data:
+                        if column in column_owner:
+                            raise ValueError(
+                                f"Column '{column}' appears in api_data sets '{column_owner[column]}' and "
+                                f"'{key_name}'; column names must be unique across sets."
+                            )
+                        column_owner[column] = key_name
                     api_input_data_collection.setup_key_class(key_name, list(key_data.keys()))
 
             self.strict_type_enforcement = strict_type_enforcement
@@ -95,6 +109,7 @@ class mlodaAPI:
             self.api_input_data_collection = api_input_data_collection
             self.api_data = api_data
             self.plugin_collector = plugin_collector
+            self.function_extender = function_extender
         except SetupConfigurationError:
             raise
         except ValueError as error:
@@ -102,19 +117,22 @@ class mlodaAPI:
 
         self.runner: None | ExecutionOrchestrator = None
         self.engine: None | Engine = None
+        self.run_id = generate_run_id()
 
         self.engine = self._create_engine()
 
     def _process_features(
         self,
         requested_features: Features | list[Feature | str],
-        api_input_data_collection: Optional[ApiInputDataCollection],
+        api_input_data_collection: ApiInputDataCollection | None,
     ) -> Features:
         """Processes the requested features, ensuring they are in the correct format and adding API input data."""
         features = requested_features if isinstance(requested_features, Features) else Features(requested_features)
 
         for feature in features:
             feature.initial_requested_data = True
+            # Framework stamps below are never the feature's own declaration.
+            feature.options.lock_own_keys()
             self._add_api_input_data(feature, api_input_data_collection)
             # Propagate strict_type_enforcement to typed features only
             if self.strict_type_enforcement and feature.data_type is not None:
@@ -126,18 +144,20 @@ class mlodaAPI:
     def run_all(
         cls,
         features: Features | list[Feature | str],
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
-        function_extender: Optional[set[Extender]] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
+        column_ordering: str | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
     ) -> RunResult:
         """
         Run feature computation in one step.
@@ -156,18 +176,24 @@ class mlodaAPI:
                 one input source (e.g. ``"CustomerData"``). During feature
                 resolution, columns listed under a KeyName are matched to
                 requested features by name. Multiple KeyNames allow passing
-                independent datasets in a single call.
+                independent datasets in a single call. Each set returns its own
+                result frame (order not guaranteed); a column name shared by two
+                sets raises ``SetupConfigurationError``.
             plugin_collector: Plugin collector.
             copy_features: Whether to deep copy features (default True).
             strict_type_enforcement: If True, enforce strict type matching for typed features.
+            carrier: Opaque W3C trace-context carrier dict, forwarded to every ``HookContext``.
+            child_bootstrap: Picklable, no-argument callable run once in a spawned
+                MULTIPROCESSING worker before it processes its first command.
 
         Returns:
-            ``RunResult``, a list of computed results, one per feature group in
-            execution plan order. Each element is a compute-framework object
+            ``RunResult``, a list of computed results, one per feature group, in ``result.plan``
+            order. Each element is a compute-framework object
             (e.g. ``pd.DataFrame``, ``pa.Table``) containing only the columns
             for the requested features resolved by that group. When all
             requested features resolve to a single group, the list has one
-            element. ``result.plan`` exposes the resolved plan of this run.
+            element. ``result.plan`` exposes the resolved plan of this run, and
+            ``result.frames()`` pairs each result with the ``PlanStep`` that produced it.
 
         Example:
             result = mloda.run_all(
@@ -187,40 +213,49 @@ class mlodaAPI:
             strict_type_enforcement=strict_type_enforcement,
             column_ordering=column_ordering,
             parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
         )
         results = session.run(
             api_data=api_data,
             parallelization_modes=parallelization_modes,
             flight_server=flight_server,
             function_extender=function_extender,
+            carrier=carrier,
+            child_bootstrap=child_bootstrap,
         )
-        return RunResult(results, session.resolved_plan())
+        result_items = session.runner.get_result_items() if session.runner is not None else None
+        return RunResult(results, session.resolved_plan(), result_items)
 
     @classmethod
     def stream_all(
         cls,
         features: Features | list[Feature | str],
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
-        function_extender: Optional[set[Extender]] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
+        column_ordering: str | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
     ) -> ResultStream:
         """Stream results at feature-group granularity.
 
         Like ``run_all`` but yields each feature group's result as it completes.
-        ``list(stream_all(...))`` equals ``run_all(...)``. Planning happens eagerly
-        at the call; the returned ``ResultStream`` exposes ``plan`` before iteration.
+        ``list(stream_all(...))`` carries the same elements as ``run_all(...)``. Planning happens
+        eagerly at the call; the returned ``ResultStream`` exposes ``plan`` before iteration.
+        ``carrier``/``child_bootstrap`` behave as in ``run_all``. Unlike ``run_all``, it yields in
+        completion order, which can differ from ``run_all``'s plan order under THREADING/MULTIPROCESSING.
 
         Returns:
-            ``ResultStream`` yielding one complete result per feature group.
+            ``ResultStream`` yielding one complete result per feature group; ``stream.frames()`` pairs each
+            result with the ``PlanStep`` that produced it.
         """
         session = cls.prepare(
             features,
@@ -234,14 +269,19 @@ class mlodaAPI:
             strict_type_enforcement=strict_type_enforcement,
             column_ordering=column_ordering,
             parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
         )
         # Planning is eager in prepare, so the plan snapshot is available before iteration.
         return ResultStream(
-            session.stream_run(
+            session._start_stream(
                 api_data=api_data,
                 parallelization_modes=parallelization_modes,
                 flight_server=flight_server,
                 function_extender=function_extender,
+                artifacts=None,
+                carrier=carrier,
+                child_bootstrap=child_bootstrap,
+                with_step_uuids=True,
             ),
             session.resolved_plan(),
         )
@@ -250,16 +290,17 @@ class mlodaAPI:
     def prepare(
         cls,
         features: Features | list[Feature | str],
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
     ) -> "mlodaAPI":
         """Build an execution plan without running it.
 
@@ -278,6 +319,7 @@ class mlodaAPI:
             strict_type_enforcement=strict_type_enforcement,
             column_ordering=column_ordering,
             parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
         )
 
     @classmethod
@@ -285,16 +327,17 @@ class mlodaAPI:
         cls,
         features: Features | list[Feature | str],
         *,
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
     ) -> list[PlanStep]:
         """Resolve the execution plan without executing it.
 
@@ -319,6 +362,7 @@ class mlodaAPI:
             strict_type_enforcement=strict_type_enforcement,
             column_ordering=column_ordering,
             parallelization_modes=parallelization_modes,
+            function_extender=function_extender,
         )
         return session.resolved_plan()
 
@@ -327,18 +371,19 @@ class mlodaAPI:
         cls,
         features: Features | list[Feature | str],
         *,
-        compute_frameworks: set[type[ComputeFramework]] | Optional[list[str]] = None,
-        links: Optional[set[Link]] = None,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        global_filter: Optional[GlobalFilter] = None,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
-        plugin_collector: Optional[PluginCollector] = None,
+        compute_frameworks: set[type[ComputeFramework]] | list[str] | None = None,
+        links: set[Link] | None = None,
+        data_access_collection: DataAccessCollection | None = None,
+        global_filter: GlobalFilter | None = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
+        plugin_collector: PluginCollector | None = None,
         copy_features: bool = True,
         strict_type_enforcement: bool = False,
-        column_ordering: Optional[str] = None,
-        parallelization_modes: Optional[set[ParallelizationMode]] = None,
+        column_ordering: str | None = None,
+        parallelization_modes: set[ParallelizationMode] | None = None,
+        function_extender: set[Extender] | None = None,
     ) -> ResolutionDiagnosis:
-        """Non-raising whole-request resolution preflight.
+        """Whole-request resolution preflight that does not raise on resolution or setup failures.
 
         Runs the same eager planning as prepare() but projects the outcome instead of raising: on success
         records equals resolution_report() with complete True; on a resolution failure records holds the
@@ -348,7 +393,8 @@ class mlodaAPI:
         column_ordering or an unknown compute framework name) yields only the message. Environment-build
         failures (EnvironmentPreconditionError, RedefinitionConflictError, FrameworkDeclarationError) and
         compute-framework pin misuse (ComputeFrameworkPinError) are likewise projected into the diagnosis
-        instead of raising; any other error propagates. Every parameter after features is keyword-only.
+        instead of raising; any other error propagates, including an exception a breaking extender raises unless
+        it is one of the types above. Every parameter after features is keyword-only.
         """
         try:
             session = cls(
@@ -363,6 +409,7 @@ class mlodaAPI:
                 strict_type_enforcement=strict_type_enforcement,
                 column_ordering=column_ordering,
                 parallelization_modes=parallelization_modes,
+                function_extender=function_extender,
             )
         except FeatureResolutionError as error:
             return ResolutionDiagnosis(
@@ -401,13 +448,37 @@ class mlodaAPI:
             raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
         return deepcopy(self.engine.resolution_records)
 
+    def _build_run_context(
+        self,
+        carrier: dict[str, str] | None,
+        child_bootstrap: Callable[[], None] | None,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> RunContext:
+        """Derive this run's context from the engine's plan-time base."""
+        if self.engine is None:
+            raise ValueError("Internal error: engine not initialized. This is likely a bug in mloda.")
+        verified = current_verified_context()
+        return replace(
+            self.engine.run_context,
+            run_id=self.run_id,
+            carrier=carrier,
+            child_bootstrap=child_bootstrap,
+            graceful_shutdown_timeout=graceful_shutdown_timeout,
+            tenant_id=verified.tenant_id if verified else None,
+            project_id=verified.project_id if verified else None,
+            principal=verified.principal if verified else None,
+        )
+
     def run(
         self,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
-        function_extender: Optional[set[Extender]] = None,
-        artifacts: Optional[dict[str, Any]] = None,
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
     ) -> list[Any]:
         """Execute the prepared session and return results.
 
@@ -420,45 +491,125 @@ class mlodaAPI:
                 When provided, feature groups with matching artifact names
                 switch to load mode for this run, enabling train-then-predict
                 workflows without re-preparing.
+            carrier/child_bootstrap: See ``run_all``. Unlike ``run_id`` (minted once per
+                session), ``carrier`` may differ on each ``run()`` call.
+            graceful_shutdown_timeout: Seconds a MULTIPROCESSING worker gets to run its
+                extenders' ``close()`` before being terminated, shared across every extender in
+                that worker.
         """
         runner = self._batch_run(
-            parallelization_modes, flight_server, function_extender, api_data=api_data, artifacts=artifacts
+            parallelization_modes,
+            flight_server,
+            function_extender,
+            api_data=api_data,
+            artifacts=artifacts,
+            run_context=self._build_run_context(carrier, child_bootstrap, graceful_shutdown_timeout),
         )
         self.runner = runner
         return self.get_result()
 
     def stream_run(
         self,
-        api_data: Optional[dict[str, dict[str, Any]]] = None,
+        api_data: dict[str, dict[str, Any]] | None = None,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
-        function_extender: Optional[set[Extender]] = None,
-        artifacts: Optional[dict[str, Any]] = None,
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        carrier: dict[str, str] | None = None,
+        child_bootstrap: Callable[[], None] | None = None,
+        graceful_shutdown_timeout: float = 2.0,
     ) -> Generator[Any, None, None]:
-        """Execute the prepared session and yield each feature group's result as it completes."""
+        """Execute the prepared session and yield each feature group's result as it completes.
+
+        carrier/child_bootstrap and the active verified_context() scope are read here, at call
+        time, not at first iteration: a function whose body itself contains ``yield`` only starts
+        executing on first iteration, which would defer that read past the caller's intended scope.
+        """
+        return self._start_stream(
+            api_data,
+            parallelization_modes,
+            flight_server,
+            function_extender,
+            artifacts,
+            carrier,
+            child_bootstrap,
+            with_step_uuids=False,
+            graceful_shutdown_timeout=graceful_shutdown_timeout,
+        )
+
+    def _start_stream(
+        self,
+        api_data: dict[str, dict[str, Any]] | None,
+        parallelization_modes: set[ParallelizationMode],
+        flight_server: Any | None,
+        function_extender: set[Extender] | None,
+        artifacts: dict[str, Any] | None,
+        carrier: dict[str, str] | None,
+        child_bootstrap: Callable[[], None] | None,
+        with_step_uuids: bool,
+        graceful_shutdown_timeout: float = 2.0,
+    ) -> Generator[Any, None, None]:
+        """Eager setup for ``stream_run``/``stream_all``; no yield, so carrier/verified_context read at call time."""
         _api_data = api_data if api_data is not None else self.api_data
         runner = self._setup_engine_runner(parallelization_modes, flight_server)
+        run_context = self._build_run_context(carrier, child_bootstrap, graceful_shutdown_timeout)
+        return self._stream_run_results(
+            runner, parallelization_modes, function_extender, _api_data, artifacts, run_context, with_step_uuids
+        )
+
+    def _stream_run_results(
+        self,
+        runner: ExecutionOrchestrator,
+        parallelization_modes: set[ParallelizationMode],
+        function_extender: set[Extender] | None,
+        api_data: dict[str, dict[str, Any]] | None,
+        artifacts: dict[str, Any] | None,
+        run_context: RunContext,
+        with_step_uuids: bool,
+    ) -> Generator[Any, None, None]:
+        """Deferred half of ``stream_run``: iterating this is what actually drives computation."""
+        # Assign self.runner before the yield loop so that get_result()/get_artifacts()
+        # remain accessible even when the consumer exits early (break / next()).
+        # Previously this line lived after the loop, which meant an early exit left
+        # self.runner unset and both methods raised "You need to run any run function
+        # beforehand." despite teardown having completed successfully in `finally`.
+        self.runner = runner
         try:
-            self._enter_runner_context(runner, parallelization_modes, function_extender, _api_data, artifacts=artifacts)
-            for _step_uuid, result in runner.compute_stream():
-                yield result
+            self._enter_runner_context(
+                runner,
+                parallelization_modes,
+                function_extender,
+                api_data,
+                artifacts=artifacts,
+                run_context=run_context,
+            )
+            with contextlib.closing(runner.compute_stream()) as stream:
+                for step_uuid, result in stream:
+                    yield (step_uuid, result) if with_step_uuids else result
         finally:
             self._exit_runner_context(runner)
-        self.runner = runner
 
     def _batch_run(
         self,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
-        function_extender: Optional[set[Extender]] = None,
-        api_data: Optional[dict[str, Any]] = None,
-        artifacts: Optional[dict[str, Any]] = None,
+        flight_server: Any | None = None,
+        function_extender: set[Extender] | None = None,
+        api_data: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
     ) -> ExecutionOrchestrator:
         """Sets up the engine runner and runs the engine computation."""
         # Use stored api_data if not explicitly provided
         _api_data = api_data if api_data is not None else self.api_data
         runner = self._setup_engine_runner(parallelization_modes, flight_server)
-        self._run_engine_computation(runner, parallelization_modes, function_extender, _api_data, artifacts=artifacts)
+        self._run_engine_computation(
+            runner,
+            parallelization_modes,
+            function_extender,
+            _api_data,
+            artifacts=artifacts,
+            run_context=run_context,
+        )
         self.runner = runner
         return runner
 
@@ -466,16 +617,24 @@ class mlodaAPI:
         self,
         runner: ExecutionOrchestrator,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        function_extender: Optional[set[Extender]] = None,
-        api_data: Optional[dict[str, Any]] = None,
-        artifacts: Optional[dict[str, Any]] = None,
+        function_extender: set[Extender] | None = None,
+        api_data: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
     ) -> None:
         """Runs the engine computation within a context manager."""
         if not isinstance(runner, ExecutionOrchestrator):
             raise ValueError("Internal error: execution orchestrator not initialized. This is likely a bug in mloda.")
 
         try:
-            self._enter_runner_context(runner, parallelization_modes, function_extender, api_data, artifacts=artifacts)
+            self._enter_runner_context(
+                runner,
+                parallelization_modes,
+                function_extender,
+                api_data,
+                artifacts=artifacts,
+                run_context=run_context,
+            )
             runner.compute()
         finally:
             self._exit_runner_context(runner)
@@ -484,19 +643,24 @@ class mlodaAPI:
         self,
         runner: ExecutionOrchestrator,
         parallelization_modes: set[ParallelizationMode],
-        function_extender: Optional[set[Extender]],
-        api_data: Optional[dict[str, Any]],
-        artifacts: Optional[dict[str, Any]] = None,
+        function_extender: set[Extender] | None,
+        api_data: dict[str, Any] | None,
+        artifacts: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
     ) -> None:
         """Enters the runner context with strict-mode-filtered extenders."""
+        function_extender = function_extender if function_extender is not None else self.function_extender
         function_extender = filter_extenders_by_strict_mode(function_extender, self.plugin_collector)
-        runner.__enter__(parallelization_modes, function_extender, api_data, artifacts)
+        if run_context is None:
+            run_context = self._build_run_context(None, None)
+        runner.__enter__(parallelization_modes, function_extender, api_data, artifacts, run_context)
 
     def _exit_runner_context(self, runner: ExecutionOrchestrator) -> None:
         """Exits the runner context."""
         runner.__exit__(None, None, None)
 
     def _create_engine(self) -> Engine:
+        function_extender = filter_extenders_by_strict_mode(self.function_extender, self.plugin_collector)
         engine = Engine(
             self.features,
             self.compute_framework,
@@ -506,6 +670,8 @@ class mlodaAPI:
             self.api_input_data_collection,
             self.plugin_collector,
             column_ordering=self.column_ordering,
+            function_extender=function_extender,
+            run_id=self.run_id,
         )
         if not isinstance(engine, Engine):
             raise ValueError("Engine initialization failed.")
@@ -514,7 +680,7 @@ class mlodaAPI:
     def _setup_engine_runner(
         self,
         parallelization_modes: set[ParallelizationMode] = {ParallelizationMode.SYNC},
-        flight_server: Optional[Any] = None,
+        flight_server: Any | None = None,
     ) -> ExecutionOrchestrator:
         """Sets up the engine runner based on parallelization mode."""
         if self.engine is None:
@@ -543,9 +709,7 @@ class mlodaAPI:
             raise ValueError("You need to run any run function beforehand.")
         return self.runner.get_artifacts()
 
-    def _add_api_input_data(
-        self, feature: Feature, api_input_data_collection: Optional[ApiInputDataCollection]
-    ) -> None:
+    def _add_api_input_data(self, feature: Feature, api_input_data_collection: ApiInputDataCollection | None) -> None:
         """Adds API input data to the feature options if available."""
         if api_input_data_collection:
             api_input_data_column_names = api_input_data_collection.get_column_names()

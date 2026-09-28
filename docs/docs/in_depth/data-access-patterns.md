@@ -33,7 +33,7 @@ from mloda.provider import BaseInputData, FeatureGroup, FeatureSet
 
 class ReadFileFeature(FeatureGroup):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return ReadFile()  # BaseInputData implementation
     
     @classmethod
@@ -47,7 +47,7 @@ class ReadFileFeature(FeatureGroup):
 
 ### Common BaseInputData Implementations
 - **ReadFile**: For structured file-based data loading (see [access-feature-data](access-feature-data.md#global-scope-data-access))
-- **ReadDocument**: For unstructured document loading (Markdown, YAML, text). Skips file types owned by ReadFile by default.
+- **ReadDocument**: For unstructured document loading (Markdown `.md`, YAML `.yaml`/`.yml`, text `.text`/`.txt`/`.TXT`). Skips file types owned by ReadFile by default.
 - **DataCreator**: For generating synthetic data (see [access-feature-data](access-feature-data.md#data-creator))
 - **ApiInputData**: For runtime data injection (see [access-feature-data](access-feature-data.md#apidata))
 - **ReadDB**: For database-backed loading
@@ -60,6 +60,8 @@ Each reader family exposes a recommended hook seam. Overriding `load_data` whole
 - **ReadDocument**: implement `produce_document` and `suffix`; optionally `document_file_type`.
 - **ReadFile**: override `load_data` wholesale to return the table. `CsvReader` resolves to a `FileSource` descriptor that the target compute framework materializes into its native type.
 
+Override `data_access_identity` to publish a richer identity than the default.
+
 CSV inference semantics are defined by pyarrow's default CSV reader; the stdlib reader behind PythonDict follows it. Types are inferred per column: null tokens (pyarrow's default set, e.g. `NA`, `NaN`, `null`) become `None` in an int/float/bool column but stay literal text in a string column, a column of only empty cells and/or null tokens is all-`None`, and an int column with a value outside signed int64 range degrades entirely to float.
 
 The stdlib reader does not yet cover pyarrow's full surface. Where they differ, a column pyarrow types stays a string column in PythonDict: dates, timestamps and times, whitespace-padded numbers (`" 1 "`), `inf`/`infinity`, uppercase `NAN` (the float value, not the `NaN` null token), hex literals (`0x1f`), and a `true`/`1` mix (pyarrow reads `1`/`0` as bools too).
@@ -69,6 +71,14 @@ Readers are classified structurally; no reader code is executed for classificati
 **Warning**: classification is structural (declared is overridden), so an intermediate base that re-declares a hook or `load_data` with a bare `raise NotImplementedError` body is classified as a final reader and enters discovery. Intermediate bases must not re-declare bare hooks; re-anchor the family by declaring `_final_reader_requires` instead.
 
 `_final_reader_requires` is underscore-named but is a stable, documented extension point for third-party reader families.
+
+### Column discovery
+
+`BaseInputData.describe_columns(data_access) -> dict[str, DataType | None]` maps column name to `DataType` (`None` where unknown). It raises `NotImplementedError` when a reader can't enumerate columns, and `ImportError` when a backend it needs is missing; a missing or unreadable source raises `OSError` or `ValueError`. `ReadFile` supplies a family default wrapping `get_column_names` with unknown types and accepting a `str` or `Path` data access (anything else raises `ValueError`); `ParquetReader`, `FeatherReader`, and `OrcReader` override it to report the types stored in the file's own schema, and `JsonReader` the types pyarrow infers while parsing. `SQLITEReader` overrides it too, from SQLite's declared (unenforced) column types; it needs `data_access["table_name"]` already set, e.g. `{"sqlite": path, "table_name": "customers"}`.
+
+### Row counts
+
+`BaseInputData.count_rows(data_access, compute_framework) -> int | None` returns the row count of `data_access` without loading it, or `None` when only a read can tell (the default); it raises `ImportError` when a backend it needs is missing, and `OSError`/`ValueError` for a non-path, missing, or unreadable source. `ParquetReader`, `OrcReader`, and `FeatherReader` count from file metadata for every compute framework; `CsvReader` only under PythonDict, since other frameworks read CSV through pyarrow, whose row split can differ. A subclass overriding `load_data` gets `None` unless it also overrides `count_rows`. The count is of `data_access` itself, not of the step's output: filters, extenders, and feature-group logic may change what the step actually reports.
 
 ### Selecting among sibling readers
 
@@ -80,7 +90,7 @@ Feature("value", options={UbaAirReader.__name__: url})
 
 The reader class itself is also accepted as the key, e.g. `Feature("value", options={UbaAirReader: url})`; it is normalized to the class-name string when the Options object is constructed, so both forms are one identity.
 
-The matched `(ReaderClass, data_access)` pair is stored under the reserved `"BaseInputData"` options key and consumed by `init_reader` at load time.
+The matched `(ReaderClass, data_access)` pair is stored under the reserved `"BaseInputData"` options key and consumed by `init_reader` at load time; `PlanStep.reader_data_access` exposes the same pair on a resolved plan. `data_access` may hold credentials, so use `reader.data_access_identity(data_access)` for display and logs.
 
 For non-file sources such as HTTP endpoints, subclassing `ReadFile` and overriding `match_subclass_data_access` plus `load_data` is a supported pattern; on that path `suffix()` is never consulted (it is inert). `ApiInputData` injects in-memory data passed through the API request and is not an HTTP client.
 
@@ -141,11 +151,13 @@ The recorded decline renders as a near-miss line of the resolution failure:
 Rules for reader authors:
 
 - Record only when ownership is established but the content fails: right suffix but a missing column, valid credentials but a declined feature.
-- Plain non-matches (wrong suffix, invalid credentials) stay silent. `NotImplementedError` from `is_valid_credentials` is a silent non-match; from `check_feature_in_data_access` it is an accept (the reader matches on credentials alone).
-- Never raise to decline: anything but `NotImplementedError` in the DB match hooks aborts matching for every reader sharing the `DataAccessCollection`. Record, then return a falsy value.
+- Plain non-matches (wrong suffix, invalid credentials) stay silent. An unmarked `NotImplementedError` from `is_valid_credentials` is a silent non-match; from `check_feature_in_data_access` it is an accept for a plain name (the reader matches on credentials alone). A raise marked with `escalate_match_abort` propagates instead of being read as a non-match.
+- Never raise to decline: anything but an unmarked `NotImplementedError` in the DB match hooks aborts matching for every reader sharing the `DataAccessCollection`. Record, then return a falsy value.
 - Recording outside an engine-opened window is a no-op, so readers stay usable standalone.
 - Recorded reasons are discarded at the enclosing candidate level: when the reader ultimately matches, when a sibling reader matches, or, for unowned recordings, when the feature group matches by another rule. An owned veto instead gates the name-based rules (see the paragraph below). Only a decline surfaces them.
 - Name the reader and the concrete input in the reason, as the example does. Any label works as the owner name, an overridden `data_access_name()` included, but it must be distinct among the reader's own decline points: the first recording per owner wins, so a later reason under a name already used in the same window is dropped and never reaches the owned stage.
+- A `ReadFile` subclass that cannot enumerate columns (no `get_column_names` override, or one raising `NotImplementedError` or `ImportError`), and a `ReadDB` subclass that does not override `check_feature_in_data_access`, decline a chain- or column-separated feature name while matching. A `ReadDocument` subclass declines such a name on a `DataAccessCollection` (not on a `str` or `Path` access), since a document reader has no columns to confirm such a name. An explicit `column_to_file` pin is exempt; for `ReadDB`, overriding the hook opts out.
+- In `ReadFile` matching, an unpinned file whose columns cannot be read (`OSError`, `ValueError`) is declined with a recorded reason, so a shipped file reader needs the file to be readable when features resolve. A pinned file that cannot be read raises instead of falling back to another file. Any other exception from `get_column_names` ends reader selection for that feature group candidate, so no sibling reader is tried (the engine contains it as a non-match for that candidate); a raise marked with `escalate_match_abort` propagates out of matching.
 
 `ReadFile` column validation and the `ReadDB` feature check (`check_feature_in_data_access`) already record automatically; a custom reader only needs this for its own decline points.
 
@@ -184,8 +196,8 @@ class DuckDBFeatureGroup(FeatureGroup, MatchData):
         cls,
         feature_name: str,
         options: Options,
-        data_access_collection: Optional[DataAccessCollection] = None,
-        framework_connection_object: Optional[Any] = None,
+        data_access_collection: DataAccessCollection | None = None,
+        framework_connection_object: Any | None = None,
     ) -> Any:
         # Logic to determine if this matcher handles DuckDB connections
         if framework_connection_object and isinstance(framework_connection_object, duckdb.DuckDBPyConnection):
@@ -198,6 +210,11 @@ class DuckDBFeatureGroup(FeatureGroup, MatchData):
             )
         return None
 ```
+
+### Connection Forwarding
+- The connection value forwards to input features like any other option, including across a same-class chain (an upstream feature resolved by the same MatchData class as its consumer).
+- Both entry points (`global_scope_data_access` and `feature_scope_data_access`) mark the class-name key non-forwarded for pickling, without blocking normal option flow.
+- Pickling an `Options` with a marked key (multiprocessing preflight or a worker handoff) drops that key from the snapshot, so MatchData features stay safe in mixed SYNC/MULTIPROCESSING runs even though the connection itself can't be pickled. In-process reads are unaffected.
 
 ## Key Differences
 
@@ -228,14 +245,14 @@ BaseInputData and MatchData serve **different purposes** and are used in **diffe
 ```py
 class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         # BaseInputData for general data loading
         return ReadFile()
 
     @classmethod
     def match_data_access(cls, feature_name: str, options: Options,
-                         data_access_collection: Optional[DataAccessCollection] = None,
-                         framework_connection_object: Optional[Any] = None) -> Any:
+                         data_access_collection: DataAccessCollection | None = None,
+                         framework_connection_object: Any | None = None) -> Any:
         # MatchData for connection object matching
         if framework_connection_object and isinstance(framework_connection_object, duckdb.DuckDBPyConnection):
             return framework_connection_object
@@ -252,7 +269,7 @@ class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
 ```py
 class CsvProcessingFeature(FeatureGroup):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return ReadFile()  # BaseInputData handles file reading
 ```
 
@@ -264,7 +281,7 @@ class CsvProcessingFeature(FeatureGroup):
 ```py
 class DuckDBAnalyticsFeature(FeatureGroup, MatchData):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return ReadFile()  # BaseInputData for data loading
 
     @classmethod
@@ -283,7 +300,7 @@ For database connection patterns, see [Framework Connection Object](framework-co
 ```py
 class SyntheticDataFeature(FeatureGroup):
     @classmethod
-    def input_data(cls) -> Optional[BaseInputData]:
+    def input_data(cls) -> BaseInputData | None:
         return DataCreator({"synthetic_data"})  # BaseInputData for data creation
 ```
 

@@ -1,3 +1,5 @@
+import configparser
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -161,13 +163,14 @@ class TestExtrasConsistency:
 class TestRuffConfig:
     """Validate that ruff lint rules enforce modern Python typing conventions."""
 
-    def test_up006_and_up007_rules_configured(self) -> None:
-        """UP006 (PEP 585 builtins) and UP007 (PEP 604 unions) must be enforced."""
+    def test_modern_typing_rules_configured(self) -> None:
+        """UP006 (PEP 585 builtins), UP007 (PEP 604 unions), and UP045 (PEP 604 Optional rewrite) must be enforced."""
         with open(PROJECT_ROOT / "pyproject.toml", "rb") as f:
             data: dict[str, Any] = tomllib.load(f)
         extend_select = data.get("tool", {}).get("ruff", {}).get("lint", {}).get("extend-select", [])
         assert "UP006" in extend_select, "ruff must enforce UP006 (use builtin generics instead of typing generics)"
-        assert "UP007" in extend_select, "ruff must enforce UP007 (use X | Y instead of Union/Optional)"
+        assert "UP007" in extend_select, "ruff must enforce UP007 (use X | Y instead of Union)"
+        assert "UP045" in extend_select, "ruff must enforce UP045 (use X | None instead of Optional)"
 
     def test_no_redundant_typing_generics_in_source(self) -> None:
         """Source files must not import redundant typing generics that UP006/UP007 replace."""
@@ -184,6 +187,20 @@ class TestRuffConfig:
                     if found:
                         violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{i} imports {found}")
         assert not violations, "Redundant typing imports found:\n" + "\n".join(violations)
+
+    def test_no_optional_typing_usage_in_source(self) -> None:
+        """Source and test files must not use Optional-style annotations that UP045 replaces."""
+        needle = "Optional" + "["
+        source_dirs = [PROJECT_ROOT / "mloda", PROJECT_ROOT / "mloda_plugins", PROJECT_ROOT / "tests"]
+        violations: list[str] = []
+        for source_dir in source_dirs:
+            for py_file in source_dir.rglob("*.py"):
+                for i, line in enumerate(_read_text(py_file).splitlines(), start=1):
+                    if needle in line:
+                        violations.append(f"{py_file.relative_to(PROJECT_ROOT)}:{i}")
+        assert not violations, f"Found {len(violations)} {needle}...] usages (showing up to 20):\n" + "\n".join(
+            violations[:20]
+        )
 
 
 class TestPackagingConfig:
@@ -205,3 +222,33 @@ class TestPackagingConfig:
         assert "build-system" in data, "pyproject.toml must have a [build-system] section"
         assert "requires" in data["build-system"], "pyproject.toml [build-system] must specify 'requires'"
         assert "build-backend" in data["build-system"], "pyproject.toml [build-system] must specify 'build-backend'"
+
+
+class TestToxConfig:
+    """Validate the tox settings the CI and release workflows depend on."""
+
+    TOX_INSTALL = re.compile(r"\binstall\b.*(?<![\w-])tox(?![\w-])")
+    TOX_PIN = re.compile(r"uv tool install tox==\S+ --with tox-uv==\S+$")
+
+    def test_tox_opts_out_of_venv_redirect(self) -> None:
+        """tox >= 4.64 otherwise writes a .venv redirect file that makes the release job's `uv lock` fail."""
+        parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+        assert parser.read(PROJECT_ROOT / "tox.ini", encoding="utf-8"), "tox.ini not found"
+        assert not parser.getboolean("tox", "venv_redirect", fallback=True), (
+            "tox.ini must set `venv_redirect = false` under [tox]"
+        )
+
+    def test_workflows_pin_the_same_tox(self) -> None:
+        pins: dict[str, set[str]] = {}
+        for workflow in sorted((PROJECT_ROOT / ".github" / "workflows").glob("*.y*ml")):
+            for line in _read_text(workflow).splitlines():
+                command = line.strip()
+                if command.startswith("#") or not self.TOX_INSTALL.search(command):
+                    continue
+                match = self.TOX_PIN.search(command)
+                assert match, (
+                    f"{workflow.name} must install `uv tool install tox==X --with tox-uv==Y`, found: {command}"
+                )
+                pins.setdefault(workflow.name, set()).add(match.group(0))
+        assert {"ci.yaml", "release.yaml"} <= pins.keys(), f"ci.yaml and release.yaml must install tox: {pins}"
+        assert len(set().union(*pins.values())) == 1, f"workflows must install the same tox and tox-uv: {pins}"

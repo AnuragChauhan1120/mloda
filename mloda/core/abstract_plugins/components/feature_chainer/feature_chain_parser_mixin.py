@@ -39,11 +39,11 @@ first (during property mapping validation) on each parsed element, then
 element, the match fails with a ``ValueError`` before ``match_guard`` is
 reached.
 
-A guard rejection on a spec that also sets ``strict_validation=True`` is
-reportable: the match pass records it as it happens, and the recorded reason
-feeds the resolution-failure report. ``_strict_validation_rejection_reason``
-remains a standalone diagnostic facade producing the same message. A guard on
-a non-strict spec keeps its "not mine" meaning and reports nothing.
+A guard rejection on a spec that also sets ``strict_validation=True``, or that declares
+``expected``, is reportable: the match pass records it as it happens, and the recorded
+reason feeds the resolution-failure report. ``_strict_validation_rejection_reason``
+remains a standalone diagnostic facade producing the same message. A guard on a
+non-strict spec with no ``expected`` keeps its "not mine" meaning and reports nothing.
 
 Validators must be pure functions with no side effects. They may be called
 multiple times during feature group resolution (once per candidate feature
@@ -56,8 +56,9 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import reprlib
 from collections.abc import Callable
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 from mloda.core.abstract_plugins.components.feature import Feature
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
@@ -67,6 +68,7 @@ from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_author
     install_required_when_guard,
     validate_name_binding,
     warn_captureless_without_binding,
+    warn_missing_in_features_declaration,
     warn_universal_optional_matcher,
 )
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import (
@@ -77,7 +79,7 @@ from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser
     option_key_is_present,
 )
 from mloda.core.abstract_plugins.components.match_rejection import record_match_rejection
-from mloda.core.abstract_plugins.components.property_spec import PropertySpec
+from mloda.core.abstract_plugins.components.property_spec import PropertySpec, is_no_default
 from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
 from mloda.core.abstract_plugins.components.utils import (
     contained_raise_log_level,
@@ -106,7 +108,9 @@ class FeatureChainParserMixin:
     - PREFIX_PATTERN or SUFFIX_PATTERN: Regex patterns for matching
     - PROPERTY_MAPPING: Property validation mapping (see docs/in_depth/property-mapping.md)
     - IN_FEATURE_SEPARATOR: Optional custom separator (default: "&")
-    - MIN_IN_FEATURES: Optional minimum in_feature count (default: 1)
+    - MIN_IN_FEATURES: Optional minimum in_feature count (default: 1);
+      a group with no in_features key in PROPERTY_MAPPING and a minimum of 1 draws a definition-time warning
+      (exempt: a name pattern, an input_features override, a custom matcher)
     - MAX_IN_FEATURES: Optional maximum in_feature count (default: None)
     - RECOGNITION_ONLY_PATTERN: Optional marker for a recognition-only pattern that binds no key
       from the name (all values come from options); default False (#772)
@@ -139,11 +143,11 @@ class FeatureChainParserMixin:
 
     IN_FEATURE_SEPARATOR: str = INPUT_SEPARATOR
     MIN_IN_FEATURES: int = 1
-    MAX_IN_FEATURES: Optional[int] = None
+    MAX_IN_FEATURES: int | None = None
     # A recognition-only pattern binds no key from the name; all values come from options (#772).
     RECOGNITION_ONLY_PATTERN: bool = False
-    # An all-optional PROPERTY_MAPPING that inherits the config matcher matches any feature name with
-    # empty options; set True to declare that universal match intentional and silence the #771 warning.
+    # An all-optional PROPERTY_MAPPING that inherits the config matcher matches any feature name once
+    # in_features supplies a source; set True to declare that universal match intentional and silence the #771 warning.
     ALLOW_UNIVERSAL_MATCHER: bool = False
     # The column-wise hooks a family's calculate_feature calls; a family base declares it so its
     # framework implementations can be checked against it with missing_columnwise_hooks below.
@@ -158,6 +162,7 @@ class FeatureChainParserMixin:
         install_name_path_presence_guard(cls)
         install_required_when_guard(cls)
         warn_universal_optional_matcher(cls)
+        warn_missing_in_features_declaration(cls, FeatureChainParserMixin)
 
     @classmethod
     def _validate_string_match(cls, _feature_name: str, _operation_config: str, _in_feature: str) -> bool:
@@ -174,7 +179,7 @@ class FeatureChainParserMixin:
         """
         return True
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> Optional[set[Feature]]:
+    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         """
         Parse input features from feature name or options.
 
@@ -262,7 +267,8 @@ class FeatureChainParserMixin:
         Also enforces MIN_IN_FEATURES / MAX_IN_FEATURES, counting the sources the name
         carries when it identifies the group, else the in_features option value. A
         name-carried count outside the range is recorded as a reportable rejection; an
-        in_features option value the matcher cannot resolve is a silent non-match.
+        in_features option value the matcher cannot resolve is a silent non-match. An
+        absent in_features counts as zero on the configuration path.
 
         ``required_when`` is NOT evaluated here. The guard installed at class definition
         runs the predicates after this method (or any override of it) returns True.
@@ -364,15 +370,15 @@ class FeatureChainParserMixin:
 
         1. A ValueError raised by option-value validation (a strict_validation rejection). Present
            option values are validated on both match paths, the string-named one included.
-        2. A match_guard rejection on a spec that also declares strict_validation, which the match
-           path turns into a silent non-match.
+        2. A match_guard rejection on a spec that also declares strict_validation or ``expected``,
+           which the match path would otherwise turn into a silent non-match.
 
-        A guard on a non-strict spec means "this feature group does not match", not "this value is
-        wrong", so it stays unreported. A ValueError raised while parsing a PREFIX_PATTERN match
-        (malformed feature name, no chain separator) is a parse error, not an option-value
-        rejection, and is likewise nothing to report. Returns None when nothing was rejected (the
-        match succeeded, or the candidate is unrelated). Diagnostic-only: does not affect
-        match_feature_group_criteria's behavior.
+        A guard on a non-strict spec with no ``expected`` means "this feature group does not
+        match", not "this value is wrong", so it stays unreported. A ValueError raised while
+        parsing a PREFIX_PATTERN match (malformed feature name, no chain separator) is a parse
+        error, not an option-value rejection, and is likewise nothing to report. Returns None
+        when nothing was rejected (the match succeeded, or the candidate is unrelated).
+        Diagnostic-only: does not affect match_feature_group_criteria's behavior.
         """
         property_mapping = cls._get_property_mapping()
         if property_mapping is None:
@@ -418,9 +424,7 @@ class FeatureChainParserMixin:
             return None
 
         key, value = rejection
-        if not property_mapping[key].strict_validation:
-            return None
-        return f"Property value '{value}' rejected by match_guard for '{key}'"
+        return cls._guard_rejection_reason(key, value, property_mapping[key])
 
     @classmethod
     def _validate_forwarded_name_mismatch(
@@ -510,6 +514,25 @@ class FeatureChainParserMixin:
         return None
 
     @classmethod
+    def _guard_rejection_reason(cls, key: str, value: Any, spec: PropertySpec) -> str | None:
+        """The reportable reason for a guard rejection of ``key``/``value``, or ``None`` if unreportable.
+
+        Shared by the match-time recorder and the diagnostic facade, so the two text sources cannot drift.
+        """
+        if spec.expected is not None:
+            if type(value) in (str, int, float, bool):
+                shown = f"{type(value).__name__} {reprlib.repr(value)}"
+            elif value is None:
+                shown = "None"
+            else:
+                # No value text: a composite can hold data the caller should not see.
+                shown = type(value).__name__
+            return f"option '{key}' must be {spec.expected}, got {shown}"
+        if spec.strict_validation:
+            return f"Property value '{value}' rejected by match_guard for '{key}'"
+        return None
+
+    @classmethod
     def _validate_match_guards(
         cls, result: bool, options: Options, property_mapping: dict[str, PropertySpec] | None
     ) -> bool:
@@ -523,8 +546,10 @@ class FeatureChainParserMixin:
 
         key, value = rejection
         logger.debug("match_guard for '%s' rejected value %r", key, value)
-        if property_mapping is not None and property_mapping[key].strict_validation:
-            record_match_rejection(cls.__name__, f"Property value '{value}' rejected by match_guard for '{key}'")
+        if property_mapping is not None:
+            reason = cls._guard_rejection_reason(key, value, property_mapping[key])
+            if reason is not None:
+                record_match_rejection(cls.__name__, reason)
         return False
 
     @classmethod
@@ -550,9 +575,16 @@ class FeatureChainParserMixin:
 
         in_features_raw = options.get(DefaultOptionKeys.in_features)
         if in_features_raw is None:
-            return True
-        if isinstance(in_features_raw, (list, tuple, set, frozenset)) and not in_features_raw:
-            # Present but empty: zero in_features, a non-match rather than an error.
+            property_mapping = cls._get_property_mapping()
+            declared = property_mapping.get(DefaultOptionKeys.in_features.value) if property_mapping else None
+            if declared is not None and not is_no_default(declared.default) and declared.default is not None:
+                # A declared in_features default is supplied at intake, so the group keeps matching without it.
+                return True
+
+        if in_features_raw is None or (
+            isinstance(in_features_raw, (list, tuple, set, frozenset)) and not in_features_raw
+        ):
+            # None counts as absent; absent or empty is zero in_features, a non-match rather than an error.
             count = 0
         else:
             # An in_features value this matcher cannot count is a non-match, not an error:
@@ -572,11 +604,7 @@ class FeatureChainParserMixin:
                 )
                 return False
 
-        if count < cls.MIN_IN_FEATURES:
-            return False
-        if cls.MAX_IN_FEATURES is not None and count > cls.MAX_IN_FEATURES:
-            return False
-        return True
+        return cls._in_feature_count_reason(feature_name, count) is None
 
     @classmethod
     def _get_prefix_patterns(cls) -> list[Any]:
@@ -587,10 +615,10 @@ class FeatureChainParserMixin:
         return FeatureChainParser.prefix_patterns_of(cls)
 
     @classmethod
-    def _get_property_mapping(cls) -> Optional[dict[str, PropertySpec]]:
+    def _get_property_mapping(cls) -> dict[str, PropertySpec] | None:
         """Get property mapping from class attribute."""
         if hasattr(cls, "PROPERTY_MAPPING"):
-            return cast(Optional[dict[str, PropertySpec]], cls.PROPERTY_MAPPING)
+            return cast(dict[str, PropertySpec] | None, cls.PROPERTY_MAPPING)
         return None
 
     @classmethod
@@ -622,11 +650,28 @@ class FeatureChainParserMixin:
         return [f.name for f in in_features_set]
 
     @classmethod
+    def _extract_single_source_feature(cls, feature: Feature) -> str:
+        """Single-source counterpart to ``_extract_source_features``; always enforces exactly one result.
+
+        Raises:
+            ValueError: if the resolved source count is not exactly one
+        """
+        source_features = cls._extract_source_features(feature)
+        reason = cls._in_feature_count_reason(feature.name, len(source_features))
+        if reason is not None:
+            raise ValueError(reason)
+        if len(source_features) != 1:
+            raise ValueError(
+                f"Feature '{feature.name}' resolved {len(source_features)} source feature(s), expected exactly 1"
+            )
+        return source_features[0]
+
+    @classmethod
     def _extract_operation_and_source_feature(
         cls, feature: Feature, extract_fn: Callable[[Feature], Any], label: str
     ) -> tuple[Any, str]:
         """
-        Extract an operation parameter and the primary source feature name from a feature.
+        Extract the primary source feature name and an operation parameter from a feature.
 
         Args:
             feature: The feature to extract parameters from
@@ -637,21 +682,21 @@ class FeatureChainParserMixin:
             Tuple of (operation_value, source_feature_name)
 
         Raises:
-            ValueError: If the operation value cannot be extracted
+            ValueError: if the source count isn't exactly one, or the operation can't be extracted
         """
-        source_features = cls._extract_source_features(feature)
+        source_feature = cls._extract_single_source_feature(feature)
         operation = extract_fn(feature)
         if operation is None:
             raise ValueError(f"Could not extract {label} from: {feature.name}")
-        return operation, source_features[0]
+        return operation, source_feature
 
     @classmethod
     def _resolve_operation(
         cls,
         feature_or_name: Any,
         options_or_key: Any,
-        config_key: Optional[str] = None,
-    ) -> Optional[str]:
+        config_key: str | None = None,
+    ) -> str | None:
         """Resolve the operation type from either a chained feature name or options.
 
         Many feature groups need to extract an operation type (e.g. aggregation type,

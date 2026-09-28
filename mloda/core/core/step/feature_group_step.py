@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID, uuid4
 from mloda.core.abstract_plugins.components.base_artifact import BaseArtifact
 from mloda.core.abstract_plugins.components.input_data.api.base_api_data import BaseApiData
@@ -17,7 +17,7 @@ class FeatureGroupStep(Step):
         features: FeatureSet,
         required_uuids: set[UUID],
         compute_framework: type[ComputeFramework],
-        children_if_root: Optional[set[UUID]] = None,
+        children_if_root: set[UUID] | None = None,
         api_input_data: BaseApiData | bool = False,
     ) -> None:
         if children_if_root is None:
@@ -35,7 +35,6 @@ class FeatureGroupStep(Step):
 
         self.need_to_upload = False
 
-        # Currently, also used for joinsteps without tfs. This might be a bug.
         self.tfs_ids: set[UUID] = set()
 
     def get_uuids(self) -> set[UUID]:
@@ -45,9 +44,9 @@ class FeatureGroupStep(Step):
         self,
         cfw_register: CfwManager,
         cfw: ComputeFramework,
-        from_cfw: Optional[ComputeFramework | UUID] = None,  # Not used in this implementation
-        data: Optional[Any] = None,
-    ) -> Optional[Any]:
+        from_cfw: ComputeFramework | UUID | None = None,  # Not used in this implementation
+        data: Any | None = None,
+    ) -> Any | None:
         self.location = cfw_register.get_location()
 
         runtime_artifacts = cfw_register.get_runtime_artifacts()
@@ -65,12 +64,16 @@ class FeatureGroupStep(Step):
         if self.location:
             if self.need_to_upload:
                 if not isinstance(cfw.data, str):
+                    native = cfw.data
                     cfw.upload_finished_data(self.location)
+                    if cfw.mode is not ParallelizationMode.MULTIPROCESSING:
+                        # a same-process consumer or the result collector reads cfw.data next; keep it native
+                        cfw.set_data(native)
                 cfw_register.add_uuid_flyway_datasets(cfw.uuid, set(self.children_if_root))
             return data
         return None
 
-    def run_calculate_feature(self, cfw: ComputeFramework, data: Optional[Any] = None) -> Any:
+    def run_calculate_feature(self, cfw: ComputeFramework, data: Any | None = None) -> Any:
         if self.feature_group.calculate_feature is None:
             raise ValueError("FeatureGroup calculate_feature is not implemented")
 

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import inspect
 import logging
 import re
 from typing import Any
 
+from mloda.core.abstract_plugins.components.default_options_key import DefaultOptionKeys
 from mloda.core.abstract_plugins.components.feature_name import FeatureName
 from mloda.core.abstract_plugins.components.options import Options
 from mloda.core.abstract_plugins.components.feature_chainer.feature_chain_parser import (
@@ -36,20 +38,37 @@ from mloda.core.abstract_plugins.components.utils import (
 logger = logging.getLogger(__name__)
 
 # Marks a matcher that already carries the required_when guard, so it is never wrapped twice.
+# The VALUE is the wrapper itself (self-reference), which is why a functools.wraps copy onto
+# another function never reads as that function's own guard.
 REQUIRED_WHEN_GUARD_FLAG = "_mloda_required_when_guard"
 
 # Marks a matcher that already carries the name-path presence guard, so it is never wrapped twice.
+# The VALUE is the wrapper itself (self-reference), which is why a functools.wraps copy onto
+# another function never reads as that function's own guard.
 NAME_PATH_PRESENCE_GUARD_FLAG = "_mloda_name_path_presence_guard"
 
 # Marks a class whose captureless diagnostic already ran, so the two __init_subclass__ hooks
 # emit it at most once. Checked on the class's OWN dict so a subclass still evaluates fresh.
 CAPTURELESS_DIAGNOSTIC_FLAG = "_mloda_captureless_diagnostic_emitted"
 
+# Marks a class whose missing-in_features diagnostic already ran; a subclass of it skips the warning (once per hierarchy).
+MISSING_IN_FEATURES_DIAGNOSTIC_FLAG = "_mloda_missing_in_features_diagnostic_emitted"
+
+# The walk self-terminates at the first non-guard-wrapper function; this bound is a residual
+# defense against a hand-mutated __wrapped__ on an actual guard wrapper, not normal operation.
+_MAX_WRAPPED_HOPS = 16
+
+# Sentinel default for the guard-flag lookups below: unlike None, it can never equal a real
+# function, so a missing flag is never mistaken for a self-reference.
+_NO_GUARD_FLAG = object()
+
 # An unrelated feature name used to probe whether a matcher is universal: does it accept a name it
-# has no business matching, with empty options? It carries NO chain separator, so no
+# has no business matching, once in_features supplies a source? It carries NO chain separator, so no
 # PREFIX_PATTERN/SUFFIX_PATTERN can capture it and the resolved matcher falls through to the
 # configuration path, where the universal-matcher problem actually lives.
 _UNIVERSAL_MATCHER_PROBE_NAME = "mloda_universal_matcher_probe"
+# Supplied as in_features so the probe tests name-universality independent of the MIN_IN_FEATURES gate.
+_UNIVERSAL_MATCHER_PROBE_SOURCE = "mloda_universal_matcher_probe_source"
 
 # How many guards the current match call is nested in. A guarded matcher that delegates via super()
 # reaches the guard of its parent, and only the outermost one may evaluate the predicates.
@@ -177,10 +196,10 @@ def warn_universal_optional_matcher(owner: type[Any]) -> None:
     """Nudge authors whose all-optional PROPERTY_MAPPING inherits the universal configuration matcher (#771).
 
     With zero unconditionally required keys, the configuration path matches any feature name given
-    empty options. Warn unless the class opts in with ALLOW_UNIVERSAL_MATCHER = True. A key that is
-    unconditionally required, or conditionally required via required_when, gates the match, so the
+    a source supplied through in_features. Warn unless the class opts in with ALLOW_UNIVERSAL_MATCHER = True.
+    A key that is unconditionally required, or conditionally required via required_when, gates the match, so the
     mapping is not warned. Universality is confirmed behaviorally: the resolved matcher is called
-    with an unrelated, separator-free name and empty options, which exempts a genuine custom matcher
+    with an unrelated, separator-free name and a synthetic in_features source, which exempts a genuine custom matcher
     while still catching a pass-through override that delegates to the universal base.
     """
     if getattr(owner, "ALLOW_UNIVERSAL_MATCHER", False):
@@ -207,8 +226,10 @@ def warn_universal_optional_matcher(owner: type[Any]) -> None:
     if matcher is None:
         return
     # A matcher that raises on the probe is doing custom work, so it is not treated as universal.
+    sources = [f"{_UNIVERSAL_MATCHER_PROBE_SOURCE}_{i}" for i in range(max(getattr(owner, "MIN_IN_FEATURES", 1), 1))]
+    probe_options = Options(context={DefaultOptionKeys.in_features: sources})
     try:
-        universal = bool(matcher(_UNIVERSAL_MATCHER_PROBE_NAME, Options()))
+        universal = bool(matcher(_UNIVERSAL_MATCHER_PROBE_NAME, probe_options))
     except Exception as exc:
         # Text, not exc: a retained record must not pin the traceback, its frames and the plugin class.
         logger.debug(
@@ -221,9 +242,90 @@ def warn_universal_optional_matcher(owner: type[Any]) -> None:
         return
     logger.warning(
         "%s declares a PROPERTY_MAPPING with no unconditionally required key and inherits the "
-        "universal configuration matcher: with empty options it matches any feature name. Add a "
+        "universal configuration matcher: once in_features supplies a source it matches any feature name. Add a "
         "required key (a PropertySpec with no default, or a required_when predicate that fires), or "
         "set ALLOW_UNIVERSAL_MATCHER = True to declare the universal match intentional.",
+        owner.__name__,
+    )
+
+
+def _is_guard_wrapper(function: Any) -> bool:
+    """True when the function is one of this module's own guard wrappers, identified by self-reference."""
+    return (
+        getattr(function, REQUIRED_WHEN_GUARD_FLAG, _NO_GUARD_FLAG) is function
+        or getattr(function, NAME_PATH_PRESENCE_GUARD_FLAG, _NO_GUARD_FLAG) is function
+    )
+
+
+def _matcher_carries_guard(function: Any, flag_name: str) -> bool:
+    """True when function, or a guard wrapper it delegates to through ``__wrapped__``, already is that guard.
+
+    A class stacking two guards produces an outer wrapper whose OWN flag is the other guard's, so a
+    subclass that inherits the fully stacked matcher unchanged must still be recognized as already
+    carrying each guard by walking the chain, not just checking the immediate function's own flag.
+    """
+    current = function
+    for _ in range(_MAX_WRAPPED_HOPS):
+        if getattr(current, flag_name, _NO_GUARD_FLAG) is current:
+            return True
+        if not _is_guard_wrapper(current):
+            return False
+        inner = getattr(current, "__wrapped__", None)
+        if inner is None:
+            return False
+        current = inner
+    return False
+
+
+def _unwrapped_matcher_function(owner: type[Any]) -> Any:
+    """The function behind a class's resolved matcher, unwrapped while it is a guard wrapper.
+
+    Only hops while the current function is itself an installer-created guard wrapper, so a genuine
+    override that happens to carry its own unrelated ``__wrapped__`` is never followed past. The hop
+    count is bounded only as a residual defense against a hand-mutated ``__wrapped__``.
+    """
+    matcher = getattr(owner, "match_feature_group_criteria", None)
+    function = getattr(matcher, "__func__", matcher)
+    for _ in range(_MAX_WRAPPED_HOPS):
+        if not _is_guard_wrapper(function):
+            break
+        inner = getattr(function, "__wrapped__", None)
+        if inner is None:
+            break
+        function = inner
+    return function
+
+
+def warn_missing_in_features_declaration(owner: type[Any], mixin: type[Any]) -> None:
+    """Warn when a mixin group has no in_features key but keeps MIN_IN_FEATURES >= 1.
+
+    Silent if the group has a name pattern (the source can come from the name), overrides input_features or
+    the matcher, or a class above it already warned (once per hierarchy). Never raises.
+    """
+    property_mapping = getattr(owner, "PROPERTY_MAPPING", None)
+    if not isinstance(property_mapping, dict) or DefaultOptionKeys.in_features.value in property_mapping:
+        return
+    if not (hasattr(owner, "MIN_IN_FEATURES") and hasattr(owner, "MAX_IN_FEATURES")):
+        return
+    minimum = owner.MIN_IN_FEATURES
+    if not isinstance(minimum, int) or minimum < 1:
+        return
+    if FeatureChainParser.prefix_patterns_of(owner):
+        return
+    if getattr(owner, "input_features", None) is not getattr(mixin, "input_features", None):
+        return
+    if getattr(owner, "match_feature_group_criteria", None) is None:
+        return
+    if _unwrapped_matcher_function(owner) is not _unwrapped_matcher_function(mixin):
+        return
+    if any(klass.__dict__.get(MISSING_IN_FEATURES_DIAGNOSTIC_FLAG, False) for klass in owner.__mro__[1:]):
+        return
+    setattr(owner, MISSING_IN_FEATURES_DIAGNOSTIC_FLAG, True)
+    logger.warning(
+        "%s declares no in_features source contract and has no name pattern that could carry its source, so an "
+        "absent in_features counts as zero sources and it matches by options only when the caller passes "
+        "in_features. Set MIN_IN_FEATURES = 0 if the group is source-less, or declare an in_features key in "
+        "PROPERTY_MAPPING (with a default if it should match without one).",
         owner.__name__,
     )
 
@@ -335,6 +437,18 @@ def _reject_staticmethod_matcher(owner: type[Any]) -> None:
         return
 
 
+def _reject_descriptorless_matcher(owner: type[Any]) -> None:
+    """Reject a matcher with no classmethod/staticmethod descriptor (and not a bound method) on a guarded class."""
+    attr = inspect.getattr_static(owner, "match_feature_group_criteria", None)
+    if attr is None or isinstance(attr, (classmethod, staticmethod)) or inspect.ismethod(attr):
+        return
+    raise ValueError(
+        f"{owner.__name__} guards its match_feature_group_criteria, but it is a {type(attr).__name__} "
+        f"with no classmethod or staticmethod descriptor. Decorate it with @classmethod: the "
+        f"guard is installed as a classmethod and passes the class as the first argument."
+    )
+
+
 def install_required_when_guard(owner: type[Any]) -> None:
     """Wrap a class's RESOLVED matcher so its required_when predicates run whatever matcher it kept.
 
@@ -356,13 +470,14 @@ def install_required_when_guard(owner: type[Any]) -> None:
         return
 
     _reject_staticmethod_matcher(owner)
+    _reject_descriptorless_matcher(owner)
 
     matcher = getattr(owner, "match_feature_group_criteria", None)
     if matcher is None:
         return
 
     inner: Any = getattr(matcher, "__func__", matcher)
-    if getattr(inner, REQUIRED_WHEN_GUARD_FLAG, False):
+    if _matcher_carries_guard(inner, REQUIRED_WHEN_GUARD_FLAG):
         return
 
     @functools.wraps(inner)
@@ -393,7 +508,7 @@ def install_required_when_guard(owner: type[Any]) -> None:
         finally:
             REQUIRED_WHEN_GUARD_DEPTH.reset(token)
 
-    setattr(guarded, REQUIRED_WHEN_GUARD_FLAG, True)
+    setattr(guarded, REQUIRED_WHEN_GUARD_FLAG, guarded)
     setattr(owner, "match_feature_group_criteria", classmethod(guarded))
 
 
@@ -415,6 +530,8 @@ def install_name_path_presence_guard(owner: type[Any]) -> None:
     if not FeatureChainParser._name_path_missing_required_keys(Options(), property_mapping):
         return
 
+    _reject_descriptorless_matcher(owner)
+
     # Wrapping a staticmethod matcher would hide it from _reject_staticmethod_matcher, so the
     # required_when installer's existing definition-time ValueError keeps precedence.
     is_static = _matcher_is_staticmethod(owner)
@@ -428,7 +545,7 @@ def install_name_path_presence_guard(owner: type[Any]) -> None:
         return
 
     inner: Any = getattr(matcher, "__func__", matcher)
-    if getattr(inner, NAME_PATH_PRESENCE_GUARD_FLAG, False):
+    if _matcher_carries_guard(inner, NAME_PATH_PRESENCE_GUARD_FLAG):
         return
 
     @functools.wraps(inner)
@@ -474,5 +591,5 @@ def install_name_path_presence_guard(owner: type[Any]) -> None:
         finally:
             NAME_PATH_PRESENCE_GUARD_DEPTH.reset(token)
 
-    setattr(guarded, NAME_PATH_PRESENCE_GUARD_FLAG, True)
+    setattr(guarded, NAME_PATH_PRESENCE_GUARD_FLAG, guarded)
     setattr(owner, "match_feature_group_criteria", classmethod(guarded))

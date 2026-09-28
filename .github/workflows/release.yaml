@@ -3,6 +3,10 @@ name: Release
 on:
   workflow_dispatch:
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   github_release:
     name: GitHub Release
@@ -12,6 +16,7 @@ jobs:
     outputs:
       new_release_version: ${{ steps.semantic.outputs.new_release_version }}
       new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_sha: ${{ steps.release_sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,11 +36,16 @@ jobs:
           # unreviewed [skip ci] commit, so an unpinned uv could silently change the
           # lockfile format underneath that commit.
           python -m pip install uv==0.11.8
-          uv tool install tox --with tox-uv
+          # tox >= 4.64 writes a PEP 832 `.venv` redirect file after each run, and
+          # prepareCmd's `uv lock` fails on it ("expected directory but found a file").
+          # tox.ini opts out with `venv_redirect = false`; the setting is provisional, so
+          # recheck the tox changelog before bumping. Keep in sync with ci.yaml.
+          uv tool install tox==4.64.1 --with tox-uv==1.36.0
 
       - name: Generate License Files
         env:
           TOX_WRITE_THIRD_PARTY_LICENSES: true
+          PYTEST_WORKERS: 2
         run: |
             tox -e python310
             # Ship the committed ATTRIBUTION.md, not a copy regenerated from this
@@ -65,7 +75,7 @@ jobs:
             @semantic-release/git \
             @semantic-release/github
 
-      - name: Semantic Release Dry Run
+      - name: Semantic Release Run
         id: semantic
         run: |
           dry_run_output=$(semantic-release --dry-run 2>&1 || true)
@@ -100,19 +110,27 @@ jobs:
           CI: true
           GITHUB_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
 
+      - name: Capture released commit SHA
+        id: release_sha
+        if: steps.semantic.outputs.new_release_published == 'true'
+        env:
+          VERSION: ${{ steps.semantic.outputs.new_release_version }}
+        run: |
+          sha=$(git rev-parse --verify "refs/tags/$VERSION^{commit}")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   publish:
     needs: github_release
-    if: needs.github_release.outputs.new_release_published == 'true'
+    if: >-
+      needs.github_release.outputs.new_release_published == 'true' &&
+      needs.github_release.outputs.new_release_sha != ''
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out the code
+      - name: Check out the released commit
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: main
-
-      - name: Fetch changes on main
-        run: git pull origin main
+          ref: ${{ needs.github_release.outputs.new_release_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

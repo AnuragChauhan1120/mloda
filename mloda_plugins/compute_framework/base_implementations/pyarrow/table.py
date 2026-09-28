@@ -1,8 +1,9 @@
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.provider import BaseMergeEngine
 from mloda.provider import BaseFilterEngine, BaseMaskEngine
+from mloda.provider import OutputSchema
 from mloda_plugins.compute_framework.base_implementations.pyarrow.pyarrow_merge_engine import PyArrowMergeEngine
 from mloda_plugins.compute_framework.base_implementations.pyarrow.pyarrow_filter_engine import PyArrowFilterEngine
 from mloda_plugins.compute_framework.base_implementations.pyarrow.pyarrow_mask_engine import (
@@ -17,10 +18,28 @@ try:
 except ImportError:
     pa = None  # type: ignore[assignment, unused-ignore]
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
+
+def arrow_schema_output_schema(schema: Any) -> OutputSchema | None:
+    """Read a pyarrow Schema's names/types once and zip them, rather than calling schema.field()
+    per name. Duplicate column names (e.g. an un-aliased join) collapse to the first occurrence.
+
+    Shared with IcebergFramework, which reaches the same PyArrow interchange shape post-transform.
+    """
+    names = schema.names
+    if not names:
+        return None
+    seen: dict[str, str] = {}
+    for name, arrow_type in zip(names, schema.types):
+        seen.setdefault(name, str(arrow_type))
+    return tuple((name, seen[name]) for name in sorted(seen, key=str))
+
+
+def arrow_schema_field_type(schema: Any, column_name: str) -> Any | None:
+    """Return column_name's arrow type from its first occurrence; unlike schema.field(), never raises on duplicates."""
+    for name, arrow_type in zip(schema.names, schema.types):
+        if name == column_name:
+            return arrow_type
+    return None
 
 
 class PyArrowTable(ComputeFramework):
@@ -54,8 +73,8 @@ class PyArrowTable(ComputeFramework):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
         column_names = set(data.schema.names)
         _selected_feature_names = self.identify_naming_convention(
@@ -67,14 +86,21 @@ class PyArrowTable(ComputeFramework):
         return set(data.schema.names)
 
     def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
-        if column_name in data.schema.names:
-            return str(data.schema.field(column_name).type)
-        return None
-
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
-        if column_name not in data.schema.names:
+        arrow_type = arrow_schema_field_type(data.schema, column_name)
+        if arrow_type is None:
             return None
-        return DataType.from_arrow_type_safe(data.schema.field(column_name).type)
+        return str(arrow_type)
+
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        arrow_type = arrow_schema_field_type(data.schema, column_name)
+        if arrow_type is None:
+            return None
+        return DataType.from_arrow_type_safe(arrow_type)
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        return arrow_schema_output_schema(data.schema)
 
     def transform(
         self,

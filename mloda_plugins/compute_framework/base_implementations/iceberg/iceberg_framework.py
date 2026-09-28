@@ -1,11 +1,16 @@
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 from mloda.core.abstract_plugins.components.data_types import DataType
 from mloda.provider import BaseMergeEngine
-from mloda.user import FeatureName
+from mloda.user import FeatureName, ParallelizationMode
 from mloda.provider import ComputeFramework
 from mloda.provider import BaseFilterEngine
+from mloda.provider import OutputSchema
 from mloda_plugins.compute_framework.base_implementations.iceberg.iceberg_filter_engine import IcebergFilterEngine
+from mloda_plugins.compute_framework.base_implementations.pyarrow.table import (
+    arrow_schema_field_type,
+    arrow_schema_output_schema,
+)
 
 try:
     from pyiceberg.catalog import Catalog
@@ -53,7 +58,7 @@ class IcebergFramework(ComputeFramework):
     provided via set_framework_connection_object() before use.
     """
 
-    def set_framework_connection_object(self, framework_connection_object: Optional[Any] = None) -> None:
+    def set_framework_connection_object(self, framework_connection_object: Any | None = None) -> None:
         """
         Set the Iceberg catalog for table operations.
 
@@ -93,6 +98,11 @@ class IcebergFramework(ComputeFramework):
             return False
 
     @classmethod
+    def supported_parallelization_modes(cls) -> set[ParallelizationMode]:
+        """The live catalog handle cannot cross a process boundary."""
+        return {ParallelizationMode.SYNC, ParallelizationMode.THREADING}
+
+    @classmethod
     def expected_data_framework(cls) -> Any:
         """Return the expected Iceberg table type."""
         if IcebergTable is None:
@@ -112,30 +122,26 @@ class IcebergFramework(ComputeFramework):
         self,
         data: Any,
         selected_feature_names: Sequence[FeatureName],
-        column_ordering: Optional[str] = None,
-        request_feature_order: Optional[list[str]] = None,
+        column_ordering: str | None = None,
+        request_feature_order: list[str] | None = None,
     ) -> Any:
-        """
-        Select specific columns from Iceberg table.
-
-        Args:
-            data: Iceberg table
-            selected_feature_names: Sequence of feature names to select
-            column_ordering: Optional column ordering strategy
-
-        Returns:
-            Iceberg table scan with selected columns
-        """
-        if not isinstance(data, IcebergTable):
-            return data
-
-        column_names = set(data.schema().column_names)
-        _selected_feature_names = self.identify_naming_convention(
-            selected_feature_names, column_names, ordering=column_ordering, request_feature_order=request_feature_order
+        """Select the requested columns; an Iceberg table is scanned into a pa.Table."""
+        column_names = self._extract_column_names(data)
+        selected = list(
+            self.identify_naming_convention(
+                selected_feature_names,
+                column_names,
+                ordering=column_ordering,
+                request_feature_order=request_feature_order,
+            )
         )
-
-        # Use Iceberg's scan with column selection
-        return data.scan(selected_fields=tuple(_selected_feature_names))
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            # The scan projects in table schema order; the select below restores the requested order.
+            # A nested field ("b.c") comes back inside its struct column, so that result is not reordered.
+            data = data.scan(selected_fields=tuple(selected)).to_arrow()
+            if not set(selected).issubset(data.schema.names):
+                return data
+        return data.select(selected)
 
     def _extract_column_names(self, data: Any) -> set[str]:
         if IcebergTable is not None and isinstance(data, IcebergTable):
@@ -144,47 +150,80 @@ class IcebergFramework(ComputeFramework):
         return set(data.schema.names)
 
     def _extract_column_dtype(self, data: Any, column_name: str) -> str | None:
-        if IcebergTable is None or not isinstance(data, IcebergTable):
-            return None
-        schema = data.schema()
-        if column_name not in set(schema.column_names):
-            return None
-        field = schema.find_field(column_name)
-        if field is None:
-            return None
-        return str(field.field_type)
-
-    def _extract_column_data_type(self, data: Any, column_name: str) -> Optional[DataType]:
-        if IcebergTable is None or not isinstance(data, IcebergTable):
-            return None
-        schema = data.schema()
-        if column_name not in set(schema.column_names):
-            return None
-        field = schema.find_field(column_name)
-        if field is None:
-            return None
-        field_type = field.field_type
-        if isinstance(field_type, IntegerType):
-            return DataType.INT32
-        if isinstance(field_type, LongType):
-            return DataType.INT64
-        if isinstance(field_type, FloatType):
-            return DataType.FLOAT
-        if isinstance(field_type, DoubleType):
-            return DataType.DOUBLE
-        if isinstance(field_type, BooleanType):
-            return DataType.BOOLEAN
-        if isinstance(field_type, StringType):
-            return DataType.STRING
-        if isinstance(field_type, BinaryType):
-            return DataType.BINARY
-        if isinstance(field_type, DateType):
-            return DataType.DATE
-        if isinstance(field_type, (TimestampType, TimestamptzType)):
-            return DataType.TIMESTAMP_MICROS
-        if isinstance(field_type, DecimalType):
-            return DataType.DECIMAL
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            if column_name not in set(schema.column_names):
+                return None
+            field = schema.find_field(column_name)
+            if field is None:
+                return None
+            return str(field.field_type)
+        if pa is not None and isinstance(data, pa.Table):
+            arrow_type = arrow_schema_field_type(data.schema, column_name)
+            if arrow_type is None:
+                return None
+            return str(arrow_type)
         return None
+
+    def _extract_column_data_type(self, data: Any, column_name: str) -> DataType | None:
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            if column_name not in set(schema.column_names):
+                return None
+            field = schema.find_field(column_name)
+            if field is None:
+                return None
+            field_type = field.field_type
+            if isinstance(field_type, IntegerType):
+                return DataType.INT32
+            if isinstance(field_type, LongType):
+                return DataType.INT64
+            if isinstance(field_type, FloatType):
+                return DataType.FLOAT
+            if isinstance(field_type, DoubleType):
+                return DataType.DOUBLE
+            if isinstance(field_type, BooleanType):
+                return DataType.BOOLEAN
+            if isinstance(field_type, StringType):
+                return DataType.STRING
+            if isinstance(field_type, BinaryType):
+                return DataType.BINARY
+            if isinstance(field_type, DateType):
+                return DataType.DATE
+            if isinstance(field_type, (TimestampType, TimestamptzType)):
+                return DataType.TIMESTAMP_MICROS
+            if isinstance(field_type, DecimalType):
+                return DataType.DECIMAL
+            return None
+        if pa is not None and isinstance(data, pa.Table):
+            arrow_type = arrow_schema_field_type(data.schema, column_name)
+            if arrow_type is None:
+                return None
+            return DataType.from_arrow_type_safe(arrow_type)
+        return None
+
+    def _output_schema(self, data: Any) -> OutputSchema | None:
+        """Read the schema once and build the sorted (name, dtype) pairs directly: for a native
+        Iceberg table, schema.column_names (nested fields included, e.g. "b.c") read once, then
+        schema.find_field(name) per name, an O(1) cached lookup rather than the O(columns) rebuild
+        of set(schema.column_names) the old per-column path did. For the PyArrow interchange shape
+        reached post-transform, delegate to the same helper PyArrowTable uses.
+        """
+        if isinstance(data, dict):
+            return super()._output_schema(data)
+        if IcebergTable is not None and isinstance(data, IcebergTable):
+            schema = data.schema()
+            names = schema.column_names
+            if not names:
+                return None
+            seen: dict[str, str | None] = {}
+            for name in names:
+                field = schema.find_field(name)
+                seen.setdefault(name, None if field is None else str(field.field_type))
+            return tuple((name, seen[name]) for name in sorted(seen, key=str))
+        if pa is not None and isinstance(data, pa.Table):
+            return arrow_schema_output_schema(data.schema)
+        return super()._output_schema(data)
 
     def transform(self, data: Any, feature_names: Sequence[str]) -> Any:
         """
@@ -223,7 +262,7 @@ class IcebergFramework(ComputeFramework):
 
         raise ValueError(f"Data type {type(data)} is not supported by {self.__class__.__name__}")
 
-    def validate_expected_framework(self, location: Optional[str] = None) -> None:
+    def validate_expected_framework(self, location: str | None = None) -> None:
         """
         Override to accept both Iceberg tables and PyArrow tables.
 

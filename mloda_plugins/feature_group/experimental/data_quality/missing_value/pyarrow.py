@@ -4,7 +4,7 @@ PyArrow implementation for missing value imputation feature groups.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -53,8 +53,8 @@ class PyArrowMissingValueFeatureGroup(MissingValueFeatureGroup):
         data: pa.Table,
         imputation_method: str,
         in_features: list[str],
-        constant_value: Optional[Any] = None,
-        group_by_features: Optional[list[str]] = None,
+        constant_value: Any | None = None,
+        group_by_features: list[str] | None = None,
     ) -> pa.Array:
         """
         Perform the imputation using PyArrow compute functions.
@@ -110,9 +110,9 @@ class PyArrowMissingValueFeatureGroup(MissingValueFeatureGroup):
 
                     # Find all indices where count equals max_count
                     max_indices = []
-                    for i in range(len(counts)):
-                        if counts[i].as_py() == max_count:
-                            max_indices.append(i)
+                    for count_idx in range(len(counts)):
+                        if counts[count_idx].as_py() == max_count:
+                            max_indices.append(count_idx)
 
                     # Use the first index with maximum count
                     if max_indices:
@@ -167,7 +167,7 @@ class PyArrowMissingValueFeatureGroup(MissingValueFeatureGroup):
         data: pa.Table,
         imputation_method: str,
         in_features: str,  # Note: grouped imputation only supports single column
-        constant_value: Optional[Any],
+        constant_value: Any | None,
         group_by_features: list[str],
     ) -> pa.Array:
         """
@@ -206,9 +206,9 @@ class PyArrowMissingValueFeatureGroup(MissingValueFeatureGroup):
 
                 # Find all indices where count equals max_count
                 max_indices = []
-                for i in range(len(counts)):
-                    if counts[i].as_py() == max_count:
-                        max_indices.append(i)
+                for count_idx in range(len(counts)):
+                    if counts[count_idx].as_py() == max_count:
+                        max_indices.append(count_idx)
 
                 # Use the first index with maximum count
                 if max_indices:
@@ -258,31 +258,41 @@ class PyArrowMissingValueFeatureGroup(MissingValueFeatureGroup):
 
                     # Find all indices where count equals max_count
                     max_indices = []
-                    for i in range(len(counts)):
-                        if counts[i].as_py() == max_count:
-                            max_indices.append(i)
+                    for count_idx in range(len(counts)):
+                        if counts[count_idx].as_py() == max_count:
+                            max_indices.append(count_idx)
 
                     # Use the first index with maximum count
                     if max_indices:
                         group_value = value_counts.field("values")[max_indices[0]].as_py()
             elif imputation_method == "ffill":
-                # For ffill, we need to find the last non-null value before this row in the group
-                valid_indices = pc.indices_nonzero(pc.is_valid(group_data))
-                if len(valid_indices) > 0:
-                    # Find the largest valid index that is less than the current index
-                    valid_indices_before = [idx for idx in valid_indices.to_pylist() if idx < i]
-                    if valid_indices_before:
-                        last_valid_idx = max(valid_indices_before)
-                        group_value = group_data[last_valid_idx].as_py()
+                # `i` is the global row index; translate it to the row's position within the group.
+                # A null group key yields an all-null group_mask, so `i` won't be found; there is
+                # no identifiable group to ffill from, so fall back to the overall value.
+                group_row_indices = pc.indices_nonzero(group_mask).to_pylist()
+                if i in group_row_indices:
+                    local_idx = group_row_indices.index(i)
+                    valid_indices = pc.indices_nonzero(pc.is_valid(group_data))
+                    if len(valid_indices) > 0:
+                        # Find the largest valid index that is less than the current group-local index
+                        valid_indices_before = [idx for idx in valid_indices.to_pylist() if idx < local_idx]
+                        if valid_indices_before:
+                            last_valid_idx = max(valid_indices_before)
+                            group_value = group_data[last_valid_idx].as_py()
             elif imputation_method == "bfill":
-                # For bfill, we need to find the first non-null value after this row in the group
-                valid_indices = pc.indices_nonzero(pc.is_valid(group_data))
-                if len(valid_indices) > 0:
-                    # Find the smallest valid index that is greater than the current index
-                    valid_indices_after = [idx for idx in valid_indices.to_pylist() if idx > i]
-                    if valid_indices_after:
-                        next_valid_idx = min(valid_indices_after)
-                        group_value = group_data[next_valid_idx].as_py()
+                # `i` is the global row index; translate it to the row's position within the group.
+                # A null group key yields an all-null group_mask, so `i` won't be found; there is
+                # no identifiable group to bfill from, so fall back to the overall value.
+                group_row_indices = pc.indices_nonzero(group_mask).to_pylist()
+                if i in group_row_indices:
+                    local_idx = group_row_indices.index(i)
+                    valid_indices = pc.indices_nonzero(pc.is_valid(group_data))
+                    if len(valid_indices) > 0:
+                        # Find the smallest valid index that is greater than the current group-local index
+                        valid_indices_after = [idx for idx in valid_indices.to_pylist() if idx > local_idx]
+                        if valid_indices_after:
+                            next_valid_idx = min(valid_indices_after)
+                            group_value = group_data[next_valid_idx].as_py()
 
             # If the group imputation value is None, fall back to the overall value
             if group_value is None:
